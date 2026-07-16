@@ -52,10 +52,10 @@ codex-websocket-generate-false-warmup: true
 	}
 }
 
-func TestBuildClaudeArgsAddsOnlyObservabilityFlagsWithoutModelPolicy(t *testing.T) {
+func TestBuildClaudeArgsDefaultsRootToSolWithoutOverridingUserFlags(t *testing.T) {
 	t.Parallel()
 	got := BuildClaudeArgs([]string{"--effort", "xhigh"}, "session-1", "/run/debug.log")
-	want := []string{"--session-id", "session-1", "--debug-file", "/run/debug.log", "--effort", "xhigh"}
+	want := []string{"--model", "gpt-5.6-sol", "--session-id", "session-1", "--debug-file", "/run/debug.log", "--effort", "xhigh"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}

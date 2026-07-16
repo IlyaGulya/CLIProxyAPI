@@ -26,11 +26,11 @@ can contain prompts, tool payloads, upstream credentials, and other sensitive
 data. Do not publish a complete bundle. The summary files contain only models,
 correlation IDs, latency, usage, cache, connection-source, and completion data.
 
-The launcher is routing-neutral. It does not add `--model` and does not set or
-rewrite `CLAUDE_CODE_SUBAGENT_MODEL`, effort, tool-search, background-task, or
-concurrency settings. Claude receives the same CLI arguments and environment
-that it would receive without the launcher. Model and workflow policy belongs
-in the caller's shell, Claude configuration, or an explicit benchmark preset.
+The launcher defaults the root model to `gpt-5.6-sol`; an explicit `--model`
+still takes precedence. It does not set or rewrite
+`CLAUDE_CODE_SUBAGENT_MODEL`, effort, tool-search, background-task, or
+concurrency settings. Child-model and workflow policy remains in the caller's
+shell or Claude configuration.
 
 The isolated proxy enables upstream WebSockets, request timelines, speculative
 preconnect, and bounded replenishment. `generate=false` warmup remains disabled.
