@@ -13,6 +13,8 @@ import (
 )
 
 const ClaudeCodeSessionHeader = "X-Claude-Code-Session-Id"
+const ClaudeCodeAgentHeader = "X-Claude-Code-Agent-Id"
+const ClaudeCodeWebsocketSessionPrefix = "claude-code:"
 
 var claudeCodeSessionSuffixPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 
@@ -31,6 +33,38 @@ func ExtractClaudeCodeSessionID(ctx context.Context, payload []byte, headers htt
 		}
 	}
 	return extractClaudeCodeSessionIDFromPayload(payload)
+}
+
+// ExtractClaudeCodeAgentID resolves the Claude Code agent ID from the request.
+// The header is absent for the root agent.
+func ExtractClaudeCodeAgentID(ctx context.Context, headers http.Header) string {
+	if headers != nil {
+		if agentID := strings.TrimSpace(headers.Get(ClaudeCodeAgentHeader)); agentID != "" {
+			return agentID
+		}
+	}
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			return strings.TrimSpace(ginCtx.Request.Header.Get(ClaudeCodeAgentHeader))
+		}
+	}
+	return ""
+}
+
+// ClaudeCodeWebsocketSessionID returns a stable, agent-scoped execution
+// session ID. Root and child agents intentionally use separate upstream
+// websocket connections so parallel subagents cannot serialize on one socket.
+func ClaudeCodeWebsocketSessionID(ctx context.Context, payload []byte, headers http.Header) string {
+	rootSessionID := ExtractClaudeCodeSessionID(ctx, payload, headers)
+	if rootSessionID == "" {
+		return ""
+	}
+	agentID := ExtractClaudeCodeAgentID(ctx, headers)
+	if agentID == "" {
+		agentID = "main"
+	}
+	identity := rootSessionID + "\x00" + agentID
+	return ClaudeCodeWebsocketSessionPrefix + uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
 }
 
 func extractClaudeCodeSessionIDFromPayload(payload []byte) string {

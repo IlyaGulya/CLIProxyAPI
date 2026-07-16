@@ -39,6 +39,22 @@ type SDKConfig struct {
 	// credentials as well.
 	ForceModelPrefix bool `yaml:"force-model-prefix" json:"force-model-prefix"`
 
+	// CodexPreferUpstreamWebsockets allows Claude-compatible HTTP/SSE requests
+	// with a stable Claude Code session identity to use persistent Codex upstream
+	// websocket connections. The default is false.
+	CodexPreferUpstreamWebsockets bool `yaml:"codex-prefer-upstream-websockets" json:"codex-prefer-upstream-websockets"`
+
+	// CodexWebsocketSessionTTLSeconds controls idle Claude-compatible persistent
+	// upstream websocket retention. Values <= 0 use the default (10 minutes).
+	CodexWebsocketSessionTTLSeconds int `yaml:"codex-websocket-session-ttl-seconds,omitempty" json:"codex-websocket-session-ttl-seconds,omitempty"`
+
+	// CodexWebsocketMaxSessions bounds Claude-compatible persistent upstream
+	// websocket sessions. Native downstream websocket sessions retain their
+	// existing lifecycle.
+	// Values <= 0 use the default (128). At capacity, active sessions are never
+	// evicted; excess requests use a one-shot websocket instead.
+	CodexWebsocketMaxSessions int `yaml:"codex-websocket-max-sessions,omitempty" json:"codex-websocket-max-sessions,omitempty"`
+
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 

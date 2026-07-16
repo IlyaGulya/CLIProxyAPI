@@ -38,6 +38,12 @@ type authScheduler struct {
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
+	executionPins map[string]executionSessionPin
+}
+
+type executionSessionPin struct {
+	authID   string
+	lastUsed time.Time
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -128,6 +134,7 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
+		executionPins: make(map[string]executionSessionPin),
 	}
 }
 
@@ -206,7 +213,8 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
+	executionPinKey := upstreamWebsocketExecutionPinKey(ctx, providerKey, modelKey, opts.Metadata)
+	preferWebsocket := (cliproxyexecutor.DownstreamWebsocket(ctx) || cliproxyexecutor.PreferUpstreamWebsocket(ctx)) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -220,6 +228,27 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	shard := providerState.ensureModelLocked(modelKey, time.Now())
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if pinnedAuthID == "" && executionPinKey != "" {
+		s.pruneExecutionPinsLocked(time.Now())
+		if pin, ok := s.executionPins[executionPinKey]; ok && pin.authID != "" {
+			pinPredicate := func(entry *scheduledAuth) bool {
+				if entry == nil || entry.auth == nil || entry.auth.ID != pin.authID {
+					return false
+				}
+				if len(tried) == 0 {
+					return true
+				}
+				_, alreadyTried := tried[pin.authID]
+				return !alreadyTried
+			}
+			if picked := shard.pickReadyLocked(preferWebsocket, strategy, pinPredicate); picked != nil {
+				pin.lastUsed = time.Now()
+				s.executionPins[executionPinKey] = pin
+				return picked, nil
+			}
+			delete(s.executionPins, executionPinKey)
+		}
 	}
 	predicate := func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
@@ -236,9 +265,36 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		return true
 	}
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+		if executionPinKey != "" {
+			s.executionPins[executionPinKey] = executionSessionPin{authID: picked.ID, lastUsed: time.Now()}
+		}
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
+}
+
+const executionSessionPinTTL = 15 * time.Minute
+
+func upstreamWebsocketExecutionPinKey(ctx context.Context, providerKey, modelKey string, metadata map[string]any) string {
+	if !cliproxyexecutor.PreferUpstreamWebsocket(ctx) || (providerKey != "codex" && providerKey != "mixed") {
+		return ""
+	}
+	sessionID := stringMetadataValue(metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
+	if sessionID == "" {
+		return ""
+	}
+	return sessionID + "\x00" + providerKey + "\x00" + modelKey
+}
+
+func (s *authScheduler) pruneExecutionPinsLocked(now time.Time) {
+	if s == nil || len(s.executionPins) == 0 {
+		return
+	}
+	for key, pin := range s.executionPins {
+		if pin.lastUsed.IsZero() || now.Sub(pin.lastUsed) > executionSessionPinTTL {
+			delete(s.executionPins, key)
+		}
+	}
 }
 
 func providerPrefersWebsocketTransport(providerKey string) bool {
@@ -308,6 +364,45 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
+	}
+
+	executionPinKey := upstreamWebsocketExecutionPinKey(ctx, "mixed", modelKey, opts.Metadata)
+	if executionPinKey != "" {
+		s.pruneExecutionPinsLocked(time.Now())
+		if pin, ok := s.executionPins[executionPinKey]; ok && pin.authID != "" {
+			providerKey := s.authProviders[pin.authID]
+			providerState := s.providers[providerKey]
+			if providerState != nil && containsProvider(normalized, providerKey) {
+				shard := providerState.ensureModelLocked(modelKey, time.Now())
+				pinPredicate := func(entry *scheduledAuth) bool {
+					if entry == nil || entry.auth == nil || entry.auth.ID != pin.authID {
+						return false
+					}
+					if len(tried) == 0 {
+						return true
+					}
+					_, alreadyTried := tried[pin.authID]
+					return !alreadyTried
+				}
+				if picked := shard.pickReadyLocked(true, strategy, pinPredicate); picked != nil {
+					pin.lastUsed = time.Now()
+					s.executionPins[executionPinKey] = pin
+					return picked, providerKey, nil
+				}
+			}
+			delete(s.executionPins, executionPinKey)
+		}
+
+		if containsProvider(normalized, "codex") {
+			providerState := s.providers["codex"]
+			if providerState != nil {
+				shard := providerState.ensureModelLocked(modelKey, time.Now())
+				if picked := shard.pickReadyLocked(true, strategy, triedPredicate(tried)); picked != nil && authWebsocketsEnabled(picked) {
+					s.executionPins[executionPinKey] = executionSessionPin{authID: picked.ID, lastUsed: time.Now()}
+					return picked, "codex", nil
+				}
+			}
+		}
 	}
 
 	predicate := triedPredicate(tried)

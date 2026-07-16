@@ -22,8 +22,10 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -273,6 +275,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, _ = h.codexUpstreamWebsocketContext(cliCtx, rawJSON)
 
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
@@ -336,6 +339,19 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		}
 	}
+}
+
+func (h *ClaudeCodeAPIHandler) codexUpstreamWebsocketContext(ctx context.Context, rawJSON []byte) (context.Context, string) {
+	if h == nil || h.Cfg == nil || !h.Cfg.CodexPreferUpstreamWebsockets {
+		return ctx, ""
+	}
+	sessionID := helps.ClaudeCodeWebsocketSessionID(ctx, rawJSON, nil)
+	if sessionID == "" {
+		return ctx, ""
+	}
+	ctx = cliproxyexecutor.WithPreferUpstreamWebsocket(ctx)
+	ctx = handlers.WithExecutionSessionID(ctx, sessionID)
+	return ctx, sessionID
 }
 
 func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {

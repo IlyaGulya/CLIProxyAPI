@@ -38,6 +38,8 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
+	codexWebsocketDefaultSessionTTL        = 10 * time.Minute
+	codexWebsocketDefaultMaxSessions       = 128
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -61,6 +63,7 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 
 type codexWebsocketSession struct {
 	sessionID string
+	lastUsed  time.Time
 
 	reqMu sync.Mutex
 
@@ -269,7 +272,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
-		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+		if shouldFallbackCodexWebsocketHandshake(ctx, respHS) {
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -417,11 +420,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
-	body := req.Payload
-	userPayload := req.Payload
+	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
-		userPayload = opts.OriginalRequest
+		originalPayloadSource = opts.OriginalRequest
 	}
+	originalPayload := originalPayloadSource
+	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -430,13 +434,22 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "stream", true)
+	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+	body, _ = sjson.DeleteBytes(body, "safety_identifier")
+	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	body = normalizeCodexParallelToolCallsForTools(body)
+	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
+	if errReplay != nil {
+		return nil, errReplay
+	}
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -450,7 +463,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	clientBody := body
 	var identityState codexIdentityConfuseState
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body)
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
@@ -494,7 +507,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
-		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+		if shouldFallbackCodexWebsocketHandshake(ctx, respHS) {
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -682,11 +698,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
 				}
+				if eventType == "response.completed" {
+					cacheCodexReasoningReplayFromCompleted(replayScope, payload)
+				}
 			}
 
 			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
 			line := encodeCodexWebsocketAsSSE(clientPayload)
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, clientBody, clientBody, line, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param)
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
@@ -1330,6 +1349,25 @@ func websocketHandshakeBody(resp *http.Response) []byte {
 	return body
 }
 
+func shouldFallbackCodexWebsocketHandshake(ctx context.Context, resp *http.Response) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if resp == nil {
+		return true
+	}
+	switch resp.StatusCode {
+	case http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusUpgradeRequired,
+		http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
 func closeHTTPResponseBody(resp *http.Response, logPrefix string) {
 	if resp == nil || resp.Body == nil {
 		return
@@ -1369,20 +1407,90 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if store == nil {
 		store = globalCodexWebsocketSessionStore
 	}
+	now := time.Now()
+	ttl := codexWebsocketDefaultSessionTTL
+	maxSessions := codexWebsocketDefaultMaxSessions
+	if e.cfg != nil {
+		if e.cfg.CodexWebsocketSessionTTLSeconds > 0 {
+			ttl = time.Duration(e.cfg.CodexWebsocketSessionTTLSeconds) * time.Second
+		}
+		if e.cfg.CodexWebsocketMaxSessions > 0 {
+			maxSessions = e.cfg.CodexWebsocketMaxSessions
+		}
+	}
+
 	store.mu.Lock()
-	defer store.mu.Unlock()
 	if store.sessions == nil {
 		store.sessions = make(map[string]*codexWebsocketSession)
 	}
 	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
+		sess.lastUsed = now
+		store.mu.Unlock()
 		return sess
+	}
+	managedClaudeSession := strings.HasPrefix(sessionID, helps.ClaudeCodeWebsocketSessionPrefix)
+
+	toClose := make([]*codexWebsocketSession, 0)
+	managedSessionCount := 0
+	for existingID, existing := range store.sessions {
+		if existing == nil {
+			delete(store.sessions, existingID)
+			continue
+		}
+		if !strings.HasPrefix(existingID, helps.ClaudeCodeWebsocketSessionPrefix) {
+			continue
+		}
+		if managedClaudeSession && !existing.lastUsed.IsZero() && now.Sub(existing.lastUsed) > ttl && !codexWebsocketSessionActive(existing) {
+			delete(store.sessions, existingID)
+			toClose = append(toClose, existing)
+			continue
+		}
+		managedSessionCount++
+	}
+
+	if managedClaudeSession && maxSessions > 0 && managedSessionCount >= maxSessions {
+		oldestID := ""
+		var oldest *codexWebsocketSession
+		for existingID, existing := range store.sessions {
+			if existing == nil || !strings.HasPrefix(existingID, helps.ClaudeCodeWebsocketSessionPrefix) || codexWebsocketSessionActive(existing) {
+				continue
+			}
+			if oldest == nil || existing.lastUsed.Before(oldest.lastUsed) {
+				oldestID = existingID
+				oldest = existing
+			}
+		}
+		if oldest == nil {
+			store.mu.Unlock()
+			for i := range toClose {
+				closeCodexWebsocketSession(toClose[i], "session_expired")
+			}
+			return nil
+		}
+		delete(store.sessions, oldestID)
+		toClose = append(toClose, oldest)
 	}
 	sess := &codexWebsocketSession{
 		sessionID:            sessionID,
+		lastUsed:             now,
 		upstreamDisconnectCh: make(chan error, 1),
 	}
 	store.sessions[sessionID] = sess
+	store.mu.Unlock()
+	for i := range toClose {
+		closeCodexWebsocketSession(toClose[i], "session_evicted")
+	}
 	return sess
+}
+
+func codexWebsocketSessionActive(sess *codexWebsocketSession) bool {
+	if sess == nil {
+		return false
+	}
+	sess.activeMu.Lock()
+	active := sess.activeCh != nil
+	sess.activeMu.Unlock()
+	return active
 }
 
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
@@ -1401,7 +1509,24 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.connMu.Lock()
 	conn := sess.conn
 	readerConn := sess.readerConn
+	existingAuthID := sess.authID
+	existingWSURL := sess.wsURL
+	credentialMismatch := conn != nil && (existingAuthID != authID || existingWSURL != wsURL)
+	if credentialMismatch {
+		sess.conn = nil
+		if sess.readerConn == conn {
+			sess.readerConn = nil
+		}
+		readerConn = nil
+	}
 	sess.connMu.Unlock()
+	if credentialMismatch {
+		logCodexWebsocketDisconnected(sess.sessionID, existingAuthID, existingWSURL, "route_changed", nil)
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+		}
+		conn = nil
+	}
 	if conn != nil {
 		if readerConn != conn {
 			sess.connMu.Lock()
@@ -1687,7 +1812,7 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 }
 
 // CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
+//  1. The downstream transport is websocket or upstream websocket is preferred, and
 //  2. The selected auth enables websockets.
 //
 // For non-websocket downstream requests, it always uses the legacy HTTP implementation.
@@ -1723,7 +1848,7 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if codexShouldUseWebsockets(ctx, auth) {
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
@@ -1733,7 +1858,7 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if codexShouldUseWebsockets(ctx, auth) {
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
@@ -1797,4 +1922,11 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	default:
 	}
 	return false
+}
+
+func codexShouldUseWebsockets(ctx context.Context, auth *cliproxyauth.Auth) bool {
+	if !codexWebsocketsEnabled(auth) {
+		return false
+	}
+	return cliproxyexecutor.DownstreamWebsocket(ctx) || cliproxyexecutor.PreferUpstreamWebsocket(ctx)
 }

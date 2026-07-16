@@ -2,7 +2,9 @@ package executor
 
 import (
 	"testing"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -44,5 +46,103 @@ func TestCodexWebsocketsExecutor_SessionStoreSurvivesExecutorReplacement(t *test
 	globalCodexWebsocketSessionStore.mu.Unlock()
 	if presentAfterClose {
 		t.Fatalf("expected session to be removed after explicit close")
+	}
+}
+
+func TestCodexWebsocketsExecutor_EvictsExpiredIdleSessions(t *testing.T) {
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketSessionTTLSeconds: 1}})
+	exec.store = store
+
+	expired := exec.getOrCreateSession("claude-code:expired")
+	if expired == nil {
+		t.Fatal("expected expired session fixture")
+	}
+	store.mu.Lock()
+	expired.lastUsed = time.Now().Add(-2 * time.Second)
+	store.mu.Unlock()
+
+	if current := exec.getOrCreateSession("claude-code:current"); current == nil {
+		t.Fatal("expected current session")
+	}
+	store.mu.Lock()
+	_, expiredPresent := store.sessions["claude-code:expired"]
+	_, currentPresent := store.sessions["claude-code:current"]
+	store.mu.Unlock()
+	if expiredPresent || !currentPresent {
+		t.Fatalf("unexpected session store after TTL cleanup: expired=%t current=%t", expiredPresent, currentPresent)
+	}
+}
+
+func TestCodexWebsocketsExecutor_BoundsIdleSessionStore(t *testing.T) {
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: 1}})
+	exec.store = store
+
+	first := exec.getOrCreateSession("claude-code:first")
+	if first == nil {
+		t.Fatal("expected first session")
+	}
+	store.mu.Lock()
+	first.lastUsed = time.Now().Add(-time.Second)
+	store.mu.Unlock()
+	if second := exec.getOrCreateSession("claude-code:second"); second == nil {
+		t.Fatal("expected second session after idle eviction")
+	}
+
+	store.mu.Lock()
+	_, firstPresent := store.sessions["claude-code:first"]
+	_, secondPresent := store.sessions["claude-code:second"]
+	count := len(store.sessions)
+	store.mu.Unlock()
+	if firstPresent || !secondPresent || count != 1 {
+		t.Fatalf("unexpected bounded store: first=%t second=%t count=%d", firstPresent, secondPresent, count)
+	}
+}
+
+func TestCodexWebsocketsExecutor_DoesNotEvictActiveSessionAtCapacity(t *testing.T) {
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: 1}})
+	exec.store = store
+
+	active := exec.getOrCreateSession("claude-code:active")
+	if active == nil {
+		t.Fatal("expected active session fixture")
+	}
+	active.setActive(make(chan codexWebsocketRead))
+	t.Cleanup(func() { active.setActive(nil) })
+
+	if overflow := exec.getOrCreateSession("claude-code:overflow"); overflow != nil {
+		t.Fatalf("expected one-shot fallback at active capacity, got %#v", overflow)
+	}
+	store.mu.Lock()
+	_, activePresent := store.sessions["claude-code:active"]
+	_, overflowPresent := store.sessions["claude-code:overflow"]
+	store.mu.Unlock()
+	if !activePresent || overflowPresent {
+		t.Fatalf("active session eviction state: active=%t overflow=%t", activePresent, overflowPresent)
+	}
+}
+
+func TestCodexWebsocketsExecutor_DoesNotApplyClaudeCapacityToNativeSessions(t *testing.T) {
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: 1}})
+	exec.store = store
+
+	if first := exec.getOrCreateSession("native-first"); first == nil {
+		t.Fatal("expected first native session")
+	}
+	if second := exec.getOrCreateSession("native-second"); second == nil {
+		t.Fatal("expected native sessions to retain their existing unbounded lifecycle")
+	}
+	if claude := exec.getOrCreateSession("claude-code:only-managed"); claude == nil {
+		t.Fatal("native sessions must not consume Claude session capacity")
+	}
+
+	store.mu.Lock()
+	count := len(store.sessions)
+	store.mu.Unlock()
+	if count != 3 {
+		t.Fatalf("session count = %d, want 3", count)
 	}
 }

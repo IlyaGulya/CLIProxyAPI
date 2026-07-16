@@ -188,6 +188,14 @@ codex:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
+# When true, Claude-compatible HTTP/SSE requests with Claude Code session
+# identity use persistent Codex upstream websocket connections when supported.
+codex-prefer-upstream-websockets: false
+# Idle Claude-compatible persistent session retention; <= 0 uses 600 seconds.
+codex-websocket-session-ttl-seconds: 600
+# Maximum Claude-compatible persistent upstream websocket sessions; <= 0 uses 128.
+codex-websocket-max-sessions: 128
+
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).

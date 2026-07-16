@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,6 +226,258 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 	}
 }
 
+func TestCodexWebsocketsExecuteStreamTranslatesClaudeRequestBeforeSend(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		capturedPayload <- bytes.Clone(payload)
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-claude","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Errorf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.6-sol",
+		Payload: []byte(`{
+			"model":"gpt-5.6-sol",
+			"system":"You are a coding agent.",
+			"messages":[{"role":"user","content":"hello"}],
+			"max_tokens":1024,
+			"stream":true
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: req.Payload,
+	}
+
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		if gjson.GetBytes(payload, "messages").Exists() {
+			t.Fatalf("upstream payload still contains Claude messages: %s", payload)
+		}
+		if !gjson.GetBytes(payload, "input").IsArray() {
+			t.Fatalf("upstream payload does not contain Responses input: %s", payload)
+		}
+		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+			t.Fatalf("upstream type = %q, want response.create; payload=%s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for translated Claude payload")
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamReusesAgentSessionConnection(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+			requests.Add(1)
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}],"max_tokens":128,"stream":true}`)}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: req.Payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:agent-a",
+		},
+	}
+
+	for turn := 0; turn < 2; turn++ {
+		result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+		if errExecute != nil {
+			t.Fatalf("ExecuteStream() turn %d error = %v", turn, errExecute)
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("turn %d stream error = %v", turn, chunk.Err)
+			}
+		}
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("upstream websocket connections = %d, want 1", got)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream websocket requests = %d, want 2", got)
+	}
+	exec.CloseExecutionSession("claude-code:agent-a")
+}
+
+func TestCodexWebsocketsExecuteStreamSupportsInSessionModelSwitching(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	models := []string{"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-luna"}
+	serverErrors := make(chan error, 1)
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrors <- fmt.Errorf("upgrade websocket: %w", errUpgrade)
+			return
+		}
+		connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		for index, wantModel := range models {
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				serverErrors <- fmt.Errorf("read turn %d: %w", index, errRead)
+				return
+			}
+			if gotModel := gjson.GetBytes(payload, "model").String(); gotModel != wantModel {
+				serverErrors <- fmt.Errorf("turn %d model = %q, want %q; payload=%s", index, gotModel, wantModel, payload)
+				return
+			}
+			if gotType := gjson.GetBytes(payload, "type").String(); gotType != "response.create" {
+				serverErrors <- fmt.Errorf("turn %d type = %q, want response.create; payload=%s", index, gotType, payload)
+				return
+			}
+			if previousResponseID := gjson.GetBytes(payload, "previous_response_id").String(); previousResponseID != "" {
+				serverErrors <- fmt.Errorf("turn %d retained previous_response_id %q across model boundary; payload=%s", index, previousResponseID, payload)
+				return
+			}
+			if inputCount := gjson.GetBytes(payload, "input.#").Int(); inputCount == 0 {
+				serverErrors <- fmt.Errorf("turn %d did not send a full input after model selection; payload=%s", index, payload)
+				return
+			}
+			created := []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":"resp-%d","model":%q}}`, index, wantModel))
+			if errWrite := conn.WriteMessage(websocket.TextMessage, created); errWrite != nil {
+				serverErrors <- fmt.Errorf("write created turn %d: %w", index, errWrite)
+				return
+			}
+			completed := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","model":%q,"output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`, index, wantModel))
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				serverErrors <- fmt.Errorf("write completed turn %d: %w", index, errWrite)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	for index, model := range models {
+		payload := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"turn %d"}],"max_tokens":128,"stream":true}`, model, index))
+		req := cliproxyexecutor.Request{Model: model, Payload: payload}
+		opts := cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("claude"),
+			ResponseFormat:  sdktranslator.FromString("claude"),
+			OriginalRequest: payload,
+			Metadata: map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:model-switch-agent",
+			},
+		}
+		result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+		if errExecute != nil {
+			t.Fatalf("turn %d ExecuteStream() error = %v", index, errExecute)
+		}
+		var downstream strings.Builder
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("turn %d stream error = %v", index, chunk.Err)
+			}
+			downstream.Write(chunk.Payload)
+		}
+		if !strings.Contains(downstream.String(), `"model":"`+model+`"`) {
+			t.Fatalf("turn %d downstream response does not identify current model %q: %s", index, model, downstream.String())
+		}
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("model switching opened %d websocket connections, want 1", got)
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+	exec.CloseExecutionSession("claude-code:model-switch-agent")
+}
+
+func TestCodexAutoExecutorFallsBackToHTTPWhenWebsocketUnsupported(t *testing.T) {
+	var websocketAttempts atomic.Int32
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			websocketAttempts.Add(1)
+			http.Error(w, "websocket unavailable", http.StatusNotFound)
+			return
+		}
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-http","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{
+		"api_key":    "sk-test",
+		"base_url":   server.URL,
+		"websockets": "true",
+	}}
+	req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"hello"}]}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+	ctx := cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background())
+
+	result, errExecute := exec.ExecuteStream(ctx, auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("fallback stream error = %v", chunk.Err)
+		}
+	}
+	if websocketAttempts.Load() != 1 || httpRequests.Load() != 1 {
+		t.Fatalf("fallback attempts: websocket=%d http=%d, want 1 each", websocketAttempts.Load(), httpRequests.Load())
+	}
+}
+
 func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsocket(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	errorPayload := []byte(`{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached","message":"too many websockets"}}`)
@@ -404,6 +658,59 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for disconnect signal")
 	}
+}
+
+func TestCodexWebsocketsEnsureUpstreamConnReplacesCredentialMismatch(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	connected := make(chan struct{}, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		connected <- struct{}{}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	sess := exec.getOrCreateSession("credential-mismatch")
+	if sess == nil {
+		t.Fatal("expected session")
+	}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	first, _, errFirst := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-a", wsURL, http.Header{})
+	if errFirst != nil {
+		t.Fatalf("first ensureUpstreamConn() error = %v", errFirst)
+	}
+	second, _, errSecond := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-b", wsURL, http.Header{})
+	if errSecond != nil {
+		t.Fatalf("second ensureUpstreamConn() error = %v", errSecond)
+	}
+	if first == second {
+		t.Fatal("credential mismatch reused the previous websocket")
+	}
+	sess.connMu.Lock()
+	gotAuthID := sess.authID
+	sess.connMu.Unlock()
+	if gotAuthID != "auth-b" {
+		t.Fatalf("session auth ID = %q, want auth-b", gotAuthID)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-connected:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for replacement websocket connection")
+		}
+	}
+	exec.CloseExecutionSession("credential-mismatch")
 }
 
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
@@ -707,6 +1014,19 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 	}
 	if got := headers.Get("Conversation_id"); got != "" {
 		t.Fatalf("bare metadata.user_id must not create websocket Conversation_id, got %q", got)
+	}
+}
+
+func TestCodexAutoExecutorUsesWebsocketForUpstreamPreference(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"websockets": "true"}}
+	if codexShouldUseWebsockets(context.Background(), auth) {
+		t.Fatal("plain context unexpectedly selected websocket")
+	}
+	if !codexShouldUseWebsockets(cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background()), auth) {
+		t.Fatal("upstream websocket preference did not select websocket")
+	}
+	if !codexShouldUseWebsockets(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth) {
+		t.Fatal("downstream websocket no longer selects websocket")
 	}
 }
 

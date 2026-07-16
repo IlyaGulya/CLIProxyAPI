@@ -225,6 +225,137 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T)
 	}
 }
 
+func TestSchedulerPick_UpstreamWebsocketPreferenceSelectsWebsocketCredential(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-http", Provider: "codex"},
+		&Auth{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	)
+
+	ctx := cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-ws" {
+		t.Fatalf("pickSingle() auth = %#v, want codex-ws", got)
+	}
+}
+
+func TestSchedulerPick_UpstreamWebsocketSessionPinsAndFailsOver(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+		&Auth{ID: "codex-ws-b", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	)
+	ctx := cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background())
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.ExecutionSessionMetadataKey: "claude-agent-session",
+	}}
+
+	first, errPick := scheduler.pickSingle(ctx, "codex", "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("first pick error = %v", errPick)
+	}
+	second, errPick := scheduler.pickSingle(ctx, "codex", "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("second pick error = %v", errPick)
+	}
+	if first == nil || second == nil || first.ID != second.ID {
+		t.Fatalf("same execution session was not pinned: first=%#v second=%#v", first, second)
+	}
+
+	tried := map[string]struct{}{first.ID: {}}
+	failover, errPick := scheduler.pickSingle(ctx, "codex", "", opts, tried)
+	if errPick != nil {
+		t.Fatalf("failover pick error = %v", errPick)
+	}
+	if failover == nil || failover.ID == first.ID {
+		t.Fatalf("failed session did not move to another auth: first=%#v failover=%#v", first, failover)
+	}
+	afterFailover, errPick := scheduler.pickSingle(ctx, "codex", "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("post-failover pick error = %v", errPick)
+	}
+	if afterFailover == nil || afterFailover.ID != failover.ID {
+		t.Fatalf("session did not repin after failover: failover=%#v next=%#v", failover, afterFailover)
+	}
+}
+
+func TestSchedulerPick_MixedUpstreamWebsocketPreferenceSelectsCodex(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "openai-http", Provider: "openai-compatible", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
+	)
+	ctx := cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background())
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.ExecutionSessionMetadataKey: "mixed-claude-agent",
+	}}
+
+	first, provider, errPick := scheduler.pickMixed(ctx, []string{"openai-compatible", "codex"}, "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() error = %v", errPick)
+	}
+	if first == nil || first.ID != "codex-ws" || provider != "codex" {
+		t.Fatalf("pickMixed() = (%#v, %q), want codex-ws from codex", first, provider)
+	}
+	second, secondProvider, errPick := scheduler.pickMixed(ctx, []string{"openai-compatible", "codex"}, "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("second pickMixed() error = %v", errPick)
+	}
+	if second == nil || second.ID != first.ID || secondProvider != provider {
+		t.Fatalf("mixed execution session was not pinned: first=(%#v,%q) second=(%#v,%q)", first, provider, second, secondProvider)
+	}
+}
+
+func TestSchedulerPick_UpstreamWebsocketPinsAreModelScoped(t *testing.T) {
+	t.Parallel()
+
+	reg := registry.GetGlobalRegistry()
+	for _, authID := range []string{"codex-ws-a", "codex-ws-b"} {
+		reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.6-luna"}, {ID: "gpt-5.6-sol"}})
+		t.Cleanup(func() { reg.UnregisterClient(authID) })
+	}
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+		&Auth{ID: "codex-ws-b", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	)
+	ctx := cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background())
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.ExecutionSessionMetadataKey: "model-switch-agent",
+	}}
+
+	luna, errPick := scheduler.pickSingle(ctx, "codex", "gpt-5.6-luna", opts, nil)
+	if errPick != nil || luna == nil {
+		t.Fatalf("initial Luna pick = %#v, err=%v", luna, errPick)
+	}
+	lunaFailover, errPick := scheduler.pickSingle(ctx, "codex", "gpt-5.6-luna", opts, map[string]struct{}{luna.ID: {}})
+	if errPick != nil || lunaFailover == nil || lunaFailover.ID == luna.ID {
+		t.Fatalf("Luna failover = %#v, err=%v, initial=%#v", lunaFailover, errPick, luna)
+	}
+
+	sol, errPick := scheduler.pickSingle(ctx, "codex", "gpt-5.6-sol", opts, nil)
+	if errPick != nil || sol == nil {
+		t.Fatalf("Sol pick = %#v, err=%v", sol, errPick)
+	}
+	if sol.ID != luna.ID {
+		t.Fatalf("Sol inherited Luna's failover pin: sol=%q initial-luna=%q failed-over-luna=%q", sol.ID, luna.ID, lunaFailover.ID)
+	}
+
+	lunaAgain, errPick := scheduler.pickSingle(ctx, "codex", "gpt-5.6-luna", opts, nil)
+	if errPick != nil || lunaAgain == nil || lunaAgain.ID != lunaFailover.ID {
+		t.Fatalf("Luna model-specific pin was lost: got=%#v err=%v want=%q", lunaAgain, errPick, lunaFailover.ID)
+	}
+}
+
 func TestSchedulerPick_XAIWebsocketPrefersWebsocketEnabledSubset(t *testing.T) {
 	t.Parallel()
 
