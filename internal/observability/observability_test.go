@@ -45,6 +45,44 @@ func TestMetricAttributesAreBoundedAndPrivacySafe(t *testing.T) {
 	}
 }
 
+func TestRetryAttributesExposeBoundedDecisionWithoutSessionIdentity(t *testing.T) {
+	t.Parallel()
+	fields := map[string]any{
+		"boundary":             "pre_output",
+		"reason":               "close_1006",
+		"suppression_reason":   "retry_exhausted",
+		"downstream_committed": false,
+		"attempt":              1,
+		"transport_retries":    1,
+		"session_id":           "claude-code:secret-session",
+		"error":                "unexpected EOF with private payload",
+	}
+	metricText := attributesString(metricAttributes(fields))
+	spanText := attributesString(spanAttributes("root-secret", "exec-secret", fields))
+	for _, text := range []string{metricText, spanText} {
+		for _, want := range []string{
+			"retry.boundary=pre_output",
+			"finish.reason=close_1006",
+			"retry.suppression_reason=retry_exhausted",
+			"downstream.committed=false",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("retry attributes missing %q: %s", want, text)
+			}
+		}
+		for _, forbidden := range []string{"secret-session", "unexpected EOF with private payload"} {
+			if strings.Contains(text, forbidden) {
+				t.Errorf("retry attributes leaked %q: %s", forbidden, text)
+			}
+		}
+	}
+	for _, want := range []string{"retry.attempt=1", "retry.count=1"} {
+		if !strings.Contains(spanText, want) {
+			t.Errorf("span retry attributes missing %q: %s", want, spanText)
+		}
+	}
+}
+
 func TestSpanAttributesHashCorrelationAndRejectPayloads(t *testing.T) {
 	t.Parallel()
 	got := spanAttributes("root-secret", "exec-secret", map[string]any{

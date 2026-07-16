@@ -103,6 +103,40 @@ checksums, dashboard/backend availability, trace/log correlation, metric counts
 against raw timelines, and the privacy canary. It writes `verification.json`
 and a publishable `verification.md` into the run directory.
 
+### WebSocket disconnect fault injection
+
+The executor integration suite contains deterministic upstream failures: an
+abrupt close before output, an abrupt close after output, a second close after
+the single retry, and non-retriable protocol/status failures. It also switches
+the recovered session from Luna to Sol to detect stale model pinning. Run it
+without spending model quota:
+
+```bash
+go test ./internal/runtime/executor \
+  -run 'TestCodexWebsocketsExecuteStream(RetriesReadDisconnectBeforeDownstreamOutput|DoesNotRetryReadDisconnectAfterDownstreamOutput|StopsAfterOnePreOutputReadRetry)$' \
+  -count=1
+```
+
+For a real `claudex-next` run, the Grafana **Failures and retries** panel shows
+`transport_retry_attempted`, `transport_retry_succeeded`,
+`transport_retry_exhausted`, and `transport_retry_suppressed`. In Prometheus,
+start with:
+
+```promql
+sum by (event_name, finish_reason, retry_boundary) (
+  increase(claudex_proxy_events_total{event_name=~"transport_retry_.*"}[6h])
+)
+```
+
+In Tempo Explore, filter `service.name = cli-proxy-api` and the run's
+`claudex.run_id`, then inspect the HTTP request span events named
+`proxy.websocket.transport_retry_*`. They include the bounded close reason,
+pre/post-output boundary, attempt, connection source, duration, and whether
+downstream output was already committed. Session IDs, prompts, response bodies,
+credentials, and raw error strings are not exported as metric or span
+attributes. The same decisions remain in the private per-request timeline when
+request logging is enabled.
+
 Launcher-only flags use the `--next-` namespace so all other arguments pass to
 Claude unchanged:
 

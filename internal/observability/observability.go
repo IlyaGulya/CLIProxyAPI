@@ -412,7 +412,7 @@ func RecordWebsocketMetric(ctx context.Context, name, rootCorrelation, execution
 		t.links.Store(key, span.SpanContext())
 	}
 	span.AddEvent("proxy.websocket."+boundedEnum(name), trace.WithAttributes(spanAttrs...))
-	if strings.Contains(name, "failed") || strings.Contains(name, "error") {
+	if strings.Contains(name, "failed") || strings.Contains(name, "error") || strings.Contains(name, "exhausted") {
 		span.SetStatus(codes.Error, boundedEnum(name))
 	}
 }
@@ -480,16 +480,18 @@ func metricAttributes(fields map[string]any) []attribute.KeyValue {
 		out = append(out, attribute.String("model", value))
 	}
 	for source, target := range map[string]string{
-		"connection_source": "connection.source",
-		"source_format":     "source.format",
-		"reason":            "finish.reason",
-		"status":            "status.code",
+		"connection_source":  "connection.source",
+		"source_format":      "source.format",
+		"reason":             "finish.reason",
+		"status":             "status.code",
+		"boundary":           "retry.boundary",
+		"suppression_reason": "retry.suppression_reason",
 	} {
 		if value := boundedEnum(text(fields[source])); value != "" {
 			out = append(out, attribute.String(target, value))
 		}
 	}
-	for _, key := range []string{"success", "reused", "busy", "overflow", "incremental", "rate_limited"} {
+	for _, key := range []string{"success", "reused", "busy", "overflow", "incremental", "rate_limited", "downstream_committed"} {
 		if value, ok := fields[key].(bool); ok {
 			out = append(out, attribute.Bool(strings.ReplaceAll(key, "_", "."), value))
 		}
@@ -511,6 +513,7 @@ func spanAttributes(rootCorrelation, executionCorrelation string, fields map[str
 		"downstream_blocked_us": "downstream_blocked.us", "input_tokens": "gen_ai.usage.input_tokens",
 		"output_tokens": "gen_ai.usage.output_tokens", "cache_read_tokens": "gen_ai.usage.cache_read_tokens",
 		"bytes": "message.bytes", "upstream_bytes": "upstream.bytes", "pool_idle": "pool.idle", "pool_dialing": "pool.dialing",
+		"attempt": "retry.attempt", "transport_retries": "retry.count",
 	}
 	for source, target := range allowedNumbers {
 		if value, ok := numeric(fields[source]); ok {

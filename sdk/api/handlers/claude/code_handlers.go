@@ -431,19 +431,29 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			_, _ = c.Writer.Write(chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
-			if errMsg == nil {
-				return
-			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			c.Status(status)
-
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
-			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+			h.writeTerminalStreamError(c, errMsg)
 		},
 	})
+}
+
+func (h *ClaudeCodeAPIHandler) writeTerminalStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) {
+	if c == nil || errMsg == nil {
+		return
+	}
+	status := http.StatusInternalServerError
+	if errMsg.StatusCode > 0 {
+		status = errMsg.StatusCode
+	}
+	// Once SSE payload bytes have been committed, HTTP status is immutable. Calling
+	// Status here only produces a misleading "headers already written" warning.
+	if !c.Writer.Written() {
+		c.Status(status)
+	}
+	errorBytes, errMarshal := json.Marshal(h.toClaudeError(errMsg))
+	if errMarshal != nil {
+		errorBytes = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
+	}
+	_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 }
 
 type claudeErrorDetail struct {

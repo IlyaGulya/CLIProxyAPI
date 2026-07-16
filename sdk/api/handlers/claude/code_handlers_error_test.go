@@ -4,12 +4,23 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/tidwall/gjson"
 )
+
+type writeHeaderCountingWriter struct {
+	gin.ResponseWriter
+	writes int
+}
+
+func (w *writeHeaderCountingWriter) WriteHeader(statusCode int) {
+	w.writes++
+	w.ResponseWriter.WriteHeader(statusCode)
+}
 
 func TestClaudeErrorExtractsOpenAIStyleUpstreamJSON(t *testing.T) {
 	handler := &ClaudeCodeAPIHandler{}
@@ -90,5 +101,36 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 	}
 	if gotErr != wantErr {
 		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
+	}
+}
+
+func TestWriteClaudeTerminalStreamErrorDoesNotRewriteCommittedStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	counting := &writeHeaderCountingWriter{ResponseWriter: c.Writer}
+	c.Writer = counting
+	c.Header("Content-Type", "text/event-stream")
+	c.Status(http.StatusOK)
+	_, _ = c.Writer.Write([]byte("event: message_start\ndata: {}\n\n"))
+
+	handler := &ClaudeCodeAPIHandler{}
+	handler.writeTerminalStreamError(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusInternalServerError,
+		Error:      errors.New("websocket: close 1006 (abnormal closure): unexpected EOF"),
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200", recorder.Code)
+	}
+	if counting.writes != 1 {
+		t.Fatalf("WriteHeader calls = %d, want no status rewrite after commit", counting.writes)
+	}
+	body := recorder.Body.String()
+	if strings.Count(body, "event: error") != 1 {
+		t.Fatalf("terminal SSE errors = %d, want exactly one; body=%s", strings.Count(body, "event: error"), body)
+	}
+	if !strings.Contains(body, `"type":"error"`) {
+		t.Fatalf("missing Claude error envelope: %s", body)
 	}
 }

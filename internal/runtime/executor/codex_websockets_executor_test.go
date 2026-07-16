@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -468,6 +469,235 @@ func TestCodexWebsocketsExecuteStreamSupportsInSessionModelSwitching(t *testing.
 	exec.CloseExecutionSession("claude-code:model-switch-agent")
 }
 
+func TestCodexWebsocketsExecuteStreamRetriesReadDisconnectBeforeDownstreamOutput(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverErrors := make(chan error, 4)
+	models := make(chan string, 3)
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrors <- fmt.Errorf("upgrade websocket: %w", errUpgrade)
+			return
+		}
+		connection := connections.Add(1)
+		defer func() { _ = conn.Close() }()
+
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			serverErrors <- fmt.Errorf("read connection %d: %w", connection, errRead)
+			return
+		}
+		models <- gjson.GetBytes(payload, "model").String()
+		if connection == 1 {
+			// Abrupt transport loss produces close 1006 / unexpected EOF at the client.
+			_ = conn.UnderlyingConn().Close()
+			return
+		}
+
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-retry","model":"gpt-5.6-luna","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			serverErrors <- fmt.Errorf("write completed: %w", errWrite)
+			return
+		}
+		_, switchedPayload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			serverErrors <- fmt.Errorf("read switched-model request: %w", errRead)
+			return
+		}
+		models <- gjson.GetBytes(switchedPayload, "model").String()
+		switchedCompleted := []byte(`{"type":"response.completed","response":{"id":"resp-switched","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, switchedCompleted); errWrite != nil {
+			serverErrors <- fmt.Errorf("write switched-model completed: %w", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-retry", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"retry me"}],"max_tokens":128,"stream":true}`)
+	req := cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:read-retry",
+		},
+	}
+
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	var downstream strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error = %v", chunk.Err)
+		}
+		downstream.Write(chunk.Payload)
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("connections = %d, want one initial connection plus one retry", got)
+	}
+	for index := 0; index < 2; index++ {
+		select {
+		case model := <-models:
+			if model != "gpt-5.6-luna" {
+				t.Fatalf("attempt %d model = %q, want gpt-5.6-luna", index+1, model)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for model on attempt %d", index+1)
+		}
+	}
+	if !strings.Contains(downstream.String(), `"type":"message_stop"`) {
+		t.Fatalf("downstream response did not complete after retry: %s", downstream.String())
+	}
+
+	switchedPayload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"switch after retry"}],"max_tokens":128,"stream":true}`)
+	switchedResult, errSwitched := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: switchedPayload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: switchedPayload,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:read-retry",
+		},
+	})
+	if errSwitched != nil {
+		t.Fatalf("switched-model ExecuteStream() error = %v", errSwitched)
+	}
+	for chunk := range switchedResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("switched-model stream error = %v", chunk.Err)
+		}
+	}
+	select {
+	case model := <-models:
+		if model != "gpt-5.6-sol" {
+			t.Fatalf("model after retry = %q, want gpt-5.6-sol", model)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for switched model after retry")
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("connections after model switch = %d, want retry connection reuse", got)
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+	exec.CloseExecutionSession("claude-code:read-retry")
+}
+
+func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOutput(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		created := []byte(`{"type":"response.created","response":{"id":"resp-partial","model":"gpt-5.6-luna"}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, created); errWrite != nil {
+			t.Errorf("write created: %v", errWrite)
+			return
+		}
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-partial", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"partial"}],"max_tokens":128,"stream":true}`)
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:post-output-disconnect",
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	payloadChunks := 0
+	errorChunks := 0
+	for chunk := range result.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloadChunks++
+		}
+		if chunk.Err != nil {
+			errorChunks++
+		}
+	}
+	if payloadChunks == 0 {
+		t.Fatal("expected downstream output before disconnect")
+	}
+	if errorChunks != 1 {
+		t.Fatalf("error chunks = %d, want exactly one", errorChunks)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("connections = %d, want no replay after downstream output", got)
+	}
+	exec.CloseExecutionSession("claude-code:post-output-disconnect")
+}
+
+func TestCodexWebsocketsExecuteStreamStopsAfterOnePreOutputReadRetry(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-exhausted", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"fail twice"}],"max_tokens":128,"stream":true}`)
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: payload,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:retry-exhausted",
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	errorChunks := 0
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			errorChunks++
+		}
+	}
+	if errorChunks != 1 {
+		t.Fatalf("error chunks = %d, want exactly one", errorChunks)
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("connections = %d, want exactly one retry", got)
+	}
+	exec.CloseExecutionSession("claude-code:retry-exhausted")
+}
+
 func TestCodexAutoExecutorFallsBackToHTTPWhenWebsocketUnsupported(t *testing.T) {
 	var websocketAttempts atomic.Int32
 	var httpRequests atomic.Int32
@@ -571,12 +801,14 @@ func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsock
 
 func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("upgrade websocket: %v", err)
 			return
 		}
+		connections.Add(1)
 		defer func() { _ = conn.Close() }()
 
 		if _, _, errRead := conn.ReadMessage(); errRead != nil {
@@ -628,6 +860,35 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for error stream chunk")
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("connections = %d, want no retry for message-too-big close", got)
+	}
+}
+
+func TestShouldRetryCodexWebsocketReadError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "abnormal closure", err: &websocket.CloseError{Code: websocket.CloseAbnormalClosure}, want: true},
+		{name: "service restart", err: &websocket.CloseError{Code: websocket.CloseServiceRestart}, want: true},
+		{name: "normal closure", err: &websocket.CloseError{Code: websocket.CloseNormalClosure}, want: false},
+		{name: "protocol error", err: &websocket.CloseError{Code: websocket.CloseProtocolError}, want: false},
+		{name: "policy violation", err: &websocket.CloseError{Code: websocket.ClosePolicyViolation}, want: false},
+		{name: "message too big", err: statusErr{code: http.StatusRequestEntityTooLarge}, want: false},
+		{name: "canceled", err: context.Canceled, want: false},
+		{name: "deadline", err: context.DeadlineExceeded, want: false},
+		{name: "EOF", err: io.EOF, want: true},
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRetryCodexWebsocketReadError(tt.err); got != tt.want {
+				t.Fatalf("shouldRetryCodexWebsocketReadError(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
