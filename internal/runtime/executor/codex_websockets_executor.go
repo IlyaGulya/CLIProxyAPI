@@ -485,18 +485,35 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
+	sessionOverflow := false
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
-			lockWait, sessionBusy := sess.lockRequest()
-			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "session_lock_acquired", map[string]any{
-				"session_id": executionSessionID,
-				"wait_us":    lockWait.Microseconds(),
-				"busy":       sessionBusy,
-			})
-			if sess.codexHTTPFallback() {
-				sess.reqMu.Unlock()
-				return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+			if from.String() == "claude" && !sess.reqMu.TryLock() {
+				sessionOverflow = true
+				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "session_busy", map[string]any{
+					"session_id": executionSessionID,
+					"overflow":   true,
+				})
+				if sess.codexHTTPFallback() {
+					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+				}
+				sess = nil
+			} else {
+				lockWait := time.Duration(0)
+				sessionBusy := false
+				if from.String() != "claude" {
+					lockWait, sessionBusy = sess.lockRequest()
+				}
+				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "session_lock_acquired", map[string]any{
+					"session_id": executionSessionID,
+					"wait_us":    lockWait.Microseconds(),
+					"busy":       sessionBusy,
+				})
+				if sess.codexHTTPFallback() {
+					sess.reqMu.Unlock()
+					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+				}
 			}
 		}
 	}
@@ -515,6 +532,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		"input_items":              gjson.GetBytes(requestBody, "input.#").Int(),
 		"incremental":              incrementalObservation.incremental,
 		"incremental_reset_reason": incrementalObservation.resetReason,
+		"overflow":                 sessionOverflow,
 		"has_previous_response":    strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
 	})
 	var identityState codexIdentityConfuseState
@@ -536,13 +554,24 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	connectStartedAt := time.Now()
-	conn, respHS, connectionSource, errDial := e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
+	var conn *websocket.Conn
+	var respHS *http.Response
+	var connectionSource codexWebsocketConnectionSource
+	var overflowBaseSource codexWebsocketConnectionSource
+	var errDial error
+	if sessionOverflow {
+		conn, respHS, overflowBaseSource, errDial = e.ensureOverflowConnObserved(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
+		connectionSource = codexWebsocketConnectionOverflow
+	} else {
+		conn, respHS, connectionSource, errDial = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
+	}
 	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "connection_ready", map[string]any{
-		"session_id":        executionSessionID,
-		"duration_us":       time.Since(connectStartedAt).Microseconds(),
-		"connection_source": connectionSource,
-		"reused":            connectionSource == codexWebsocketConnectionSessionReuse || connectionSource == codexWebsocketConnectionSpeculative,
-		"success":           errDial == nil,
+		"session_id":           executionSessionID,
+		"duration_us":          time.Since(connectStartedAt).Microseconds(),
+		"connection_source":    connectionSource,
+		"overflow_base_source": overflowBaseSource,
+		"reused":               connectionSource == codexWebsocketConnectionSessionReuse || connectionSource == codexWebsocketConnectionSpeculative,
+		"success":              errDial == nil,
 	})
 	var upstreamHeaders http.Header
 	if respHS != nil {
@@ -1841,11 +1870,20 @@ const (
 	codexWebsocketConnectionCold         codexWebsocketConnectionSource = "cold"
 	codexWebsocketConnectionSessionReuse codexWebsocketConnectionSource = "session_reuse"
 	codexWebsocketConnectionSpeculative  codexWebsocketConnectionSource = "speculative"
+	codexWebsocketConnectionOverflow     codexWebsocketConnectionSource = "overflow"
 )
 
 func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
 	conn, resp, _, err := e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, headers)
 	return conn, resp, err
+}
+
+func (e *CodexWebsocketsExecutor) ensureOverflowConnObserved(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string) (*websocket.Conn, *http.Response, codexWebsocketConnectionSource, error) {
+	if pooledConn := e.takeSpeculativePreconnect(ctx, authID, wsURL, sessionID); pooledConn != nil {
+		return pooledConn, nil, codexWebsocketConnectionSpeculative, nil
+	}
+	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
+	return conn, resp, codexWebsocketConnectionCold, errDial
 }
 
 func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, codexWebsocketConnectionSource, error) {

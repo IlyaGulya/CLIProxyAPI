@@ -355,6 +355,109 @@ func TestClaudeMessagesRootAndSubagentDoNotSerializeOnOneWebsocket(t *testing.T)
 	}
 }
 
+func TestClaudeMessagesConcurrentSameSessionUsesOverflowWebsocket(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverErrors := make(chan error, 4)
+	bothArrived := make(chan struct{})
+	var closeBarrier sync.Once
+	var connections atomic.Int32
+	var arrivals atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrors <- fmt.Errorf("upgrade websocket: %w", errUpgrade)
+			return
+		}
+		connectionIndex := connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			serverErrors <- fmt.Errorf("connection %d read: %w", connectionIndex, errRead)
+			return
+		}
+		if arrivals.Add(1) == 2 {
+			closeBarrier.Do(func() { close(bothArrived) })
+		}
+		select {
+		case <-bothArrived:
+		case <-time.After(2 * time.Second):
+			serverErrors <- fmt.Errorf("same-session connection %d timed out waiting for overflow request", connectionIndex)
+			return
+		}
+		completed := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-overflow-%d","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`, connectionIndex))
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			serverErrors <- fmt.Errorf("connection %d write: %w", connectionIndex, errWrite)
+		}
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.handlers.Cfg.CodexPreferUpstreamWebsockets = true
+	server.cfg.CodexPreferUpstreamWebsockets = true
+	server.cfg.DisableImageGeneration = proxyconfig.DisableImageGenerationAll
+	server.handlers.AuthManager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(server.cfg))
+	credential := &cliproxyauth.Auth{
+		ID:       "codex-ws-same-session-overflow",
+		Provider: "codex",
+		Status:   cliproxyauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   upstream.URL,
+			"websockets": "true",
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(credential.ID, credential.Provider, []*registry.ModelInfo{{ID: "gpt-5.6-sol"}})
+	t.Cleanup(func() {
+		runtimeexecutor.CloseCodexWebsocketSessionsForAuthID(credential.ID, "test_cleanup")
+		registry.GetGlobalRegistry().UnregisterClient(credential.ID)
+	})
+	if _, errRegister := server.handlers.AuthManager.Register(context.Background(), credential); errRegister != nil {
+		t.Fatalf("register Codex credential: %v", errRegister)
+	}
+
+	type requestResult struct {
+		name   string
+		status int
+		body   string
+	}
+	results := make(chan requestResult, 2)
+	start := make(chan struct{})
+	for _, requestName := range []string{"title", "main"} {
+		requestName := requestName
+		go func() {
+			<-start
+			payload := `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"` + requestName + ` request"}],"max_tokens":128,"stream":true}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(payload))
+			req.Header.Set("Authorization", "Bearer test-key")
+			req.Header.Set(helps.ClaudeCodeSessionHeader, "same-session-overflow-root")
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			results <- requestResult{name: requestName, status: rr.Code, body: rr.Body.String()}
+		}()
+	}
+	close(start)
+	for range 2 {
+		select {
+		case result := <-results:
+			if result.status != http.StatusOK || !strings.Contains(result.body, "message_stop") {
+				t.Fatalf("%s response status=%d body=%s", result.name, result.status, result.body)
+			}
+		case <-time.After(4 * time.Second):
+			t.Fatal("same-session requests serialized instead of using overflow")
+		}
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("websocket connections = %d, want canonical plus overflow", got)
+	}
+	if got := arrivals.Load(); got != 2 {
+		t.Fatalf("concurrent upstream requests = %d, want 2", got)
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+}
+
 func TestClaudeMessagesWebsocket429FailsOverAndRepinsSession(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var primaryConnections atomic.Int32
