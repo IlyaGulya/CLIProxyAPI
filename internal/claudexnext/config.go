@@ -99,10 +99,7 @@ func configString(value any) string {
 
 // BuildClaudeArgs adds observable defaults while respecting explicit user flags.
 func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
-	out := make([]string, 0, len(args)+6)
-	if !hasFlag(args, "--model") {
-		out = append(out, "--model", "gpt-5.6-sol")
-	}
+	out := make([]string, 0, len(args)+4)
 	if !hasAnyFlag(args, "--session-id", "--resume", "-r", "--continue", "-c") {
 		out = append(out, "--session-id", sessionID)
 	}

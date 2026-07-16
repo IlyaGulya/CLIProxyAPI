@@ -52,10 +52,10 @@ codex-websocket-generate-false-warmup: true
 	}
 }
 
-func TestBuildClaudeArgsAddsFreshSessionAndDebugWithoutOverridingUserFlags(t *testing.T) {
+func TestBuildClaudeArgsAddsOnlyObservabilityFlagsWithoutModelPolicy(t *testing.T) {
 	t.Parallel()
 	got := BuildClaudeArgs([]string{"--effort", "xhigh"}, "session-1", "/run/debug.log")
-	want := []string{"--model", "gpt-5.6-sol", "--session-id", "session-1", "--debug-file", "/run/debug.log", "--effort", "xhigh"}
+	want := []string{"--session-id", "session-1", "--debug-file", "/run/debug.log", "--effort", "xhigh"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -130,6 +130,7 @@ X-Claude-Code-Agent-Id: child-1
 
 func TestLoadEnvFileDoesNotOverrideExistingEnvironment(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "existing")
+	t.Setenv("CLAUDE_CODE_SUBAGENT_MODEL", "user-selected-model")
 	path := filepath.Join(t.TempDir(), "claudex.env")
 	if err := os.WriteFile(path, []byte("export ANTHROPIC_AUTH_TOKEN=from-file\nexport ANTHROPIC_BASE_URL='http://old'\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -141,6 +142,9 @@ func TestLoadEnvFileDoesNotOverrideExistingEnvironment(t *testing.T) {
 	values := envMap(env)
 	if values["ANTHROPIC_AUTH_TOKEN"] != "existing" || values["ANTHROPIC_BASE_URL"] != "http://old" {
 		t.Fatalf("loaded env = %#v", values)
+	}
+	if values["CLAUDE_CODE_SUBAGENT_MODEL"] != "user-selected-model" {
+		t.Fatalf("Claude routing environment was changed: %#v", values)
 	}
 }
 
@@ -177,13 +181,5 @@ func TestSessionIDFromRequestLogsSupportsResumeRuns(t *testing.T) {
 	}
 	if got := sessionIDFromRequestLogs(logs); got != "resumed-session" {
 		t.Fatalf("session ID = %q", got)
-	}
-}
-
-func TestNextEnvUsesNamespacedOverrideInsteadOfLegacyClaudeEnvironment(t *testing.T) {
-	t.Setenv("CLAUDE_CODE_SUBAGENT_MODEL", "stale-sol")
-	t.Setenv("CLAUDEX_NEXT_SUBAGENT_MODEL", "gpt-5.6-luna")
-	if got := nextEnv("CLAUDEX_NEXT_SUBAGENT_MODEL", "fallback"); got != "gpt-5.6-luna" {
-		t.Fatalf("next env = %q", got)
 	}
 }

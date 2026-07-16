@@ -105,10 +105,6 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	}
 	values := envMap(baseEnv)
 	values["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + strconv.Itoa(port)
-	values["CLAUDE_CODE_SUBAGENT_MODEL"] = nextEnv("CLAUDEX_NEXT_SUBAGENT_MODEL", "gpt-5.6-luna")
-	values["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
-	values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"] = nextEnv("CLAUDEX_NEXT_MAX_TOOL_USE_CONCURRENCY", "3")
-	values["ENABLE_TOOL_SEARCH"] = "false"
 	values["CLAUDEX_NEXT_RUN_ID"] = runID
 
 	proxyLog, errProxyLog := os.OpenFile(filepath.Join(runDir, "proxy", "process.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -228,13 +224,6 @@ func defaults(opts *Options, home string) {
 			opts.ProxyBin = filepath.Join(filepath.Dir(executable), "cli-proxy-api-next")
 		}
 	}
-}
-
-func nextEnv(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
-	}
-	return fallback
 }
 
 func freePort() (int, error) {

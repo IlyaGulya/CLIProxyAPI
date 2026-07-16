@@ -26,10 +26,11 @@ can contain prompts, tool payloads, upstream credentials, and other sensitive
 data. Do not publish a complete bundle. The summary files contain only models,
 correlation IDs, latency, usage, cache, connection-source, and completion data.
 
-The launcher defaults to a `gpt-5.6-sol` root, `gpt-5.6-luna` children, and a
-maximum Claude tool-use concurrency of three. It ignores a stale inherited
-`CLAUDE_CODE_SUBAGENT_MODEL`; use `CLAUDEX_NEXT_SUBAGENT_MODEL` for an explicit
-override. `CLAUDEX_NEXT_MAX_TOOL_USE_CONCURRENCY` overrides the concurrency.
+The launcher is routing-neutral. It does not add `--model` and does not set or
+rewrite `CLAUDE_CODE_SUBAGENT_MODEL`, effort, tool-search, background-task, or
+concurrency settings. Claude receives the same CLI arguments and environment
+that it would receive without the launcher. Model and workflow policy belongs
+in the caller's shell, Claude configuration, or an explicit benchmark preset.
 
 The isolated proxy enables upstream WebSockets, request timelines, speculative
 preconnect, and bounded replenishment. `generate=false` warmup remains disabled.
