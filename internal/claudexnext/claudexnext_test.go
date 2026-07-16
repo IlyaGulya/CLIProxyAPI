@@ -51,6 +51,7 @@ codex-websocket-generate-false-warmup: true
 		"logging-to-file: true",
 		"request-log: true",
 		"codex-prefer-upstream-websockets: true",
+		"claude-code-auto-mode-classifier-model: gpt-5.6-luna",
 		"codex-websocket-speculative-preconnect: true",
 		"codex-websocket-preconnect-replenish: true",
 		"codex-websocket-preconnect-max-idle: 2",
@@ -68,6 +69,24 @@ codex-websocket-generate-false-warmup: true
 	}
 	if !parsed.CodexPreferUpstreamWebsockets || !parsed.CodexWebsocketSpeculativePreconnect || !parsed.RequestLog {
 		t.Fatalf("prepared runtime flags were not parsed: %+v", parsed.SDKConfig)
+	}
+	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-luna" {
+		t.Fatalf("classifier model = %q, want gpt-5.6-luna", parsed.ClaudeCodeAutoModeClassifierModel)
+	}
+}
+
+func TestPrepareConfigPreservesExplicitClassifierModel(t *testing.T) {
+	t.Parallel()
+	got, err := PrepareConfig([]byte("claude-code-auto-mode-classifier-model: gpt-5.6-sol\n"), 18432)
+	if err != nil {
+		t.Fatalf("PrepareConfig: %v", err)
+	}
+	parsed, errParse := config.ParseConfigBytes(got)
+	if errParse != nil {
+		t.Fatalf("parse prepared config: %v", errParse)
+	}
+	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-sol" {
+		t.Fatalf("classifier model = %q, want preserved gpt-5.6-sol", parsed.ClaudeCodeAutoModeClassifierModel)
 	}
 }
 

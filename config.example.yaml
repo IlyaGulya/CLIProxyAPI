@@ -211,6 +211,11 @@ codex-websocket-preconnect-max-idle: 2
 # How long an unused speculative connection remains available; <= 0 uses 30 seconds.
 codex-websocket-preconnect-ttl-seconds: 30
 
+# Reroute only Claude Code auto-mode safety classifier requests that match its
+# narrow internal payload signature. Empty disables rewriting. claudex-next
+# defaults this isolated runtime setting to gpt-5.6-luna.
+claude-code-auto-mode-classifier-model: ""
+
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).

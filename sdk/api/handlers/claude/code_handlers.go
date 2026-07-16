@@ -85,6 +85,17 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	classifierModel := ""
+	if h != nil && h.Cfg != nil {
+		classifierModel = h.Cfg.ClaudeCodeAutoModeClassifierModel
+	}
+	if rewrittenJSON, rewritten := rewriteClaudeCodeAutoModeClassifierModel(rawJSON, classifierModel); rewritten {
+		log.WithFields(log.Fields{
+			"source_model": "claude-sonnet-5",
+			"target_model": strings.TrimSpace(classifierModel),
+		}).Debug("Claude Code auto-mode classifier model rewritten")
+		rawJSON = rewrittenJSON
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -93,6 +104,48 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	} else {
 		h.handleStreamingResponse(c, rawJSON)
 	}
+}
+
+const claudeCodeAutoModeClassifierPrompt = "You are a security monitor for autonomous AI coding agents."
+
+// rewriteClaudeCodeAutoModeClassifierModel reroutes only Claude Code's internal
+// auto-mode safety classifier. The full signature avoids changing ordinary
+// requests that happen to use the same client-visible model name.
+func rewriteClaudeCodeAutoModeClassifierModel(rawJSON []byte, targetModel string) ([]byte, bool) {
+	targetModel = strings.TrimSpace(targetModel)
+	if targetModel == "" || targetModel == "claude-sonnet-5" {
+		return rawJSON, false
+	}
+	if gjson.GetBytes(rawJSON, "model").String() != "claude-sonnet-5" ||
+		gjson.GetBytes(rawJSON, "max_tokens").Int() != 64 ||
+		gjson.GetBytes(rawJSON, "thinking.type").String() != "disabled" {
+		return rawJSON, false
+	}
+	hasStopSequence := false
+	for _, stop := range gjson.GetBytes(rawJSON, "stop_sequences").Array() {
+		if stop.String() == "</block>" {
+			hasStopSequence = true
+			break
+		}
+	}
+	if !hasStopSequence {
+		return rawJSON, false
+	}
+	hasClassifierPrompt := false
+	for _, block := range gjson.GetBytes(rawJSON, "system").Array() {
+		if strings.HasPrefix(block.Get("text").String(), claudeCodeAutoModeClassifierPrompt) {
+			hasClassifierPrompt = true
+			break
+		}
+	}
+	if !hasClassifierPrompt {
+		return rawJSON, false
+	}
+	updated, errSet := sjson.SetBytes(rawJSON, "model", targetModel)
+	if errSet != nil {
+		return rawJSON, false
+	}
+	return updated, true
 }
 
 // ClaudeMessages handles Claude-compatible streaming chat completions.

@@ -36,6 +36,9 @@ func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
 	values["codex-websocket-preconnect-replenish"] = true
 	values["codex-websocket-preconnect-max-idle"] = 2
 	values["codex-websocket-preconnect-ttl-seconds"] = 30
+	if _, configured := values["claude-code-auto-mode-classifier-model"]; !configured {
+		values["claude-code-auto-mode-classifier-model"] = "gpt-5.6-luna"
+	}
 	out, errMarshal := yaml.Marshal(values)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("encode proxy config: %w", errMarshal)

@@ -77,6 +77,11 @@ type SDKConfig struct {
 	// websocket may remain idle. Values <= 0 use the default (30 seconds).
 	CodexWebsocketPreconnectTTLSeconds int `yaml:"codex-websocket-preconnect-ttl-seconds,omitempty" json:"codex-websocket-preconnect-ttl-seconds,omitempty"`
 
+	// ClaudeCodeAutoModeClassifierModel reroutes Claude Code's internal auto-mode
+	// safety classifier requests to the configured model. Empty disables rewriting.
+	// Only requests matching the classifier's narrow payload signature are changed.
+	ClaudeCodeAutoModeClassifierModel string `yaml:"claude-code-auto-mode-classifier-model,omitempty" json:"claude-code-auto-mode-classifier-model,omitempty"`
+
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 

@@ -71,6 +71,20 @@ prompt, assistant response, tool detail/content, and raw API body export off,
 and exclude session/account/run resource attributes from Claude metric labels.
 The private request logs and transcripts can still contain sensitive content.
 
+Claude Code's auto-mode safety classifier uses the internal model name
+`claude-sonnet-5`. `claudex-next` recognizes the classifier by its complete
+request signature and routes it to `gpt-5.6-luna` by default, avoiding the
+unsupported-model fallback delay. Override or disable this in the source proxy
+configuration; explicit values are preserved in each isolated run:
+
+```yaml
+# Use any model available through the proxy, or set "" to disable rewriting.
+claude-code-auto-mode-classifier-model: gpt-5.6-sol
+```
+
+Ordinary requests are never rewritten solely because their model name is
+`claude-sonnet-5`.
+
 Run the budget-guarded Sol → Luna → Sol verification with:
 
 ```bash
