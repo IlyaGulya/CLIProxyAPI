@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -442,9 +443,13 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 	record["timestamp"] = time.Now().Format(time.RFC3339Nano)
 	record["event"] = "api.websocket.metric"
 	record["name"] = name
+	if rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil); rootCorrelation != "" {
+		record["claude_root_correlation_id"] = rootCorrelation
+		record["claude_execution_correlation_id"] = executionCorrelation
+	}
 	for key, value := range fields {
 		key = strings.TrimSpace(key)
-		if key == "" || key == "timestamp" || key == "event" || key == "name" {
+		if key == "" || key == "timestamp" || key == "event" || key == "name" || key == "claude_root_correlation_id" || key == "claude_execution_correlation_id" {
 			continue
 		}
 		record[key] = value
@@ -455,6 +460,21 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 		return
 	}
 	appendAPIWebsocketTimeline(ginCtx, payload)
+}
+
+// CodexUsageMetricFields converts usage into a stable, provider-neutral metric
+// shape suitable for prompt-free request timelines.
+func CodexUsageMetricFields(detail usage.Detail) map[string]any {
+	return map[string]any{
+		"input_tokens":          detail.InputTokens,
+		"output_tokens":         detail.OutputTokens,
+		"reasoning_tokens":      detail.ReasoningTokens,
+		"cached_tokens":         detail.CachedTokens,
+		"cache_read_tokens":     detail.CacheReadTokens,
+		"cache_creation_tokens": detail.CacheCreationTokens,
+		"total_tokens":          detail.TotalTokens,
+		"response_service_tier": detail.ResponseServiceTier,
+	}
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {

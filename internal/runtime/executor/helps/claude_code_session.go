@@ -67,6 +67,24 @@ func ClaudeCodeWebsocketSessionID(ctx context.Context, payload []byte, headers h
 	return ClaudeCodeWebsocketSessionPrefix + uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
 }
 
+// ClaudeCodeCorrelationIDs returns privacy-safe, stable identifiers for
+// joining root and agent request timelines without logging client session or
+// agent IDs. The first value is shared by all agents under one root; the
+// second identifies the individual root/agent execution.
+func ClaudeCodeCorrelationIDs(ctx context.Context, payload []byte, headers http.Header) (string, string) {
+	rootSessionID := ExtractClaudeCodeSessionID(ctx, payload, headers)
+	if rootSessionID == "" {
+		return "", ""
+	}
+	agentID := ExtractClaudeCodeAgentID(ctx, headers)
+	if agentID == "" {
+		agentID = "main"
+	}
+	rootCorrelation := "claude-root:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("root\x00"+rootSessionID)).String()
+	executionCorrelation := "claude-exec:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("execution\x00"+rootSessionID+"\x00"+agentID)).String()
+	return rootCorrelation, executionCorrelation
+}
+
 func extractClaudeCodeSessionIDFromPayload(payload []byte) string {
 	if len(payload) == 0 {
 		return ""

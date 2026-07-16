@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -250,7 +251,7 @@ func TestCodexWebsocketsExecuteStreamTranslatesClaudeRequestBeforeSend(t *testin
 	}))
 	defer server.Close()
 
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll, RequestLog: true}})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model: "gpt-5.6-sol",
@@ -266,9 +267,15 @@ func TestCodexWebsocketsExecuteStreamTranslatesClaudeRequestBeforeSend(t *testin
 		SourceFormat:    sdktranslator.FromString("claude"),
 		ResponseFormat:  sdktranslator.FromString("claude"),
 		OriginalRequest: req.Payload,
+		Headers:         http.Header{helps.ClaudeCodeSessionHeader: []string{"timeline-root"}, helps.ClaudeCodeAgentHeader: []string{"timeline-child"}},
+		Metadata:        map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:timeline-child"},
 	}
 
-	result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Request.Header = opts.Headers.Clone()
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	result, errExecute := exec.ExecuteStream(ctx, auth, req, opts)
 	if errExecute != nil {
 		t.Fatalf("ExecuteStream() error = %v", errExecute)
 	}
@@ -292,6 +299,28 @@ func TestCodexWebsocketsExecuteStreamTranslatesClaudeRequestBeforeSend(t *testin
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for translated Claude payload")
 	}
+	timelineValue, exists := ginCtx.Get("API_WEBSOCKET_TIMELINE")
+	if !exists {
+		t.Fatal("websocket timeline was not captured")
+	}
+	timeline := string(timelineValue.([]byte))
+	for _, want := range []string{
+		`"name":"session_lock_acquired"`,
+		`"busy":false`,
+		`"name":"request_prepared"`,
+		`"incremental_reset_reason":"no_previous_response"`,
+		`"name":"connection_ready"`,
+		`"connection_source":"cold"`,
+		`"name":"usage"`,
+		`"input_tokens":1`,
+		`"claude_root_correlation_id":"claude-root:`,
+		`"claude_execution_correlation_id":"claude-exec:`,
+	} {
+		if !strings.Contains(timeline, want) {
+			t.Fatalf("timeline missing %q: %s", want, timeline)
+		}
+	}
+	exec.CloseExecutionSession("claude-code:timeline-child")
 }
 
 func TestCodexWebsocketsExecuteStreamReusesAgentSessionConnection(t *testing.T) {
@@ -711,6 +740,66 @@ func TestCodexWebsocketsEnsureUpstreamConnReplacesCredentialMismatch(t *testing.
 		}
 	}
 	exec.CloseExecutionSession("credential-mismatch")
+}
+
+func TestCodexWebsocketsEnsureUpstreamConnReportsColdAndSessionReuse(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	sess := exec.getOrCreateSession("connection-source")
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	first, _, firstSource, errFirst := exec.ensureUpstreamConnObserved(context.Background(), nil, sess, "auth-source", wsURL, http.Header{})
+	if errFirst != nil || firstSource != codexWebsocketConnectionCold {
+		t.Fatalf("first connection = (%v, %q), want cold success", errFirst, firstSource)
+	}
+	second, _, secondSource, errSecond := exec.ensureUpstreamConnObserved(context.Background(), nil, sess, "auth-source", wsURL, http.Header{})
+	if errSecond != nil || secondSource != codexWebsocketConnectionSessionReuse {
+		t.Fatalf("second connection = (%v, %q), want session reuse", errSecond, secondSource)
+	}
+	if first != second {
+		t.Fatal("session reuse returned a different websocket")
+	}
+	exec.CloseExecutionSession("connection-source")
+}
+
+func TestCodexWebsocketSessionLockReportsBusyWait(t *testing.T) {
+	sess := &codexWebsocketSession{}
+	sess.reqMu.Lock()
+	result := make(chan struct {
+		wait time.Duration
+		busy bool
+	}, 1)
+	go func() {
+		wait, busy := sess.lockRequest()
+		result <- struct {
+			wait time.Duration
+			busy bool
+		}{wait: wait, busy: busy}
+		sess.reqMu.Unlock()
+	}()
+	time.Sleep(20 * time.Millisecond)
+	sess.reqMu.Unlock()
+
+	got := <-result
+	if !got.busy {
+		t.Fatal("contended request lock was not reported busy")
+	}
+	if got.wait < 15*time.Millisecond {
+		t.Fatalf("reported wait = %s, want at least 15ms", got.wait)
+	}
 }
 
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {

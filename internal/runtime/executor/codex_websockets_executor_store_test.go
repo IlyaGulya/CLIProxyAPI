@@ -155,12 +155,27 @@ func TestCodexWebsocketIncrementalStateIsSizeBounded(t *testing.T) {
 	sess := &codexWebsocketSession{}
 	oversized := []byte(`{"model":"gpt-5.6-sol","instructions":"` + strings.Repeat("x", codexWebsocketMaxIncrementalStateBytes) + `","input":[]}`)
 
-	got := sess.prepareCodexIncrementalRequest(oversized)
+	got, observation := sess.prepareCodexIncrementalRequestObserved(oversized)
 	if len(got) != len(oversized) {
 		t.Fatalf("oversized request length = %d, want %d", len(got), len(oversized))
 	}
 	if len(sess.pendingRequest) != 0 || len(sess.lastRequest) != 0 || sess.lastResponseID != "" {
 		t.Fatalf("oversized request was retained in incremental state: pending=%d last=%d response=%q", len(sess.pendingRequest), len(sess.lastRequest), sess.lastResponseID)
+	}
+	if observation.resetReason != "state_too_large" || observation.incremental {
+		t.Fatalf("observation = %+v, want state_too_large non-incremental", observation)
+	}
+}
+
+func TestCodexWebsocketIncrementalObservationReportsNoPreviousResponse(t *testing.T) {
+	sess := &codexWebsocketSession{}
+	request := []byte(`{"model":"gpt-5.6-sol","input":[]}`)
+	got, observation := sess.prepareCodexIncrementalRequestObserved(request)
+	if string(got) != string(request) {
+		t.Fatalf("request changed without previous response: %s", got)
+	}
+	if observation.resetReason != "no_previous_response" || observation.incremental {
+		t.Fatalf("observation = %+v, want no_previous_response", observation)
 	}
 }
 

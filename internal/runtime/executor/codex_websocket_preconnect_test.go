@@ -200,6 +200,26 @@ func TestCodexWebsocketPreconnectPoolExpiresUnusedConnection(t *testing.T) {
 	}
 }
 
+func TestCodexWebsocketPreconnectPoolReportsExpiration(t *testing.T) {
+	connections := newCodexPreconnectTestConnections(t, 1)
+	pool := newCodexWebsocketPreconnectTestPool()
+	key := codexWebsocketPreconnectKey{authID: "auth-expire-observed", wsURL: "wss://example.test/responses"}
+	now := time.Now()
+	reserved, _, token := pool.reserve(key, 1, now)
+	if !reserved {
+		t.Fatal("expiration reservation was rejected")
+	}
+	expired := make(chan struct{})
+	if !pool.completeReservationObserved(key, token, connections[0], 1, 20*time.Millisecond, now, func() { close(expired) }) {
+		t.Fatal("expiration reservation was not stored")
+	}
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("expiration callback was not invoked")
+	}
+}
+
 func TestCodexWebsocketPreconnectPool429CooldownIsRouteScoped(t *testing.T) {
 	pool := newCodexWebsocketPreconnectTestPool()
 	keyA := codexWebsocketPreconnectKey{authID: "auth-a", wsURL: "wss://a.test/responses"}
@@ -256,9 +276,24 @@ func TestCodexWebsocketPreconnectPoolWaitsForInflightConnection(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	conn, _, ok := pool.takeOrWait(ctx, key, time.Minute)
+	conn, _, observation, ok := pool.takeOrWaitObserved(ctx, key, time.Minute)
 	if !ok || conn != connections[0] {
 		t.Fatal("request did not lease the in-flight speculative connection")
+	}
+	if observation.reason != "leased" || observation.wait < 15*time.Millisecond {
+		t.Fatalf("observation = %+v, want leased wait >= 15ms", observation)
+	}
+}
+
+func TestCodexWebsocketPreconnectPoolReportsImmediateMiss(t *testing.T) {
+	pool := newCodexWebsocketPreconnectTestPool()
+	key := codexWebsocketPreconnectKey{authID: "auth-miss", wsURL: "wss://example.test/responses"}
+	conn, _, observation, ok := pool.takeOrWaitObserved(context.Background(), key, time.Minute)
+	if ok || conn != nil {
+		t.Fatal("empty pool unexpectedly returned a connection")
+	}
+	if observation.reason != "no_idle" || observation.idle != 0 || observation.dialing != 0 {
+		t.Fatalf("observation = %+v, want no_idle with empty pool", observation)
 	}
 }
 

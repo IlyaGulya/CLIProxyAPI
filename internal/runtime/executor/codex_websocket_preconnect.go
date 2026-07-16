@@ -31,6 +31,13 @@ type codexWebsocketPreconnectEntry struct {
 	createdAt time.Time
 }
 
+type codexWebsocketPreconnectObservation struct {
+	wait    time.Duration
+	reason  string
+	idle    int
+	dialing int
+}
+
 type codexWebsocketPreconnectPool struct {
 	mu             sync.Mutex
 	idle           map[codexWebsocketPreconnectKey][]codexWebsocketPreconnectEntry
@@ -91,10 +98,13 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
 	reserved, reason, generation := globalCodexWebsocketPreconnectPool.reserve(key, maxIdle, time.Now())
+	poolIdle, poolDialing := globalCodexWebsocketPreconnectPool.snapshot()
 	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_triggered", map[string]any{
-		"session_id": sessionID,
-		"reserved":   reserved,
-		"reason":     reason,
+		"session_id":   sessionID,
+		"reserved":     reserved,
+		"reason":       reason,
+		"pool_idle":    poolIdle,
+		"pool_dialing": poolDialing,
 	})
 	if !reserved {
 		return
@@ -115,11 +125,14 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 		if errDial != nil || conn == nil {
 			duration := time.Since(startedAt)
 			globalCodexWebsocketPreconnectPool.failReservation(key, generation, status == http.StatusTooManyRequests, time.Now())
+			idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
 			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_failed", map[string]any{
 				"session_id":   sessionID,
 				"duration_us":  duration.Microseconds(),
 				"status":       status,
 				"rate_limited": status == http.StatusTooManyRequests,
+				"pool_idle":    idle,
+				"pool_dialing": dialing,
 			})
 			log.WithFields(log.Fields{
 				"auth":        key.authID,
@@ -129,18 +142,31 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 			}).WithError(errDial).Debug("codex websockets: speculative preconnect failed")
 			return
 		}
-		if !globalCodexWebsocketPreconnectPool.completeReservation(key, generation, conn, maxIdle, ttl, time.Now()) {
+		if !globalCodexWebsocketPreconnectPool.completeReservationObserved(key, generation, conn, maxIdle, ttl, time.Now(), func() {
+			idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
+			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_expired", map[string]any{
+				"session_id":   sessionID,
+				"pool_idle":    idle,
+				"pool_dialing": dialing,
+			})
+		}) {
+			idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
 			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_discarded", map[string]any{
-				"session_id":  sessionID,
-				"duration_us": time.Since(startedAt).Microseconds(),
+				"session_id":   sessionID,
+				"duration_us":  time.Since(startedAt).Microseconds(),
+				"pool_idle":    idle,
+				"pool_dialing": dialing,
 			})
 			_ = conn.Close()
 			return
 		}
 		duration := time.Since(startedAt)
+		idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
 		helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_ready", map[string]any{
-			"session_id":  sessionID,
-			"duration_us": duration.Microseconds(),
+			"session_id":   sessionID,
+			"duration_us":  duration.Microseconds(),
+			"pool_idle":    idle,
+			"pool_dialing": dialing,
 		})
 		log.WithFields(log.Fields{
 			"auth":        key.authID,
@@ -156,13 +182,23 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 		return nil
 	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
-	conn, age, ok := globalCodexWebsocketPreconnectPool.takeOrWait(ctx, key, ttl)
+	conn, age, observation, ok := globalCodexWebsocketPreconnectPool.takeOrWaitObserved(ctx, key, ttl)
 	if !ok {
+		helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_missed", map[string]any{
+			"session_id":   sessionID,
+			"wait_us":      observation.wait.Microseconds(),
+			"reason":       observation.reason,
+			"pool_idle":    observation.idle,
+			"pool_dialing": observation.dialing,
+		})
 		return nil
 	}
 	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_leased", map[string]any{
-		"session_id": sessionID,
-		"age_us":     age.Microseconds(),
+		"session_id":   sessionID,
+		"age_us":       age.Microseconds(),
+		"wait_us":      observation.wait.Microseconds(),
+		"pool_idle":    observation.idle,
+		"pool_dialing": observation.dialing,
 	})
 	return conn
 }
@@ -207,6 +243,10 @@ func (p *codexWebsocketPreconnectPool) failReservation(key codexWebsocketPreconn
 }
 
 func (p *codexWebsocketPreconnectPool) completeReservation(key codexWebsocketPreconnectKey, generation uint64, conn *websocket.Conn, maxIdle int, ttl time.Duration, now time.Time) bool {
+	return p.completeReservationObserved(key, generation, conn, maxIdle, ttl, now, nil)
+}
+
+func (p *codexWebsocketPreconnectPool) completeReservationObserved(key codexWebsocketPreconnectKey, generation uint64, conn *websocket.Conn, maxIdle int, ttl time.Duration, now time.Time, onExpire func()) bool {
 	if p == nil || conn == nil {
 		return false
 	}
@@ -227,6 +267,9 @@ func (p *codexWebsocketPreconnectPool) completeReservation(key codexWebsocketPre
 	time.AfterFunc(ttl, func() {
 		if expired := p.remove(key, entry.id); expired != nil {
 			_ = expired.Close()
+			if onExpire != nil {
+				onExpire()
+			}
 			log.WithFields(log.Fields{"auth": key.authID, "url": key.wsURL}).Debug("codex websockets: speculative preconnect expired")
 		}
 	})
@@ -234,15 +277,23 @@ func (p *codexWebsocketPreconnectPool) completeReservation(key codexWebsocketPre
 }
 
 func (p *codexWebsocketPreconnectPool) takeOrWait(ctx context.Context, key codexWebsocketPreconnectKey, ttl time.Duration) (*websocket.Conn, time.Duration, bool) {
+	conn, age, _, ok := p.takeOrWaitObserved(ctx, key, ttl)
+	return conn, age, ok
+}
+
+func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, key codexWebsocketPreconnectKey, ttl time.Duration) (*websocket.Conn, time.Duration, codexWebsocketPreconnectObservation, bool) {
 	if p == nil {
-		return nil, 0, false
+		return nil, 0, codexWebsocketPreconnectObservation{reason: "disabled"}, false
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	startedAt := time.Now()
+	waited := false
 	for {
 		if conn, age, ok := p.take(key, ttl, time.Now()); ok {
-			return conn, age, true
+			idle, dialing := p.snapshot()
+			return conn, age, codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: "leased", idle: idle, dialing: dialing}, true
 		}
 
 		p.mu.Lock()
@@ -250,7 +301,16 @@ func (p *codexWebsocketPreconnectPool) takeOrWait(ctx context.Context, key codex
 			p.mu.Unlock()
 			// A completion can land between the optimistic take and the
 			// in-flight check. Retake once before falling back to a cold dial.
-			return p.take(key, ttl, time.Now())
+			conn, age, ok := p.take(key, ttl, time.Now())
+			idle, dialing := p.snapshot()
+			reason := "no_idle"
+			if waited {
+				reason = "inflight_failed"
+			}
+			if ok {
+				reason = "leased"
+			}
+			return conn, age, codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: reason, idle: idle, dialing: dialing}, ok
 		}
 		if p.changed == nil {
 			p.changed = make(map[codexWebsocketPreconnectKey]chan struct{})
@@ -261,13 +321,26 @@ func (p *codexWebsocketPreconnectPool) takeOrWait(ctx context.Context, key codex
 			p.changed[key] = changed
 		}
 		p.mu.Unlock()
+		waited = true
 
 		select {
 		case <-ctx.Done():
-			return nil, 0, false
+			idle, dialing := p.snapshot()
+			return nil, 0, codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: "context_done", idle: idle, dialing: dialing}, false
 		case <-changed:
 		}
 	}
+}
+
+func (p *codexWebsocketPreconnectPool) snapshot() (int, int) {
+	if p == nil {
+		return 0, 0
+	}
+	p.mu.Lock()
+	idle := p.totalIdleLocked()
+	dialing := p.dialing
+	p.mu.Unlock()
+	return idle, dialing
 }
 
 func (p *codexWebsocketPreconnectPool) take(key codexWebsocketPreconnectKey, ttl time.Duration, now time.Time) (*websocket.Conn, time.Duration, bool) {
