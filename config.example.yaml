@@ -203,6 +203,9 @@ codex-websocket-speculative-preconnect: false
 # Experimental: after speculative connect, send an empty response.create with
 # generate=false and wait for completion before pooling the socket.
 codex-websocket-generate-false-warmup: false
+# Replenish a successfully leased speculative socket for small Agent bursts.
+# Experimental and disabled by default.
+codex-websocket-preconnect-replenish: false
 # Maximum total unused speculative connections plus in-flight dials; <= 0 uses 2.
 codex-websocket-preconnect-max-idle: 2
 # How long an unused speculative connection remains available; <= 0 uses 30 seconds.

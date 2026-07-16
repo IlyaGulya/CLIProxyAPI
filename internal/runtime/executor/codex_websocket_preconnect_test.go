@@ -3,9 +3,11 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -262,6 +264,202 @@ func TestScheduleSpeculativePreconnectRecordsRateLimitedFailureMetric(t *testing
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("speculative_preconnect_failed metric was not recorded")
+}
+
+func TestSuccessfulLeaseReplenishesWithinCap(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	connected := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			return
+		}
+		connected <- struct{}{}
+		<-release
+		_ = conn.Close()
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+
+	authID := "preconnect-replenish"
+	globalCodexWebsocketPreconnectPool.closeAuth(authID)
+	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
+	cfg := &config.Config{SDKConfig: config.SDKConfig{
+		RequestLog:                          true,
+		CodexWebsocketSpeculativePreconnect: true,
+		CodexWebsocketPreconnectReplenish:   true,
+		CodexWebsocketPreconnectMaxIdle:     1,
+	}}
+	exec := NewCodexWebsocketsExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root-session", nil)
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("initial speculative websocket did not connect")
+	}
+	leased := exec.takeSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "child-session")
+	if leased == nil {
+		t.Fatal("initial speculative websocket was not leased")
+	}
+	defer func() { _ = leased.Close() }()
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("successful lease did not replenish the speculative websocket")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
+		if idle == 1 && dialing == 0 {
+			return
+		}
+		if idle+dialing > 1 {
+			t.Fatalf("replenishment exceeded cap: idle=%d dialing=%d", idle, dialing)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("replenished websocket was not published")
+}
+
+func TestReplenishment429EntersCooldownWithoutRetryLoop(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var attempts atomic.Int32
+	connected := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) > 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			return
+		}
+		close(connected)
+		<-release
+		_ = conn.Close()
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+
+	authID := "preconnect-replenish-429"
+	globalCodexWebsocketPreconnectPool.closeAuth(authID)
+	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
+	cfg := &config.Config{SDKConfig: config.SDKConfig{
+		CodexWebsocketSpeculativePreconnect: true,
+		CodexWebsocketPreconnectReplenish:   true,
+		CodexWebsocketPreconnectMaxIdle:     1,
+	}}
+	exec := NewCodexWebsocketsExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root", nil)
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("initial websocket did not connect")
+	}
+	leased := exec.takeSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "child")
+	if leased == nil {
+		t.Fatal("initial websocket was not leased")
+	}
+	defer func() { _ = leased.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for attempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("dial attempts = %d, want initial plus one replenishment", attempts.Load())
+	}
+	exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root", nil)
+	time.Sleep(50 * time.Millisecond)
+	if attempts.Load() != 2 {
+		t.Fatalf("429 replenishment retried in a loop: attempts=%d", attempts.Load())
+	}
+	if idle, dialing := globalCodexWebsocketPreconnectPool.snapshot(); idle != 0 || dialing != 0 {
+		t.Fatalf("pool after 429 = idle %d dialing %d, want empty", idle, dialing)
+	}
+}
+
+func TestParallelLeasesReplenishWithoutExceedingCap(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	connected := make(chan struct{}, 4)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			return
+		}
+		connected <- struct{}{}
+		<-release
+		_ = conn.Close()
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+
+	authID := "preconnect-parallel-replenish"
+	globalCodexWebsocketPreconnectPool.closeAuth(authID)
+	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
+	cfg := &config.Config{SDKConfig: config.SDKConfig{
+		CodexWebsocketSpeculativePreconnect: true,
+		CodexWebsocketPreconnectReplenish:   true,
+		CodexWebsocketPreconnectMaxIdle:     2,
+	}}
+	exec := NewCodexWebsocketsExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	for range 2 {
+		exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root", nil)
+	}
+	for range 2 {
+		select {
+		case <-connected:
+		case <-time.After(time.Second):
+			t.Fatal("initial speculative pool did not fill")
+		}
+	}
+
+	leased := make(chan *websocket.Conn, 2)
+	for child := range 2 {
+		go func(child int) {
+			leased <- exec.takeSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, fmt.Sprintf("child-%d", child))
+		}(child)
+	}
+	for range 2 {
+		conn := <-leased
+		if conn == nil {
+			t.Fatal("parallel child missed a filled speculative pool")
+		}
+		defer func() { _ = conn.Close() }()
+	}
+	for range 2 {
+		select {
+		case <-connected:
+		case <-time.After(time.Second):
+			t.Fatal("parallel leases did not replenish both pool slots")
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
+		if idle+dialing > 2 {
+			t.Fatalf("parallel replenishment exceeded cap: idle=%d dialing=%d", idle, dialing)
+		}
+		if idle == 2 && dialing == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("parallel replenishments were not published")
 }
 
 func TestCodexAgentToolCallKeyRecognizesOnlyAgentFunctionCalls(t *testing.T) {

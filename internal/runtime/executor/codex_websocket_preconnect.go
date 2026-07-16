@@ -125,6 +125,10 @@ func codexAgentToolCallKey(payload []byte) (string, bool) {
 }
 
 func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte) {
+	e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, warmupTemplate, "agent_tool")
+}
+
+func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, trigger string) {
 	enabled, maxIdle, ttl := e.speculativePreconnectSettings()
 	if !enabled || auth == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(wsURL) == "" {
 		return
@@ -136,6 +140,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 		"session_id":            sessionID,
 		"reserved":              reserved,
 		"reason":                reason,
+		"trigger":               trigger,
 		"generate_false_warmup": e.cfg.CodexWebsocketGenerateFalseWarmup,
 		"pool_idle":             poolIdle,
 		"pool_dialing":          poolDialing,
@@ -178,7 +183,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 			}).WithError(errDial).Debug("codex websockets: speculative preconnect failed")
 			return
 		}
-		if e.cfg.CodexWebsocketGenerateFalseWarmup {
+		if e.cfg.CodexWebsocketGenerateFalseWarmup && len(warmupTemplate) > 0 {
 			warmupStartedAt := time.Now()
 			helpFields := map[string]any{"session_id": sessionID}
 			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "generate_false_warmup_started", rootCorrelation, executionCorrelation, helpFields)
@@ -254,7 +259,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 	}()
 }
 
-func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context, authID string, wsURL string, sessionID string) *websocket.Conn {
+func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string) *websocket.Conn {
 	enabled, _, ttl := e.speculativePreconnectSettings()
 	if !enabled {
 		return nil
@@ -278,6 +283,9 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 		"pool_idle":    observation.idle,
 		"pool_dialing": observation.dialing,
 	})
+	if e.cfg != nil && e.cfg.CodexWebsocketPreconnectReplenish {
+		e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, nil, "lease_replenish")
+	}
 	return conn
 }
 

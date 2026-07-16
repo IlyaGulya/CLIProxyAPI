@@ -65,6 +65,10 @@ type SDKConfig struct {
 	// disabled by default.
 	CodexWebsocketGenerateFalseWarmup bool `yaml:"codex-websocket-generate-false-warmup" json:"codex-websocket-generate-false-warmup"`
 
+	// CodexWebsocketPreconnectReplenish replaces a speculative connection after
+	// a successful lease, within the same global cap and route cooldown.
+	CodexWebsocketPreconnectReplenish bool `yaml:"codex-websocket-preconnect-replenish" json:"codex-websocket-preconnect-replenish"`
+
 	// CodexWebsocketPreconnectMaxIdle bounds speculative upstream websocket
 	// connections, including in-flight dials. Values <= 0 use the default (2).
 	CodexWebsocketPreconnectMaxIdle int `yaml:"codex-websocket-preconnect-max-idle,omitempty" json:"codex-websocket-preconnect-max-idle,omitempty"`

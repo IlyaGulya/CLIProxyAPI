@@ -1998,7 +1998,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 }
 
 func (e *CodexWebsocketsExecutor) ensureOverflowConnObserved(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string) (*websocket.Conn, *http.Response, codexWebsocketConnectionSource, error) {
-	if pooledConn := e.takeSpeculativePreconnect(ctx, authID, wsURL, sessionID); pooledConn != nil {
+	if pooledConn := e.takeSpeculativePreconnect(ctx, auth, authID, wsURL, headers, sessionID); pooledConn != nil {
 		return pooledConn, nil, codexWebsocketConnectionSpeculative, nil
 	}
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
@@ -2043,7 +2043,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 		}
 		return conn, nil, codexWebsocketConnectionSessionReuse, nil
 	}
-	if pooledConn := e.takeSpeculativePreconnect(ctx, authID, wsURL, sess.sessionID); pooledConn != nil {
+	if pooledConn := e.takeSpeculativePreconnect(ctx, auth, authID, wsURL, headers, sess.sessionID); pooledConn != nil {
 		sess.connMu.Lock()
 		sess.conn = pooledConn
 		sess.wsURL = wsURL
