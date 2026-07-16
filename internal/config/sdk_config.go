@@ -60,6 +60,11 @@ type SDKConfig struct {
 	// the subsequent child agent request to avoid a cold handshake.
 	CodexWebsocketSpeculativePreconnect bool `yaml:"codex-websocket-speculative-preconnect" json:"codex-websocket-speculative-preconnect"`
 
+	// CodexWebsocketGenerateFalseWarmup sends an empty, non-generating Responses
+	// request before pooling a speculative websocket. It is experimental and
+	// disabled by default.
+	CodexWebsocketGenerateFalseWarmup bool `yaml:"codex-websocket-generate-false-warmup" json:"codex-websocket-generate-false-warmup"`
+
 	// CodexWebsocketPreconnectMaxIdle bounds speculative upstream websocket
 	// connections, including in-flight dials. Values <= 0 use the default (2).
 	CodexWebsocketPreconnectMaxIdle int `yaml:"codex-websocket-preconnect-max-idle,omitempty" json:"codex-websocket-preconnect-max-idle,omitempty"`

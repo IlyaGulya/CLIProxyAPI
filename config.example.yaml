@@ -200,6 +200,9 @@ codex-websocket-max-sessions: 128
 # Disabled by default. The pool is global, bounded, route/auth isolated, and applies
 # a route-scoped cooldown after an upstream 429 handshake response.
 codex-websocket-speculative-preconnect: false
+# Experimental: after speculative connect, send an empty response.create with
+# generate=false and wait for completion before pooling the socket.
+codex-websocket-generate-false-warmup: false
 # Maximum total unused speculative connections plus in-flight dials; <= 0 uses 2.
 codex-websocket-preconnect-max-idle: 2
 # How long an unused speculative connection remains available; <= 0 uses 30 seconds.

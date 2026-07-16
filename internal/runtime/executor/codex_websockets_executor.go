@@ -810,7 +810,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if agentCallKey, ok := codexAgentToolCallKey(payload); ok {
 					if _, seen := speculativeAgentCalls[agentCallKey]; !seen {
 						speculativeAgentCalls[agentCallKey] = struct{}{}
-						e.scheduleSpeculativePreconnect(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
+						e.scheduleSpeculativePreconnect(ctx, auth, authID, wsURL, wsHeaders, executionSessionID, upstreamBody)
 					}
 				}
 			}
@@ -939,6 +939,76 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	fallback := bytes.Clone(body)
 	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
 	return fallback
+}
+
+type codexGenerateFalseWarmupResult struct {
+	responseID   string
+	inputTokens  int64
+	outputTokens int64
+}
+
+func performCodexGenerateFalseWarmup(ctx context.Context, conn *websocket.Conn, request []byte) (codexGenerateFalseWarmupResult, error) {
+	var result codexGenerateFalseWarmupResult
+	if conn == nil {
+		return result, fmt.Errorf("codex websocket warmup: websocket conn is nil")
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return result, errContext
+	}
+	deadline := time.Now().Add(codexResponsesWebsocketIdleTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	_ = conn.SetWriteDeadline(deadline)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+		return result, fmt.Errorf("codex websocket warmup: write request: %w", errWrite)
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+	_ = conn.SetReadDeadline(deadline)
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	for {
+		msgType, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			if errContext := ctx.Err(); errContext != nil {
+				return result, errContext
+			}
+			return result, fmt.Errorf("codex websocket warmup: read response: %w", errRead)
+		}
+		if msgType != websocket.TextMessage {
+			continue
+		}
+		if wsErr, ok := parseCodexWebsocketError(payload); ok {
+			return result, wsErr
+		}
+		eventType := gjson.GetBytes(payload, "type").String()
+		if eventType != "response.completed" && eventType != "response.done" {
+			continue
+		}
+		result.responseID = strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+		result.inputTokens = gjson.GetBytes(payload, "response.usage.input_tokens").Int()
+		result.outputTokens = gjson.GetBytes(payload, "response.usage.output_tokens").Int()
+		return result, nil
+	}
+}
+
+func codexGenerateFalseWarmupFailureReason(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline"
+	}
+	var status interface{ StatusCode() int }
+	if errors.As(err, &status) {
+		if status.StatusCode() == http.StatusTooManyRequests {
+			return "rate_limited"
+		}
+		return "upstream_error"
+	}
+	return "transport_error"
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {

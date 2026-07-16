@@ -435,16 +435,47 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 	if ginCtx == nil {
 		return
 	}
-	name = strings.TrimSpace(name)
-	if name == "" {
+	if rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil); rootCorrelation != "" {
+		payload := marshalAPIWebsocketMetric(name, rootCorrelation, executionCorrelation, fields)
+		if len(payload) > 0 {
+			appendAPIWebsocketTimeline(ginCtx, payload)
+		}
 		return
 	}
-	record := make(map[string]any, len(fields)+3)
+	payload := marshalAPIWebsocketMetric(name, "", "", fields)
+	if len(payload) > 0 {
+		appendAPIWebsocketTimeline(ginCtx, payload)
+	}
+}
+
+// RecordDetachedAPIWebsocketMetric writes an immutable metric snapshot to the
+// process log. It is safe for goroutines that can outlive the originating Gin
+// request; retaining *gin.Context after a handler returns can attribute data to
+// a later request when Gin reuses the context.
+func RecordDetachedAPIWebsocketMetric(cfg *config.Config, name string, rootCorrelation string, executionCorrelation string, fields map[string]any) {
+	if !requestLogCaptureEnabled(cfg) {
+		return
+	}
+	payload := marshalAPIWebsocketMetric(name, rootCorrelation, executionCorrelation, fields)
+	if len(payload) == 0 {
+		return
+	}
+	log.Debugf("detached websocket metric: %s", payload)
+}
+
+func marshalAPIWebsocketMetric(name string, rootCorrelation string, executionCorrelation string, fields map[string]any) []byte {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	record := make(map[string]any, len(fields)+5)
 	record["timestamp"] = time.Now().Format(time.RFC3339Nano)
 	record["event"] = "api.websocket.metric"
 	record["name"] = name
-	if rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil); rootCorrelation != "" {
+	if rootCorrelation = strings.TrimSpace(rootCorrelation); rootCorrelation != "" {
 		record["claude_root_correlation_id"] = rootCorrelation
+	}
+	if executionCorrelation = strings.TrimSpace(executionCorrelation); executionCorrelation != "" {
 		record["claude_execution_correlation_id"] = executionCorrelation
 	}
 	for key, value := range fields {
@@ -457,9 +488,9 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 	payload, errMarshal := json.Marshal(record)
 	if errMarshal != nil {
 		log.WithError(errMarshal).Warn("failed to marshal api websocket metric")
-		return
+		return nil
 	}
-	appendAPIWebsocketTimeline(ginCtx, payload)
+	return payload
 }
 
 // CodexUsageMetricFields converts usage into a stable, provider-neutral metric

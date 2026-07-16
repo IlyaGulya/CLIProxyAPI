@@ -126,6 +126,7 @@ func TestClaudeMessagesAgentToolSpeculativelyPreconnectsChildWebsocket(t *testin
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	serverErrors := make(chan error, 4)
 	spareConnected := make(chan struct{})
+	warmupPayload := make(chan []byte, 1)
 	childPayload := make(chan []byte, 1)
 	var connections atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +165,17 @@ func TestClaudeMessagesAgentToolSpeculativelyPreconnectsChildWebsocket(t *testin
 			}
 		case 2:
 			close(spareConnected)
+			_, warmup, errRead := conn.ReadMessage()
+			if errRead != nil {
+				serverErrors <- fmt.Errorf("read generate=false warmup: %w", errRead)
+				return
+			}
+			warmupPayload <- bytes.Clone(warmup)
+			warmupCompleted := []byte(`{"type":"response.completed","response":{"id":"resp-warmup","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, warmupCompleted); errWrite != nil {
+				serverErrors <- fmt.Errorf("write warmup completion: %w", errWrite)
+				return
+			}
 			_, payload, errRead := conn.ReadMessage()
 			if errRead != nil {
 				serverErrors <- fmt.Errorf("read child request from speculative websocket: %w", errRead)
@@ -187,6 +199,7 @@ func TestClaudeMessagesAgentToolSpeculativelyPreconnectsChildWebsocket(t *testin
 	server.handlers.Cfg.CodexPreferUpstreamWebsockets = true
 	server.cfg.CodexPreferUpstreamWebsockets = true
 	server.cfg.CodexWebsocketSpeculativePreconnect = true
+	server.cfg.CodexWebsocketGenerateFalseWarmup = true
 	server.cfg.CodexWebsocketPreconnectMaxIdle = 2
 	server.cfg.DisableImageGeneration = proxyconfig.DisableImageGenerationAll
 	server.handlers.AuthManager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(server.cfg))
@@ -215,6 +228,17 @@ func TestClaudeMessagesAgentToolSpeculativelyPreconnectsChildWebsocket(t *testin
 	server.engine.ServeHTTP(rootRR, rootReq)
 	if rootRR.Code != http.StatusOK || !strings.Contains(rootRR.Body.String(), "message_stop") {
 		t.Fatalf("root response status=%d body=%s", rootRR.Code, rootRR.Body.String())
+	}
+	select {
+	case payload := <-warmupPayload:
+		if !gjson.GetBytes(payload, "generate").Exists() || gjson.GetBytes(payload, "generate").Bool() {
+			t.Fatalf("speculative warmup does not set generate=false: %s", payload)
+		}
+		if got := gjson.GetBytes(payload, "input.#").Int(); got != 0 {
+			t.Fatalf("speculative warmup input items = %d, want 0; payload=%s", got, payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("generate=false warmup was not sent")
 	}
 
 	childRequestBody := `{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"child work"}],"max_tokens":128,"stream":true}`
