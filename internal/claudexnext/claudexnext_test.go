@@ -257,7 +257,7 @@ func TestEnsureLGTMReusesRunningContainer(t *testing.T) {
 		output []byte
 		err    error
 	}{
-		"docker inspect --format {{.State.Running}} claudex-next-otel-lgtm": {output: []byte("true\n")},
+		"docker inspect --format {{.State.Running}}|{{.Config.Image}} claudex-next-otel-lgtm": {output: []byte("true|grafana/otel-lgtm:0.27.1\n")},
 	}}
 	status := EnsureLGTM(context.Background(), runner, func(context.Context, string) error { return nil })
 	if !status.Available || status.Started || len(runner.calls) != 1 {
@@ -271,7 +271,7 @@ func TestEnsureLGTMStartsPinnedPersistentContainer(t *testing.T) {
 		output []byte
 		err    error
 	}{
-		"docker inspect --format {{.State.Running}} claudex-next-otel-lgtm": {err: os.ErrNotExist},
+		"docker inspect --format {{.State.Running}}|{{.Config.Image}} claudex-next-otel-lgtm": {err: os.ErrNotExist},
 	}}
 	status := EnsureLGTM(context.Background(), runner, func(context.Context, string) error { return nil })
 	if !status.Available || !status.Started {
@@ -294,7 +294,7 @@ func TestEnsureLGTMDegradesWhenDockerUnavailable(t *testing.T) {
 		output []byte
 		err    error
 	}{
-		"docker inspect --format {{.State.Running}} claudex-next-otel-lgtm": {err: os.ErrNotExist},
+		"docker inspect --format {{.State.Running}}|{{.Config.Image}} claudex-next-otel-lgtm": {err: os.ErrNotExist},
 	}}
 	status := EnsureLGTM(context.Background(), runner, func(context.Context, string) error { return os.ErrNotExist })
 	if status.Available || status.Error == "" {

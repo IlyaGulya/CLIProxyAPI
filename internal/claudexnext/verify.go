@@ -45,7 +45,7 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 	}
 	report.check("root_is_sol", manifest.RootModel == "gpt-5.6-sol")
 	report.check("leaf_is_luna", contains(summary.TranscriptModels, "gpt-5.6-luna"))
-	report.check("sol_continuation_seen", contains(summary.TranscriptModels, "gpt-5.6-sol") || summary.Models["gpt-5.6-sol"] > 0)
+	report.check("sol_continuation_seen", summary.RootRequests >= 2 && summary.Models["gpt-5.6-sol"] >= 2)
 	report.check("child_request_seen", summary.ChildRequests > 0)
 	report.check("speculative_websocket_used", summary.SpeculativeHitRate > 0)
 	report.check("otel_flush_succeeded", manifest.OTELFlushOK)
@@ -59,9 +59,19 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 	probes := map[string]string{
 		"grafana_dashboard_present": "/api/dashboards/uid/claudex-next-overview",
 		"proxy_metrics_present":     "/api/datasources/proxy/uid/prometheus/api/v1/query?query=" + url.QueryEscape("sum(claudex_proxy_events_total)"),
-		"claude_metrics_present":    "/api/datasources/proxy/uid/prometheus/api/v1/query?query=" + url.QueryEscape(`sum({__name__=~"claude_code_.*"})`),
-		"correlated_traces_present": "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" }`, manifest.RunID)),
-		"correlated_logs_present":   "/api/datasources/proxy/uid/loki/loki/api/v1/query_range?query=" + url.QueryEscape(fmt.Sprintf(`{service_name=~"claude-code|cli-proxy-api|claudex-next",claudex_run_id="%s"}`, manifest.RunID)) + "&limit=20",
+		"claude_metrics_present":    "/api/datasources/proxy/uid/prometheus/api/v1/query?query=" + url.QueryEscape(`sum({__name__=~"claude_code_.*|claudex_claude_.*"})`),
+		"correlated_traces_present": "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && resource.service.name = "claudex-next" } && { resource.service.name = "claude-code" } && { resource.service.name = "cli-proxy-api" }`, manifest.RunID)),
+		"correlated_logs_present":   "/api/datasources/proxy/uid/loki/loki/api/v1/query_range?query=" + url.QueryEscape(fmt.Sprintf(`{service_name=~"claude-code|cli-proxy-api|claudex-next"} | claudex_run_id="%s"`, manifest.RunID)) + "&limit=20",
+	}
+	solTraceQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.model = "gpt-5.6-sol" }`, manifest.RunID))
+	lunaTraceQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.model = "gpt-5.6-luna" }`, manifest.RunID))
+	solTraces, errSolTraces := grafanaTempoTraceIDs(ctx, client, solTraceQuery)
+	lunaTraces, errLunaTraces := grafanaTempoTraceIDs(ctx, client, lunaTraceQuery)
+	report.Checks["model_switch_in_same_trace"] = intersects(solTraces, lunaTraces)
+	if errSolTraces != nil {
+		report.BackendErrors["model_switch_in_same_trace"] = errSolTraces.Error()
+	} else if errLunaTraces != nil {
+		report.BackendErrors["model_switch_in_same_trace"] = errLunaTraces.Error()
 	}
 	for name, path := range probes {
 		ok, errProbe := grafanaProbe(ctx, client, grafanaURL+path, name)
@@ -88,6 +98,13 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 	} else {
 		report.Checks["privacy_no_prompt_in_logs"] = empty
 	}
+	tracePrivacyQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.user_prompt =~ ".*Use the Agent tool exactly once.*" }`, manifest.RunID))
+	if traces, errPrivacy := grafanaTempoTraceIDs(ctx, client, tracePrivacyQuery); errPrivacy != nil {
+		report.Checks["privacy_no_prompt_in_traces"] = false
+		report.BackendErrors["privacy_no_prompt_in_traces"] = errPrivacy.Error()
+	} else {
+		report.Checks["privacy_no_prompt_in_traces"] = len(traces) == 0
+	}
 	for name, passed := range report.Checks {
 		if !passed {
 			report.Failures = append(report.Failures, name)
@@ -98,6 +115,31 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 		report.BackendErrors = nil
 	}
 	return report, nil
+}
+
+func grafanaTempoTraceIDs(ctx context.Context, client *http.Client, endpoint string) (map[string]struct{}, error) {
+	payload, errPayload := grafanaJSON(ctx, client, endpoint)
+	if errPayload != nil {
+		return nil, errPayload
+	}
+	traces, _ := payload["traces"].([]any)
+	ids := make(map[string]struct{}, len(traces))
+	for _, item := range traces {
+		traceItem, _ := item.(map[string]any)
+		if id, ok := traceItem["traceID"].(string); ok && id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	return ids, nil
+}
+
+func intersects(left, right map[string]struct{}) bool {
+	for value := range left {
+		if _, ok := right[value]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func grafanaPromValue(ctx context.Context, client *http.Client, endpoint string) (float64, error) {

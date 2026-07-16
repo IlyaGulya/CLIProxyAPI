@@ -236,6 +236,21 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		launcherSpan.AddEvent("proxy.stopped", trace.WithAttributes(attribute.Bool("graceful", proxyStopped)))
 	}
 	_ = proxyLog.Sync()
+	if observedSessionID := sessionIDFromRequestLogs(filepath.Join(runDir, "proxy", "logs")); observedSessionID != "" {
+		sessionID = observedSessionID
+	}
+	copySessionTranscripts(home, sessionID, filepath.Join(runDir, "transcripts"))
+	summary, errAnalyze := AnalyzeRun(runDir)
+	if errAnalyze != nil {
+		return runDir, exitCode, errAnalyze
+	}
+	var inputTokens, outputTokens, cacheReadTokens int64
+	for _, request := range summary.Requests {
+		inputTokens += request.InputTokens
+		outputTokens += request.OutputTokens
+		cacheReadTokens += request.CacheReadTokens
+	}
+	observability.RecordClaudeRun(ctx, flagValue(claudeArgs, "--model"), summary.Claude.TerminalReason, summary.Claude.CostUSD, claudeRuntimeMS, inputTokens, outputTokens, cacheReadTokens)
 	otelFlushOK := false
 	if launcherSpan != nil {
 		launcherSpan.End()
@@ -245,10 +260,6 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		otelFlushOK = launcherTelemetry.Shutdown(flushCtx) == nil
 		cancelFlush()
 	}
-	if observedSessionID := sessionIDFromRequestLogs(filepath.Join(runDir, "proxy", "logs")); observedSessionID != "" {
-		sessionID = observedSessionID
-	}
-	copySessionTranscripts(home, sessionID, filepath.Join(runDir, "transcripts"))
 
 	proxyHash, _ := fileSHA256(opts.ProxyBin)
 	manifest := Manifest{
@@ -261,10 +272,6 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	}
 	if errWrite := writeJSON(filepath.Join(runDir, "manifest.json"), manifest); errWrite != nil {
 		return runDir, exitCode, errWrite
-	}
-	summary, errAnalyze := AnalyzeRun(runDir)
-	if errAnalyze != nil {
-		return runDir, exitCode, errAnalyze
 	}
 	if errWrite := writeJSON(filepath.Join(runDir, "summary.json"), summary); errWrite != nil {
 		return runDir, exitCode, errWrite

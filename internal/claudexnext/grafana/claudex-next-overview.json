@@ -51,7 +51,8 @@
         "id": 5, "type": "timeseries", "title": "Tokens and prompt-cache reads by model",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
         "targets": [
-          {"refId": "A", "expr": "sum by (model, token_type) (rate(claudex_proxy_tokens_total{model=~\"$model\"}[5m]))", "legendFormat": "{{model}} {{token_type}}"}
+          {"refId": "A", "expr": "sum by (model, token_type) (rate(claudex_proxy_tokens_total{model=~\"$model\"}[5m]))", "legendFormat": "{{model}} {{token_type}}"},
+          {"refId": "B", "expr": "sum(claudex_claude_cost_total)", "legendFormat": "Claude cost USD"}
         ],
         "gridPos": {"x": 0, "y": 18, "w": 12, "h": 8}
       },
@@ -67,14 +68,17 @@
         "targets": [
           {"refId": "A", "expr": "process_runtime_go_goroutines", "legendFormat": "goroutines"},
           {"refId": "B", "expr": "process_runtime_go_heap_bytes", "legendFormat": "heap bytes"},
-          {"refId": "C", "expr": "rate(process_runtime_go_gc_pause_total_nanoseconds_total[5m])", "legendFormat": "GC pause ns/s"}
+          {"refId": "C", "expr": "rate(process_runtime_go_gc_pause_total_nanoseconds_total[5m])", "legendFormat": "GC pause ns/s"},
+          {"refId": "D", "expr": "process_memory_rss_bytes", "legendFormat": "RSS bytes"},
+          {"refId": "E", "expr": "rate(process_cpu_time_seconds_total[5m])", "legendFormat": "CPU cores"},
+          {"refId": "F", "expr": "process_network_connections_open", "legendFormat": "open connections"}
         ],
         "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8}
       },
       {
         "id": 8, "type": "logs", "title": "Correlated Claude / proxy events",
         "datasource": {"type": "loki", "uid": "loki"},
-        "targets": [{"refId": "A", "expr": "{service_name=~\"claude-code|cli-proxy-api|claudex-next\"} |= \"$run_id\""}],
+        "targets": [{"refId": "A", "expr": "{service_name=~\"claude-code|cli-proxy-api|claudex-next\"} | claudex_run_id=\"$run_id\""}],
         "gridPos": {"x": 12, "y": 26, "w": 12, "h": 8}
       }
     ]

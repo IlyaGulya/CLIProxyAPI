@@ -24,7 +24,7 @@ func main() {
 	_, exitCode, errRun := claudexnext.Run(ctx, claudexnext.Options{
 		ClaudeArgs: claudeArgs, ClaudeBin: launcher.claudeBinary, ProxyBin: launcher.proxyBinary,
 		ConfigPath: launcher.configPath, EnvPath: launcher.envPath, RunsDir: launcher.runsDir,
-		Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr, Interactive: isTerminal(os.Stdin) && isTerminal(os.Stdout),
+		Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr, Interactive: isTerminal(os.Stdin) && isTerminal(os.Stdout) && !isPrintMode(claudeArgs),
 	})
 	if errRun != nil {
 		var exitErr *exec.ExitError
@@ -80,4 +80,13 @@ func parseArgs(args []string) (launcherOptions, []string, error) {
 func isTerminal(file *os.File) bool {
 	info, errStat := file.Stat()
 	return errStat == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func isPrintMode(args []string) bool {
+	for _, arg := range args {
+		if arg == "--print" || arg == "-p" || strings.HasPrefix(arg, "--print=") {
+			return true
+		}
+	}
+	return false
 }

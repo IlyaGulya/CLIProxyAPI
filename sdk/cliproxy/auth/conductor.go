@@ -21,6 +21,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -4714,7 +4715,15 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 	}
 }
 
-func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (selectedAuth *Auth, selectedExecutor ProviderExecutor, selectedErr error) {
+	startedAt := time.Now()
+	defer func() {
+		observability.RecordWebsocketMetric(ctx, "scheduler_selection", "", "", map[string]any{
+			"duration_us": time.Since(startedAt).Microseconds(),
+			"model":       model,
+			"success":     selectedErr == nil && selectedAuth != nil,
+		}, false)
+	}()
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err

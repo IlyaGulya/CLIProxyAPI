@@ -41,7 +41,8 @@ it enables the Codex WebSocket capability only in the per-run private copy.
 ## Local observability
 
 By default the launcher reuses or lazily starts the persistent Docker container
-`claudex-next-otel-lgtm` from the pinned image `grafana/otel-lgtm:0.27.1`.
+`claudex-next-otel-lgtm` from `grafana/otel-lgtm:0.27.1`, pinned by digest in
+the launcher source.
 Grafana is available at <http://127.0.0.1:3300>; OTLP/gRPC and OTLP/HTTP use
 ports 4317 and 4318. Backend state is kept in the named volume
 `claudex-next-otel-lgtm-data`. The launcher never deletes that volume.

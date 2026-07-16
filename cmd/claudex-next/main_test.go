@@ -34,3 +34,15 @@ func TestParseArgsExtractsNamespacedLauncherFlags(t *testing.T) {
 		t.Fatalf("claude args = %#v, want %#v", claudeArgs, want)
 	}
 }
+
+func TestPrintModeNeverUsesInteractiveTerminalRecorder(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{{"--print", "hello"}, {"-p", "hello"}, {"--print=true", "hello"}} {
+		if !isPrintMode(args) {
+			t.Errorf("isPrintMode(%#v) = false", args)
+		}
+	}
+	if isPrintMode([]string{"hello"}) {
+		t.Fatal("ordinary interactive args detected as print mode")
+	}
+}

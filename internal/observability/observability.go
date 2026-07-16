@@ -49,11 +49,16 @@ type Telemetry struct {
 	meterProvider  *sdkmetric.MeterProvider
 	loggerProvider *sdklog.LoggerProvider
 	logger         otellog.Logger
+	runID          string
 	events         metric.Int64Counter
 	requests       metric.Int64Counter
 	latency        metric.Float64Histogram
 	bytes          metric.Int64Counter
 	tokens         metric.Int64Counter
+	claudeRuns     metric.Int64Counter
+	claudeCost     metric.Float64Counter
+	claudeDuration metric.Float64Histogram
+	claudeTokens   metric.Int64Counter
 	activeRequests atomic.Int64
 	poolIdle       atomic.Int64
 	poolDialing    atomic.Int64
@@ -80,7 +85,7 @@ func Start(ctx context.Context) (*Telemetry, error) {
 }
 
 func StartService(ctx context.Context, serviceName string) (*Telemetry, error) {
-	telemetry := &Telemetry{}
+	telemetry := &Telemetry{runID: strings.TrimSpace(os.Getenv("CLAUDEX_NEXT_RUN_ID"))}
 	current.Store(telemetry)
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("OTEL_SDK_DISABLED")), "true") {
 		return telemetry, nil
@@ -217,23 +222,38 @@ func (t *Telemetry) initInstruments() {
 	t.latency, _ = t.meter.Float64Histogram("claudex.proxy.phase.duration", metric.WithUnit("ms"))
 	t.bytes, _ = t.meter.Int64Counter("claudex.proxy.bytes", metric.WithUnit("By"))
 	t.tokens, _ = t.meter.Int64Counter("claudex.proxy.tokens", metric.WithUnit("{token}"))
+	t.claudeRuns, _ = t.meter.Int64Counter("claudex.claude.runs")
+	t.claudeCost, _ = t.meter.Float64Counter("claudex.claude.cost")
+	t.claudeDuration, _ = t.meter.Float64Histogram("claudex.claude.duration", metric.WithUnit("ms"))
+	t.claudeTokens, _ = t.meter.Int64Counter("claudex.claude.tokens", metric.WithUnit("{token}"))
 	active, _ := t.meter.Int64ObservableGauge("claudex.proxy.requests.active")
 	poolIdle, _ := t.meter.Int64ObservableGauge("claudex.proxy.pool.idle")
 	poolDialing, _ := t.meter.Int64ObservableGauge("claudex.proxy.pool.dialing")
 	goRoutines, _ := t.meter.Int64ObservableGauge("process.runtime.go.goroutines")
 	heap, _ := t.meter.Int64ObservableGauge("process.runtime.go.heap", metric.WithUnit("By"))
 	gcPause, _ := t.meter.Int64ObservableGauge("process.runtime.go.gc.pause.total", metric.WithUnit("ns"))
+	cpu, _ := t.meter.Float64ObservableGauge("process.cpu.time", metric.WithUnit("s"))
+	rss, _ := t.meter.Int64ObservableGauge("process.memory.rss", metric.WithUnit("By"))
+	openConnections, _ := t.meter.Int64ObservableGauge("process.network.connections.open", metric.WithUnit("{connection}"))
 	_, _ = t.meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
 		var memory runtime.MemStats
 		runtime.ReadMemStats(&memory)
-		observer.ObserveInt64(active, t.activeRequests.Load())
-		observer.ObserveInt64(poolIdle, t.poolIdle.Load())
-		observer.ObserveInt64(poolDialing, t.poolDialing.Load())
-		observer.ObserveInt64(goRoutines, int64(runtime.NumGoroutine()))
-		observer.ObserveInt64(heap, int64(memory.HeapAlloc))
-		observer.ObserveInt64(gcPause, int64(memory.PauseTotalNs))
+		options := []metric.ObserveOption(nil)
+		if t.runID != "" {
+			options = append(options, metric.WithAttributes(attribute.String("claudex.run_id", t.runID)))
+		}
+		observer.ObserveInt64(active, t.activeRequests.Load(), options...)
+		observer.ObserveInt64(poolIdle, t.poolIdle.Load(), options...)
+		observer.ObserveInt64(poolDialing, t.poolDialing.Load(), options...)
+		observer.ObserveInt64(goRoutines, int64(runtime.NumGoroutine()), options...)
+		observer.ObserveInt64(heap, int64(memory.HeapAlloc), options...)
+		observer.ObserveInt64(gcPause, int64(memory.PauseTotalNs), options...)
+		cpuSeconds, rssBytes := processStats()
+		observer.ObserveFloat64(cpu, cpuSeconds, options...)
+		observer.ObserveInt64(rss, rssBytes, options...)
+		observer.ObserveInt64(openConnections, t.activeRequests.Load()+t.poolIdle.Load()+t.poolDialing.Load(), options...)
 		return nil
-	}, active, poolIdle, poolDialing, goRoutines, heap, gcPause)
+	}, active, poolIdle, poolDialing, goRoutines, heap, gcPause, cpu, rss, openConnections)
 }
 
 func (t *Telemetry) Shutdown(ctx context.Context) error {
@@ -353,6 +373,9 @@ func RecordWebsocketMetric(ctx context.Context, name, rootCorrelation, execution
 	}
 	spanAttrs := spanAttributes(rootCorrelation, executionCorrelation, fields)
 	metricAttrs := append(metricAttributes(fields), attribute.String("event.name", boundedEnum(name)))
+	if t.runID != "" {
+		metricAttrs = append(metricAttrs, attribute.String("claudex.run_id", t.runID))
+	}
 	if t.logger != nil {
 		var record otellog.Record
 		record.SetTimestamp(time.Now())
@@ -391,6 +414,29 @@ func RecordWebsocketMetric(ctx context.Context, name, rootCorrelation, execution
 	span.AddEvent("proxy.websocket."+boundedEnum(name), trace.WithAttributes(spanAttrs...))
 	if strings.Contains(name, "failed") || strings.Contains(name, "error") {
 		span.SetStatus(codes.Error, boundedEnum(name))
+	}
+}
+
+// RecordClaudeRun emits launcher-derived aggregate metrics for short sessions
+// that may exit before Claude Code's periodic native metric reader flushes.
+// Claude's native events and traces remain the detailed source of truth.
+func RecordClaudeRun(ctx context.Context, model, terminal string, costUSD float64, durationMS, inputTokens, outputTokens, cacheReadTokens int64) {
+	t := Current()
+	if !t.Enabled || t.claudeRuns == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("model", normalizeModel(model)),
+		attribute.String("terminal.reason", boundedEnum(terminal)),
+	}
+	if t.runID != "" {
+		attrs = append(attrs, attribute.String("claudex.run_id", t.runID))
+	}
+	t.claudeRuns.Add(ctx, 1, metric.WithAttributes(attrs...))
+	t.claudeCost.Add(ctx, costUSD, metric.WithAttributes(attrs...))
+	t.claudeDuration.Record(ctx, float64(durationMS), metric.WithAttributes(attrs...))
+	for tokenType, count := range map[string]int64{"input": inputTokens, "output": outputTokens, "cache_read": cacheReadTokens} {
+		t.claudeTokens.Add(ctx, count, metric.WithAttributes(appendCopy(attrs, attribute.String("token.type", tokenType))...))
 	}
 }
 

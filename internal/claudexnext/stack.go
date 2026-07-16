@@ -11,7 +11,7 @@ import (
 
 const (
 	LGTMContainer = "claudex-next-otel-lgtm"
-	LGTMImage     = "grafana/otel-lgtm:0.27.1"
+	LGTMImage     = "grafana/otel-lgtm:0.27.1@sha256:f533fb9c059aad2d47658e9dc059289755d992404b62168b40b3fbcbe4623355"
 	LGTMEndpoint  = "http://127.0.0.1:4318"
 	GrafanaURL    = "http://127.0.0.1:3300"
 )
@@ -41,16 +41,21 @@ type StackStatus struct {
 // as status rather than an error so observability can never block Claude.
 func EnsureLGTM(ctx context.Context, runner CommandRunner, health func(context.Context, string) error) StackStatus {
 	status := StackStatus{Image: LGTMImage, Grafana: GrafanaURL, Endpoint: LGTMEndpoint}
-	output, errInspect := runner.Run(ctx, "docker", "inspect", "--format", "{{.State.Running}}", LGTMContainer)
-	if errInspect == nil && strings.TrimSpace(string(output)) == "true" {
+	output, errInspect := runner.Run(ctx, "docker", "inspect", "--format", "{{.State.Running}}|{{.Config.Image}}", LGTMContainer)
+	state, image, _ := strings.Cut(strings.TrimSpace(string(output)), "|")
+	imageMatches := image == LGTMImage || image == "grafana/otel-lgtm:0.27.1"
+	if errInspect == nil && state == "true" && imageMatches {
 		if errHealth := health(ctx, GrafanaURL+"/api/health"); errHealth == nil {
 			status.Available = true
 			return status
 		}
 	}
-	if errInspect == nil {
+	if errInspect == nil && imageMatches {
 		_, _ = runner.Run(ctx, "docker", "start", LGTMContainer)
 	} else {
+		if errInspect == nil {
+			_, _ = runner.Run(ctx, "docker", "rm", "-f", LGTMContainer)
+		}
 		output, errRun := runner.Run(ctx, "docker", "run", "-d", "--name", LGTMContainer,
 			"--restart", "unless-stopped",
 			"-p", "127.0.0.1:3300:3000",
