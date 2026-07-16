@@ -25,7 +25,7 @@ func TestClaudeUpstreamWebsocketContextEnabledAndAgentScoped(t *testing.T) {
 	ctx, cancel := h.GetContextWithCancel(h, c, context.Background())
 	defer cancel()
 
-	ctx, sessionID := h.codexUpstreamWebsocketContext(ctx, []byte(`{"model":"gpt-5.6-sol","stream":true}`))
+	ctx, sessionID := h.codexUpstreamWebsocketContext(ctx, []byte(`{"model":"gpt-5.6-sol","stream":true}`), req.Header)
 	if !cliproxyexecutor.PreferUpstreamWebsocket(ctx) {
 		t.Fatal("enabled Claude request does not prefer upstream websocket")
 	}
@@ -40,7 +40,7 @@ func TestClaudeUpstreamWebsocketContextEnabledAndAgentScoped(t *testing.T) {
 func TestClaudeUpstreamWebsocketContextDisabledByDefault(t *testing.T) {
 	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil)
 	h := NewClaudeCodeAPIHandler(base)
-	ctx, sessionID := h.codexUpstreamWebsocketContext(context.Background(), []byte(`{"metadata":{"user_id":"{\"session_id\":\"root-session\"}"}}`))
+	ctx, sessionID := h.codexUpstreamWebsocketContext(context.Background(), []byte(`{"metadata":{"user_id":"{\"session_id\":\"root-session\"}"}}`), nil)
 	if cliproxyexecutor.PreferUpstreamWebsocket(ctx) {
 		t.Fatal("disabled Claude request prefers upstream websocket")
 	}
@@ -52,7 +52,7 @@ func TestClaudeUpstreamWebsocketContextDisabledByDefault(t *testing.T) {
 func TestClaudeUpstreamWebsocketContextRequiresSessionIdentity(t *testing.T) {
 	base := handlers.NewBaseAPIHandlers(&config.SDKConfig{CodexPreferUpstreamWebsockets: true}, nil)
 	h := NewClaudeCodeAPIHandler(base)
-	ctx, sessionID := h.codexUpstreamWebsocketContext(context.Background(), []byte(`{"model":"gpt-5.6-sol"}`))
+	ctx, sessionID := h.codexUpstreamWebsocketContext(context.Background(), []byte(`{"model":"gpt-5.6-sol"}`), nil)
 	if cliproxyexecutor.PreferUpstreamWebsocket(ctx) {
 		t.Fatal("sessionless Claude request prefers persistent upstream websocket")
 	}

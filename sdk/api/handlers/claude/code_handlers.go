@@ -275,7 +275,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx, _ = h.codexUpstreamWebsocketContext(cliCtx, rawJSON)
+	cliCtx, _ = h.codexUpstreamWebsocketContext(cliCtx, rawJSON, c.Request.Header)
 
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
@@ -341,11 +341,11 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	}
 }
 
-func (h *ClaudeCodeAPIHandler) codexUpstreamWebsocketContext(ctx context.Context, rawJSON []byte) (context.Context, string) {
+func (h *ClaudeCodeAPIHandler) codexUpstreamWebsocketContext(ctx context.Context, rawJSON []byte, headers http.Header) (context.Context, string) {
 	if h == nil || h.Cfg == nil || !h.Cfg.CodexPreferUpstreamWebsockets {
 		return ctx, ""
 	}
-	sessionID := helps.ClaudeCodeWebsocketSessionID(ctx, rawJSON, nil)
+	sessionID := helps.ClaudeCodeWebsocketSessionID(ctx, rawJSON, headers)
 	if sessionID == "" {
 		return ctx, ""
 	}

@@ -1927,6 +1927,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 
 	s.handlers.UpdateClients(effectiveSDKConfig(cfg))
+	log.Debugf("observable Codex websocket configuration applied: prefer=%t speculative=%t replenish=%t request_log=%t",
+		cfg.CodexPreferUpstreamWebsockets, cfg.CodexWebsocketSpeculativePreconnect, cfg.CodexWebsocketPreconnectReplenish, cfg.RequestLog)
 	s.handlers.SetPluginHost(s.pluginHost)
 	if s.pluginHost != nil {
 		s.pluginHost.SetModelExecutor(s.handlers)
