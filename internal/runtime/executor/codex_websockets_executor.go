@@ -5,12 +5,14 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +42,7 @@ const (
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
 	codexWebsocketDefaultSessionTTL        = 10 * time.Minute
 	codexWebsocketDefaultMaxSessions       = 128
+	codexWebsocketMaxIncrementalStateBytes = 8 << 20
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -66,6 +69,13 @@ type codexWebsocketSession struct {
 	lastUsed  time.Time
 
 	reqMu sync.Mutex
+
+	stateMu            sync.Mutex
+	httpFallback       bool
+	lastRequest        []byte
+	lastResponseID     string
+	lastResponseOutput []byte
+	pendingRequest     []byte
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -462,12 +472,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errPromptCache
 	}
 	clientBody := body
-	var identityState codexIdentityConfuseState
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
-	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -480,8 +487,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
 			sess.reqMu.Lock()
+			if sess.codexHTTPFallback() {
+				sess.reqMu.Unlock()
+				return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+			}
 		}
 	}
+	requestBody := clientBody
+	if sess != nil && from.String() == "claude" {
+		requestBody = sess.prepareCodexIncrementalRequest(clientBody)
+	}
+	var identityState codexIdentityConfuseState
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, requestBody)
+	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
@@ -509,6 +527,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 		if shouldFallbackCodexWebsocketHandshake(ctx, respHS) {
 			if sess != nil {
+				if shouldPersistCodexWebsocketFallback(respHS) {
+					sess.activateCodexHTTPFallback()
+				}
 				sess.reqMu.Unlock()
 			}
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
@@ -549,7 +570,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
-			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
+			fullUpstreamBody, retryIdentityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, clientBody)
+			identityState = retryIdentityState
+			wsReqBodyRetry := buildCodexWebsocketRequestBody(fullUpstreamBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -704,6 +727,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
+			if sess != nil && (eventType == "response.completed" || eventType == "response.done") {
+				sess.completeCodexIncrementalRequest(clientPayload)
+			}
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param)
 			for i := range chunks {
@@ -1368,6 +1394,22 @@ func shouldFallbackCodexWebsocketHandshake(ctx context.Context, resp *http.Respo
 	}
 }
 
+func shouldPersistCodexWebsocketFallback(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusUpgradeRequired,
+		http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
 func closeHTTPResponseBody(resp *http.Response, logPrefix string) {
 	if resp == nil || resp.Body == nil {
 		return
@@ -1493,6 +1535,169 @@ func codexWebsocketSessionActive(sess *codexWebsocketSession) bool {
 	return active
 }
 
+func (s *codexWebsocketSession) codexHTTPFallback() bool {
+	if s == nil {
+		return false
+	}
+	s.stateMu.Lock()
+	enabled := s.httpFallback
+	s.stateMu.Unlock()
+	return enabled
+}
+
+func (s *codexWebsocketSession) activateCodexHTTPFallback() {
+	if s == nil {
+		return
+	}
+	s.stateMu.Lock()
+	s.httpFallback = true
+	s.resetCodexIncrementalStateLocked()
+	s.stateMu.Unlock()
+}
+
+func (s *codexWebsocketSession) resetCodexIncrementalState() {
+	if s == nil {
+		return
+	}
+	s.stateMu.Lock()
+	s.resetCodexIncrementalStateLocked()
+	s.stateMu.Unlock()
+}
+
+func (s *codexWebsocketSession) resetCodexIncrementalStateLocked() {
+	s.lastRequest = nil
+	s.lastResponseID = ""
+	s.lastResponseOutput = nil
+	s.pendingRequest = nil
+}
+
+func (s *codexWebsocketSession) prepareCodexIncrementalRequest(fullRequest []byte) []byte {
+	if s == nil || len(fullRequest) == 0 {
+		return fullRequest
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if len(fullRequest) > codexWebsocketMaxIncrementalStateBytes {
+		s.resetCodexIncrementalStateLocked()
+		return fullRequest
+	}
+	s.pendingRequest = bytes.Clone(fullRequest)
+	if s.lastResponseID == "" || len(s.lastRequest) == 0 {
+		return fullRequest
+	}
+	delta, ok := codexIncrementalInput(s.lastRequest, s.lastResponseOutput, fullRequest)
+	if !ok {
+		return fullRequest
+	}
+	incremental, errSet := sjson.SetRawBytes(fullRequest, "input", delta)
+	if errSet != nil {
+		return fullRequest
+	}
+	incremental, errSet = sjson.SetBytes(incremental, "previous_response_id", s.lastResponseID)
+	if errSet != nil {
+		return fullRequest
+	}
+	return incremental
+}
+
+func (s *codexWebsocketSession) completeCodexIncrementalRequest(completedPayload []byte) {
+	if s == nil || len(completedPayload) == 0 {
+		return
+	}
+	responseID := strings.TrimSpace(gjson.GetBytes(completedPayload, "response.id").String())
+	if responseID == "" {
+		return
+	}
+	responseOutput := gjson.GetBytes(completedPayload, "response.output")
+	output := []byte("[]")
+	if responseOutput.IsArray() {
+		output = []byte(responseOutput.Raw)
+	}
+	s.stateMu.Lock()
+	if len(s.pendingRequest) != 0 {
+		if len(s.pendingRequest)+len(output) > codexWebsocketMaxIncrementalStateBytes {
+			s.resetCodexIncrementalStateLocked()
+			s.stateMu.Unlock()
+			return
+		}
+		s.lastRequest = bytes.Clone(s.pendingRequest)
+		s.lastResponseID = responseID
+		s.lastResponseOutput = bytes.Clone(output)
+	}
+	s.pendingRequest = nil
+	s.stateMu.Unlock()
+}
+
+func codexIncrementalInput(previousRequest, previousOutput, currentRequest []byte) ([]byte, bool) {
+	var previousObject map[string]any
+	var currentObject map[string]any
+	if json.Unmarshal(previousRequest, &previousObject) != nil || json.Unmarshal(currentRequest, &currentObject) != nil {
+		return nil, false
+	}
+	previousInput, previousInputOK := previousObject["input"].([]any)
+	currentInput, currentInputOK := currentObject["input"].([]any)
+	if !previousInputOK || !currentInputOK {
+		return nil, false
+	}
+	delete(previousObject, "input")
+	delete(currentObject, "input")
+	for _, ignored := range []string{"client_metadata", "stream_options", "type"} {
+		delete(previousObject, ignored)
+		delete(currentObject, ignored)
+	}
+	if !reflect.DeepEqual(previousObject, currentObject) {
+		return nil, false
+	}
+
+	var responseOutput []any
+	if len(previousOutput) != 0 && json.Unmarshal(previousOutput, &responseOutput) != nil {
+		return nil, false
+	}
+	baseline := make([]any, 0, len(previousInput)+len(responseOutput))
+	baseline = append(baseline, previousInput...)
+	baseline = append(baseline, responseOutput...)
+	if len(currentInput) < len(baseline) {
+		return nil, false
+	}
+	for index := range baseline {
+		if !reflect.DeepEqual(normalizeCodexIncrementalItem(baseline[index]), normalizeCodexIncrementalItem(currentInput[index])) {
+			return nil, false
+		}
+	}
+	delta, errMarshal := json.Marshal(currentInput[len(baseline):])
+	if errMarshal != nil {
+		return nil, false
+	}
+	return delta, true
+}
+
+func normalizeCodexIncrementalItem(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		normalized := make(map[string]any, len(typed))
+		for key, child := range typed {
+			switch key {
+			case "id", "status", "internal_chat_message_metadata_passthrough":
+				continue
+			case "annotations":
+				if annotations, ok := child.([]any); ok && len(annotations) == 0 {
+					continue
+				}
+			}
+			normalized[key] = normalizeCodexIncrementalItem(child)
+		}
+		return normalized
+	case []any:
+		normalized := make([]any, len(typed))
+		for index := range typed {
+			normalized[index] = normalizeCodexIncrementalItem(typed[index])
+		}
+		return normalized
+	default:
+		return value
+	}
+}
+
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
 	sess := e.getOrCreateSession(sessionID)
 	if sess == nil {
@@ -1521,6 +1726,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	}
 	sess.connMu.Unlock()
 	if credentialMismatch {
+		sess.resetCodexIncrementalState()
 		logCodexWebsocketDisconnected(sess.sessionID, existingAuthID, existingWSURL, "route_changed", nil)
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("codex websockets executor: close websocket error: %v", errClose)
@@ -1645,6 +1851,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	}
 	sess.connMu.Unlock()
 
+	sess.resetCodexIncrementalState()
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	sess.notifyUpstreamDisconnect(err)
 	if errClose := conn.Close(); errClose != nil {

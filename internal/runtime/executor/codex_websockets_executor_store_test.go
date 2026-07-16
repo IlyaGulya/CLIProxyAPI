@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -144,5 +145,41 @@ func TestCodexWebsocketsExecutor_DoesNotApplyClaudeCapacityToNativeSessions(t *t
 	store.mu.Unlock()
 	if count != 3 {
 		t.Fatalf("session count = %d, want 3", count)
+	}
+}
+
+func TestCodexWebsocketIncrementalStateIsSizeBounded(t *testing.T) {
+	sess := &codexWebsocketSession{}
+	oversized := []byte(`{"model":"gpt-5.6-sol","instructions":"` + strings.Repeat("x", codexWebsocketMaxIncrementalStateBytes) + `","input":[]}`)
+
+	got := sess.prepareCodexIncrementalRequest(oversized)
+	if len(got) != len(oversized) {
+		t.Fatalf("oversized request length = %d, want %d", len(got), len(oversized))
+	}
+	if len(sess.pendingRequest) != 0 || len(sess.lastRequest) != 0 || sess.lastResponseID != "" {
+		t.Fatalf("oversized request was retained in incremental state: pending=%d last=%d response=%q", len(sess.pendingRequest), len(sess.lastRequest), sess.lastResponseID)
+	}
+}
+
+func TestCodexIncrementalInputRequiresMatchingRequestProperties(t *testing.T) {
+	input := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]}]`
+	previous := []byte(`{"model":"gpt-5.6-sol","input":` + input + `,"tools":[],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`)
+	previousOutput := []byte(`[]`)
+
+	tests := []struct {
+		name    string
+		current string
+	}{
+		{name: "model", current: `{"model":"gpt-5.6-luna","input":` + input + `,"tools":[],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`},
+		{name: "tools", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[{"type":"function","name":"shell"}],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`},
+		{name: "reasoning", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[],"reasoning":{"effort":"high"},"service_tier":"default","stream":true}`},
+		{name: "service tier", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[],"reasoning":{"effort":"medium"},"service_tier":"priority","stream":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if delta, ok := codexIncrementalInput(previous, previousOutput, []byte(tt.current)); ok {
+				t.Fatalf("property change unexpectedly produced delta %s", delta)
+			}
+		})
 	}
 }
