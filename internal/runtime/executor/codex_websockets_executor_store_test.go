@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,5 +184,52 @@ func TestCodexIncrementalInputRequiresMatchingRequestProperties(t *testing.T) {
 				t.Fatalf("property change unexpectedly produced delta %s", delta)
 			}
 		})
+	}
+}
+
+func TestCodexWebsocketsExecutor_RejectsOverflowAcrossFourHundredAgentSessions(t *testing.T) {
+	const (
+		maxSessions   = 32
+		totalSessions = 400
+	)
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: maxSessions}})
+	exec.store = store
+
+	active := make([]*codexWebsocketSession, 0, maxSessions)
+	for index := 0; index < maxSessions; index++ {
+		sess := exec.getOrCreateSession("claude-code:active-" + strconv.Itoa(index))
+		if sess == nil {
+			t.Fatalf("active session %d was rejected below capacity", index)
+		}
+		sess.setActive(make(chan codexWebsocketRead))
+		active = append(active, sess)
+	}
+	t.Cleanup(func() {
+		for _, sess := range active {
+			sess.setActive(nil)
+		}
+	})
+
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for index := maxSessions; index < totalSessions; index++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			if sess := exec.getOrCreateSession("claude-code:overflow-" + strconv.Itoa(index)); sess != nil {
+				accepted.Add(1)
+			}
+		}(index)
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != 0 {
+		t.Fatalf("accepted overflow sessions = %d, want 0", got)
+	}
+	store.mu.Lock()
+	count := len(store.sessions)
+	store.mu.Unlock()
+	if count != maxSessions {
+		t.Fatalf("stored sessions = %d, want %d", count, maxSessions)
 	}
 }

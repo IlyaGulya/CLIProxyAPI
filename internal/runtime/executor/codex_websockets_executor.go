@@ -613,6 +613,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		defer func() {
 			if sess != nil {
 				sess.clearActive(readCh)
+				if terminateReason == "context_done" {
+					e.invalidateUpstreamConn(sess, conn, terminateReason, terminateErr)
+				}
 				sess.reqMu.Unlock()
 				return
 			}

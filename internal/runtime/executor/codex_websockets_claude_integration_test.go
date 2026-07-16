@@ -334,3 +334,107 @@ func TestClaudeCodexWebsocketToolContinuationUsesOnlyFunctionOutputDelta(t *test
 	}
 	exec.CloseExecutionSession(sessionID)
 }
+
+func TestClaudeCodexWebsocketCancellationReconnectsBeforeNextTurn(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	firstStarted := make(chan struct{})
+	secondPayload := make(chan []byte, 1)
+	serverErrors := make(chan error, 2)
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrors <- fmt.Errorf("upgrade websocket: %w", errUpgrade)
+			return
+		}
+		connectionIndex := connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			serverErrors <- fmt.Errorf("connection %d initial read: %w", connectionIndex, errRead)
+			return
+		}
+		if connectionIndex == 1 {
+			close(firstStarted)
+			if _, unexpected, errNext := conn.ReadMessage(); errNext == nil {
+				serverErrors <- fmt.Errorf("next turn reused canceled connection: %s", unexpected)
+			}
+			return
+		}
+		secondPayload <- bytes.Clone(payload)
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-after-cancel","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			serverErrors <- fmt.Errorf("connection %d write: %w", connectionIndex, errWrite)
+		}
+	}))
+	defer func() {
+		server.CloseClientConnections()
+		server.Close()
+	}()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	sessionID := "claude-code:cancel-agent"
+	firstPayload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"long turn"}],"max_tokens":128,"stream":true}`)
+	firstReq := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: firstPayload}
+	firstOpts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: firstPayload,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: sessionID,
+		},
+	}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstResult, errExecute := exec.ExecuteStream(firstCtx, auth, firstReq, firstOpts)
+	if errExecute != nil {
+		t.Fatalf("first ExecuteStream() error = %v", errExecute)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request did not reach upstream")
+	}
+	cancelFirst()
+	for range firstResult.Chunks {
+	}
+
+	secondBody := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"fresh turn"}],"max_tokens":128,"stream":true}`)
+	secondReq := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: secondBody}
+	secondOpts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		ResponseFormat:  sdktranslator.FromString("claude"),
+		OriginalRequest: secondBody,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: sessionID,
+		},
+	}
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelSecond()
+	result, errExecute := exec.ExecuteStream(secondCtx, auth, secondReq, secondOpts)
+	if errExecute != nil {
+		t.Fatalf("second ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("second stream error = %v", chunk.Err)
+		}
+	}
+	select {
+	case payload := <-secondPayload:
+		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "" {
+			t.Fatalf("post-cancellation previous_response_id = %q, want empty; payload=%s", got, payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("next turn did not use a fresh websocket connection")
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("websocket connections = %d, want 2", got)
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+	exec.CloseExecutionSession(sessionID)
+}
