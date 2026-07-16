@@ -85,6 +85,10 @@ claude-code-auto-mode-classifier-model: gpt-5.6-sol
 Ordinary requests are never rewritten solely because their model name is
 `claude-sonnet-5`.
 
+Dynamic workflows commonly use the short model names `sol` and `luna`.
+The isolated runtime config maps those aliases to `gpt-5.6-sol` and
+`gpt-5.6-luna`. Existing user mappings for either alias take precedence.
+
 Run the budget-guarded Sol → Luna → Sol verification with:
 
 ```bash

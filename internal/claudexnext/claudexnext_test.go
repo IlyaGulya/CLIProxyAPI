@@ -73,6 +73,10 @@ codex-websocket-generate-false-warmup: true
 	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-luna" {
 		t.Fatalf("classifier model = %q, want gpt-5.6-luna", parsed.ClaudeCodeAutoModeClassifierModel)
 	}
+	aliases := aliasesByName(parsed.OAuthModelAlias["codex"])
+	if aliases["sol"] != "gpt-5.6-sol" || aliases["luna"] != "gpt-5.6-luna" {
+		t.Fatalf("workflow aliases = %#v, want sol/luna defaults", aliases)
+	}
 }
 
 func TestPrepareConfigPreservesExplicitClassifierModel(t *testing.T) {
@@ -88,6 +92,43 @@ func TestPrepareConfigPreservesExplicitClassifierModel(t *testing.T) {
 	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-sol" {
 		t.Fatalf("classifier model = %q, want preserved gpt-5.6-sol", parsed.ClaudeCodeAutoModeClassifierModel)
 	}
+}
+
+func TestPrepareConfigPreservesExplicitWorkflowModelAliases(t *testing.T) {
+	t.Parallel()
+	input := []byte(`oauth-model-alias:
+  codex:
+    - name: custom-sol
+      alias: sol
+    - name: custom-other
+      alias: other
+`)
+	got, err := PrepareConfig(input, 18432)
+	if err != nil {
+		t.Fatalf("PrepareConfig: %v", err)
+	}
+	parsed, errParse := config.ParseConfigBytes(got)
+	if errParse != nil {
+		t.Fatalf("parse prepared config: %v", errParse)
+	}
+	aliases := aliasesByName(parsed.OAuthModelAlias["codex"])
+	if aliases["sol"] != "custom-sol" {
+		t.Fatalf("explicit sol alias = %q, want custom-sol", aliases["sol"])
+	}
+	if aliases["luna"] != "gpt-5.6-luna" {
+		t.Fatalf("default luna alias = %q, want gpt-5.6-luna", aliases["luna"])
+	}
+	if aliases["other"] != "custom-other" {
+		t.Fatalf("unrelated alias = %q, want custom-other", aliases["other"])
+	}
+}
+
+func aliasesByName(entries []config.OAuthModelAlias) map[string]string {
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		out[entry.Alias] = entry.Name
+	}
+	return out
 }
 
 func TestBuildClaudeArgsDefaultsRootToSolWithoutOverridingUserFlags(t *testing.T) {

@@ -39,11 +39,39 @@ func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
 	if _, configured := values["claude-code-auto-mode-classifier-model"]; !configured {
 		values["claude-code-auto-mode-classifier-model"] = "gpt-5.6-luna"
 	}
+	ensureWorkflowModelAliases(values)
 	out, errMarshal := yaml.Marshal(values)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("encode proxy config: %w", errMarshal)
 	}
 	return out, nil
+}
+
+func ensureWorkflowModelAliases(values map[string]any) {
+	channels, ok := values["oauth-model-alias"].(map[string]any)
+	if !ok {
+		channels = make(map[string]any)
+		values["oauth-model-alias"] = channels
+	}
+	entries, _ := channels["codex"].([]any)
+	configured := make(map[string]bool, len(entries))
+	for _, raw := range entries {
+		entry, okEntry := raw.(map[string]any)
+		if !okEntry {
+			continue
+		}
+		alias, _ := entry["alias"].(string)
+		configured[strings.ToLower(strings.TrimSpace(alias))] = true
+	}
+	for alias, model := range map[string]string{
+		"sol":  "gpt-5.6-sol",
+		"luna": "gpt-5.6-luna",
+	} {
+		if !configured[alias] {
+			entries = append(entries, map[string]any{"name": model, "alias": alias, "fork": true})
+		}
+	}
+	channels["codex"] = entries
 }
 
 // ConfigAuthDir returns the configured auth directory or the standard default.
