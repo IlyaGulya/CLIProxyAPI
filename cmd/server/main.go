@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -186,6 +187,18 @@ func main() {
 		if !errors.Is(errLoad, os.ErrNotExist) {
 			log.WithError(errLoad).Warn("failed to load .env file")
 		}
+	}
+	telemetry, errTelemetry := observability.Start(context.Background())
+	if errTelemetry != nil {
+		log.WithError(errTelemetry).Warn("OpenTelemetry disabled after initialization failure")
+	} else {
+		defer func() {
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelFlush()
+			if errShutdown := telemetry.Shutdown(flushCtx); errShutdown != nil {
+				log.WithError(errShutdown).Warn("OpenTelemetry flush failed")
+			}
+		}()
 	}
 
 	lookupEnv := func(keys ...string) (string, bool) {

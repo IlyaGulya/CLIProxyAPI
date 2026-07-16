@@ -1,0 +1,84 @@
+{
+  "dashboard": {
+    "uid": "claudex-next-overview",
+    "title": "claudex-next: Claude + CLIProxyAPI",
+    "tags": ["claudex-next", "opentelemetry"],
+    "timezone": "browser",
+    "schemaVersion": 39,
+    "refresh": "5s",
+    "time": {"from": "now-30m", "to": "now"},
+    "templating": {
+      "list": [
+        {"name": "run_id", "type": "textbox", "label": "claudex.run_id", "query": "", "current": {"text": "", "value": ""}},
+        {"name": "model", "type": "query", "datasource": {"type": "prometheus", "uid": "prometheus"}, "query": {"query": "label_values(claudex_proxy_events_total, model)", "refId": "model"}, "includeAll": true, "current": {"text": "All", "value": "$__all"}}
+      ]
+    },
+    "panels": [
+      {
+        "id": 1, "type": "traces", "title": "End-to-end waterfall by run",
+        "datasource": {"type": "tempo", "uid": "tempo"},
+        "targets": [{"refId": "A", "queryType": "traceql", "query": "{ resource.claudex.run_id = \"$run_id\" }"}],
+        "gridPos": {"x": 0, "y": 0, "w": 24, "h": 10}
+      },
+      {
+        "id": 2, "type": "timeseries", "title": "Proxy latency phases p50 / p95",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [
+          {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le, phase) (rate(claudex_proxy_phase_duration_milliseconds_bucket{model=~\"$model\"}[5m])))", "legendFormat": "p50 {{phase}}"},
+          {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(claudex_proxy_phase_duration_milliseconds_bucket{model=~\"$model\"}[5m])))", "legendFormat": "p95 {{phase}}"}
+        ],
+        "fieldConfig": {"defaults": {"unit": "ms", "links": [{"title": "Traces for run", "url": "/explore?left={\"datasource\":\"tempo\",\"queries\":[{\"query\":\"{ resource.claudex.run_id = \\\"$run_id\\\" }\"}]}"}]}, "overrides": []},
+        "gridPos": {"x": 0, "y": 10, "w": 16, "h": 8}
+      },
+      {
+        "id": 3, "type": "stat", "title": "Speculative WebSocket hit rate",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{"refId": "A", "expr": "sum(rate(claudex_proxy_events_total{event_name=\"speculative_preconnect_leased\"}[5m])) / clamp_min(sum(rate(claudex_proxy_events_total{event_name=~\"speculative_preconnect_(leased|missed)\"}[5m])), 1)", "legendFormat": "hit rate"}],
+        "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+        "gridPos": {"x": 16, "y": 10, "w": 8, "h": 4}
+      },
+      {
+        "id": 4, "type": "timeseries", "title": "Pool state and active requests",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [
+          {"refId": "A", "expr": "claudex_proxy_pool_idle", "legendFormat": "idle"},
+          {"refId": "B", "expr": "claudex_proxy_pool_dialing", "legendFormat": "dialing"},
+          {"refId": "C", "expr": "claudex_proxy_requests_active", "legendFormat": "active requests"}
+        ],
+        "gridPos": {"x": 16, "y": 14, "w": 8, "h": 4}
+      },
+      {
+        "id": 5, "type": "timeseries", "title": "Tokens and prompt-cache reads by model",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [
+          {"refId": "A", "expr": "sum by (model, token_type) (rate(claudex_proxy_tokens_total{model=~\"$model\"}[5m]))", "legendFormat": "{{model}} {{token_type}}"}
+        ],
+        "gridPos": {"x": 0, "y": 18, "w": 12, "h": 8}
+      },
+      {
+        "id": 6, "type": "timeseries", "title": "Failures, retries, and model switching",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{"refId": "A", "expr": "sum by (event_name, model) (rate(claudex_proxy_events_total{event_name=~\".*(failed|error|retry).*\",model=~\"$model\"}[5m]))", "legendFormat": "{{event_name}} {{model}}"}],
+        "gridPos": {"x": 12, "y": 18, "w": 12, "h": 8}
+      },
+      {
+        "id": 7, "type": "timeseries", "title": "Proxy process health",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [
+          {"refId": "A", "expr": "process_runtime_go_goroutines", "legendFormat": "goroutines"},
+          {"refId": "B", "expr": "process_runtime_go_heap_bytes", "legendFormat": "heap bytes"},
+          {"refId": "C", "expr": "rate(process_runtime_go_gc_pause_total_nanoseconds_total[5m])", "legendFormat": "GC pause ns/s"}
+        ],
+        "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8}
+      },
+      {
+        "id": 8, "type": "logs", "title": "Correlated Claude / proxy events",
+        "datasource": {"type": "loki", "uid": "loki"},
+        "targets": [{"refId": "A", "expr": "{service_name=~\"claude-code|cli-proxy-api|claudex-next\"} |= \"$run_id\""}],
+        "gridPos": {"x": 12, "y": 26, "w": 12, "h": 8}
+      }
+    ]
+  },
+  "folderUid": "",
+  "overwrite": true
+}

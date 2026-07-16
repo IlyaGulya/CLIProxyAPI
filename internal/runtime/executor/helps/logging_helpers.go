@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
@@ -403,7 +404,12 @@ func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload
 
 // RecordAPIWebsocketError stores an upstream websocket error event in Gin context.
 func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage string, err error) {
-	if !requestLogCaptureEnabled(cfg) || err == nil {
+	if err == nil {
+		return
+	}
+	rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil)
+	observability.RecordWebsocketMetric(ctx, "error", rootCorrelation, executionCorrelation, map[string]any{"reason": stage, "success": false}, false)
+	if !requestLogCaptureEnabled(cfg) {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
@@ -428,14 +434,13 @@ func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage stri
 // request-log lifecycle so a single per-request artifact contains both the raw
 // protocol transcript and enough phase metrics to explain end-to-end latency.
 func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name string, fields map[string]any) {
-	if !requestLogCaptureEnabled(cfg) {
-		return
-	}
 	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
+	rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil)
+	observability.RecordWebsocketMetric(ctx, name, rootCorrelation, executionCorrelation, fields, false)
+	if !requestLogCaptureEnabled(cfg) || ginCtx == nil {
 		return
 	}
-	if rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil); rootCorrelation != "" {
+	if rootCorrelation != "" {
 		payload := marshalAPIWebsocketMetric(name, rootCorrelation, executionCorrelation, fields)
 		if len(payload) > 0 {
 			appendAPIWebsocketTimeline(ginCtx, payload)
@@ -453,6 +458,7 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 // request; retaining *gin.Context after a handler returns can attribute data to
 // a later request when Gin reuses the context.
 func RecordDetachedAPIWebsocketMetric(cfg *config.Config, name string, rootCorrelation string, executionCorrelation string, fields map[string]any) {
+	observability.RecordWebsocketMetric(context.Background(), name, rootCorrelation, executionCorrelation, fields, true)
 	if !requestLogCaptureEnabled(cfg) {
 		return
 	}

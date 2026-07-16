@@ -15,6 +15,7 @@ Each invocation creates a private run bundle under
 `~/.claudex-next/latest`. The bundle contains:
 
 - a privacy-safe JSON and Markdown summary;
+- a checksummed evidence manifest and a machine-readable OTEL verification report;
 - the exact launcher manifest and binary checksum;
 - isolated CLIProxyAPI request timelines and process logs;
 - Claude debug output and non-interactive stdout/stderr;
@@ -36,6 +37,52 @@ The isolated proxy enables upstream WebSockets, request timelines, speculative
 preconnect, and bounded replenishment. `generate=false` warmup remains disabled.
 The launcher never modifies the source CLIProxyAPI config or credential files;
 it enables the Codex WebSocket capability only in the per-run private copy.
+
+## Local observability
+
+By default the launcher reuses or lazily starts the persistent Docker container
+`claudex-next-otel-lgtm` from the pinned image `grafana/otel-lgtm:0.27.1`.
+Grafana is available at <http://127.0.0.1:3300>; OTLP/gRPC and OTLP/HTTP use
+ports 4317 and 4318. Backend state is kept in the named volume
+`claudex-next-otel-lgtm-data`. The launcher never deletes that volume.
+
+The stack includes Grafana, Tempo, Prometheus, Loki, and an OpenTelemetry
+Collector. `claudex-next` provisions the `claudex-next: Claude + CLIProxyAPI`
+dashboard automatically. It contains the distributed waterfall, p50/p95 phase
+latencies, speculative hit rate, pool state, cache/token activity, failures,
+model switching, process health, and correlated logs.
+
+Claude Code exports its native metrics, events, and beta traces. CLIProxyAPI
+exports HTTP request spans, DNS/TCP/TLS/WebSocket phases, upstream first-event
+and first-text timings, translation/downstream flush timings, retry/failure
+events, token and byte counters, pool gauges, and Go runtime metrics. All three
+services carry `claudex.run_id`. For non-interactive Claude runs the launcher
+also injects W3C `TRACEPARENT`; CLIProxyAPI extracts the header and links
+detached speculative preconnect spans to the matching execution.
+
+If Docker or Grafana is unavailable, Claude still starts and the complete file
+bundle remains available for analysis. Set `CLAUDEX_NEXT_OTEL_STACK=off` to
+disable automatic Docker management. Supplying `OTEL_EXPORTER_OTLP_ENDPOINT`
+uses that collector and skips the local stack.
+
+Explicit `OTEL_*` settings always win over launcher defaults. The defaults keep
+prompt, assistant response, tool detail/content, and raw API body export off,
+and exclude session/account/run resource attributes from Claude metric labels.
+The private request logs and transcripts can still contain sensitive content.
+
+Run the budget-guarded Sol → Luna → Sol verification with:
+
+```bash
+go build -o ~/.local/bin/claudex-next ./cmd/claudex-next
+go build -o ~/.local/bin/cli-proxy-api-next ./cmd/server
+go build -o ~/.local/bin/claudex-next-verify ./cmd/claudex-next-verify
+scripts/claudex-next-otel-e2e.sh
+```
+
+The verifier checks routing, speculative WebSocket use, flush behavior,
+checksums, dashboard/backend availability, trace/log correlation, metric counts
+against raw timelines, and the privacy canary. It writes `verification.json`
+and a publishable `verification.md` into the run directory.
 
 Launcher-only flags use the `--next-` namespace so all other arguments pass to
 Claude unchanged:

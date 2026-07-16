@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -187,4 +188,101 @@ func flattenEnv(values map[string]string) []string {
 		out = append(out, buffer.String())
 	}
 	return out
+}
+
+// ConfigureClaudeOTEL enables Claude Code's native metrics, events, and beta
+// traces while preserving every explicit user setting. Sensitive payload gates
+// and high-cardinality metric labels remain disabled unless the user opts in.
+func ConfigureClaudeOTEL(values map[string]string, endpoint, runID string) {
+	defaults := map[string]string{
+		"CLAUDE_CODE_ENABLE_TELEMETRY":             "1",
+		"CLAUDE_CODE_ENHANCED_TELEMETRY_BETA":      "1",
+		"CLAUDE_CODE_PROPAGATE_TRACEPARENT":        "1",
+		"OTEL_METRICS_EXPORTER":                    "otlp",
+		"OTEL_LOGS_EXPORTER":                       "otlp",
+		"OTEL_TRACES_EXPORTER":                     "otlp",
+		"OTEL_EXPORTER_OTLP_PROTOCOL":              "http/protobuf",
+		"OTEL_EXPORTER_OTLP_ENDPOINT":              endpoint,
+		"OTEL_METRIC_EXPORT_INTERVAL":              "1000",
+		"OTEL_LOGS_EXPORT_INTERVAL":                "1000",
+		"OTEL_TRACES_EXPORT_INTERVAL":              "1000",
+		"OTEL_METRICS_INCLUDE_SESSION_ID":          "false",
+		"OTEL_METRICS_INCLUDE_ACCOUNT_UUID":        "false",
+		"OTEL_METRICS_INCLUDE_RESOURCE_ATTRIBUTES": "false",
+		"OTEL_LOG_USER_PROMPTS":                    "0",
+		"OTEL_LOG_ASSISTANT_RESPONSES":             "0",
+		"OTEL_LOG_TOOL_DETAILS":                    "0",
+		"OTEL_LOG_TOOL_CONTENT":                    "0",
+		"OTEL_LOG_RAW_API_BODIES":                  "0",
+	}
+	for key, value := range defaults {
+		if _, exists := values[key]; !exists {
+			values[key] = value
+		}
+	}
+	attributes := splitResourceAttributes(values["OTEL_RESOURCE_ATTRIBUTES"])
+	if _, exists := attributes["service.name"]; !exists {
+		attributes["service.name"] = "claude-code"
+	}
+	if _, exists := attributes["claudex.run_id"]; !exists && strings.TrimSpace(runID) != "" {
+		attributes["claudex.run_id"] = strings.TrimSpace(runID)
+	}
+	values["OTEL_RESOURCE_ATTRIBUTES"] = joinResourceAttributes(attributes)
+}
+
+func ConfigureProxyOTEL(values map[string]string, endpoint, runID string) {
+	defaults := map[string]string{
+		"OTEL_TRACES_EXPORTER":        "otlp",
+		"OTEL_METRICS_EXPORTER":       "otlp",
+		"OTEL_LOGS_EXPORTER":          "otlp",
+		"OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
+		"CLAUDEX_NEXT_RUN_ID":         runID,
+	}
+	for key, value := range defaults {
+		if _, exists := values[key]; !exists {
+			values[key] = value
+		}
+	}
+	attributes := splitResourceAttributes(values["OTEL_RESOURCE_ATTRIBUTES"])
+	attributes["service.name"] = "cli-proxy-api"
+	attributes["claudex.run_id"] = runID
+	values["OTEL_RESOURCE_ATTRIBUTES"] = joinResourceAttributes(attributes)
+}
+
+func splitResourceAttributes(value string) map[string]string {
+	attributes := make(map[string]string)
+	for _, entry := range strings.Split(value, ",") {
+		key, item, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		if ok && strings.TrimSpace(key) != "" {
+			attributes[strings.TrimSpace(key)] = strings.TrimSpace(item)
+		}
+	}
+	return attributes
+}
+
+func joinResourceAttributes(attributes map[string]string) string {
+	keys := make([]string, 0, len(attributes))
+	for key := range attributes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	// Keep user/team attributes first and the claudex identity predictable.
+	ordered := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key != "service.name" && key != "claudex.run_id" {
+			ordered = append(ordered, key)
+		}
+	}
+	if _, ok := attributes["service.name"]; ok {
+		ordered = append(ordered, "service.name")
+	}
+	if _, ok := attributes["claudex.run_id"]; ok {
+		ordered = append(ordered, "claudex.run_id")
+	}
+	entries := make([]string, 0, len(ordered))
+	for _, key := range ordered {
+		entries = append(entries, key+"="+attributes[key])
+	}
+	return strings.Join(entries, ",")
 }

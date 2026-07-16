@@ -1,6 +1,10 @@
 package claudexnext
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +12,21 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
+
+type fakeCommandRunner struct {
+	outputs map[string]struct {
+		output []byte
+		err    error
+	}
+	calls []string
+}
+
+func (f *fakeCommandRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	call := strings.Join(append([]string{name}, args...), " ")
+	f.calls = append(f.calls, call)
+	result := f.outputs[call]
+	return result.output, result.err
+}
 
 func TestPrepareConfigEnablesObservableWebsocketPath(t *testing.T) {
 	t.Parallel()
@@ -181,5 +200,155 @@ func TestSessionIDFromRequestLogsSupportsResumeRuns(t *testing.T) {
 	}
 	if got := sessionIDFromRequestLogs(logs); got != "resumed-session" {
 		t.Fatalf("session ID = %q", got)
+	}
+}
+
+func TestConfigureClaudeOTELUsesPrivateLowCardinalityDefaults(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+		"OTEL_RESOURCE_ATTRIBUTES":    "team.id=platform",
+	}
+	ConfigureClaudeOTEL(values, "http://127.0.0.1:4318", "run-123")
+
+	wants := map[string]string{
+		"CLAUDE_CODE_ENABLE_TELEMETRY":             "1",
+		"CLAUDE_CODE_ENHANCED_TELEMETRY_BETA":      "1",
+		"CLAUDE_CODE_PROPAGATE_TRACEPARENT":        "1",
+		"OTEL_METRICS_EXPORTER":                    "otlp",
+		"OTEL_LOGS_EXPORTER":                       "otlp",
+		"OTEL_TRACES_EXPORTER":                     "otlp",
+		"OTEL_EXPORTER_OTLP_PROTOCOL":              "grpc",
+		"OTEL_METRICS_INCLUDE_SESSION_ID":          "false",
+		"OTEL_METRICS_INCLUDE_ACCOUNT_UUID":        "false",
+		"OTEL_METRICS_INCLUDE_RESOURCE_ATTRIBUTES": "false",
+		"OTEL_LOG_USER_PROMPTS":                    "0",
+		"OTEL_LOG_ASSISTANT_RESPONSES":             "0",
+		"OTEL_LOG_TOOL_DETAILS":                    "0",
+		"OTEL_LOG_TOOL_CONTENT":                    "0",
+		"OTEL_LOG_RAW_API_BODIES":                  "0",
+	}
+	for key, want := range wants {
+		if got := values[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	if got := values["OTEL_RESOURCE_ATTRIBUTES"]; got != "team.id=platform,service.name=claude-code,claudex.run_id=run-123" {
+		t.Fatalf("resource attributes = %q", got)
+	}
+}
+
+func TestConfigureClaudeOTELPreservesExplicitPrivacyAndExporterSettings(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example",
+		"OTEL_LOG_TOOL_DETAILS":       "1",
+		"OTEL_METRIC_EXPORT_INTERVAL": "9000",
+	}
+	ConfigureClaudeOTEL(values, "http://127.0.0.1:4318", "run-1")
+	if values["OTEL_EXPORTER_OTLP_ENDPOINT"] != "https://collector.example" || values["OTEL_LOG_TOOL_DETAILS"] != "1" || values["OTEL_METRIC_EXPORT_INTERVAL"] != "9000" {
+		t.Fatalf("explicit settings were overwritten: %#v", values)
+	}
+}
+
+func TestEnsureLGTMReusesRunningContainer(t *testing.T) {
+	t.Parallel()
+	runner := &fakeCommandRunner{outputs: map[string]struct {
+		output []byte
+		err    error
+	}{
+		"docker inspect --format {{.State.Running}} claudex-next-otel-lgtm": {output: []byte("true\n")},
+	}}
+	status := EnsureLGTM(context.Background(), runner, func(context.Context, string) error { return nil })
+	if !status.Available || status.Started || len(runner.calls) != 1 {
+		t.Fatalf("status = %+v, calls = %#v", status, runner.calls)
+	}
+}
+
+func TestEnsureLGTMStartsPinnedPersistentContainer(t *testing.T) {
+	t.Parallel()
+	runner := &fakeCommandRunner{outputs: map[string]struct {
+		output []byte
+		err    error
+	}{
+		"docker inspect --format {{.State.Running}} claudex-next-otel-lgtm": {err: os.ErrNotExist},
+	}}
+	status := EnsureLGTM(context.Background(), runner, func(context.Context, string) error { return nil })
+	if !status.Available || !status.Started {
+		t.Fatalf("status = %+v", status)
+	}
+	joined := strings.Join(runner.calls, "\n")
+	for _, want := range []string{
+		"grafana/otel-lgtm:0.27.1", "claudex-next-otel-lgtm-data:/data",
+		"127.0.0.1:3300:3000", "127.0.0.1:4317:4317", "127.0.0.1:4318:4318",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("docker calls missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestEnsureLGTMDegradesWhenDockerUnavailable(t *testing.T) {
+	t.Parallel()
+	runner := &fakeCommandRunner{outputs: map[string]struct {
+		output []byte
+		err    error
+	}{
+		"docker inspect --format {{.State.Running}} claudex-next-otel-lgtm": {err: os.ErrNotExist},
+	}}
+	status := EnsureLGTM(context.Background(), runner, func(context.Context, string) error { return os.ErrNotExist })
+	if status.Available || status.Error == "" {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
+func TestProvisionGrafanaDashboardUsesStableUIDAndNoSecrets(t *testing.T) {
+	t.Parallel()
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/dashboards/db" || r.Method != http.MethodPost {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if user, password, ok := r.BasicAuth(); !ok || user != "admin" || password != "admin" {
+			t.Errorf("missing local Grafana auth")
+		}
+		payload, _ := io.ReadAll(r.Body)
+		body = string(payload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	if err := ProvisionGrafana(context.Background(), server.URL, server.Client()); err != nil {
+		t.Fatalf("ProvisionGrafana: %v", err)
+	}
+	for _, want := range []string{"claudex-next-overview", "claudex.run_id", "claudex_proxy", "tempo", "prometheus", "loki"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"ANTHROPIC_AUTH_TOKEN", "access_token", "request_body", "user_prompt"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("dashboard contains sensitive field %q", forbidden)
+		}
+	}
+}
+
+func TestEvidenceChecksumsDetectMutation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "summary.json")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeChecksums(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyChecksums(dir); err != nil {
+		t.Fatalf("fresh checksums: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyChecksums(dir); err == nil {
+		t.Fatal("mutated evidence passed checksum verification")
 	}
 }

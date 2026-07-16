@@ -22,6 +22,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Options struct {
@@ -38,20 +44,25 @@ type Options struct {
 }
 
 type Manifest struct {
-	RunID          string    `json:"run_id"`
-	SessionID      string    `json:"session_id"`
-	StartedAt      time.Time `json:"started_at"`
-	FinishedAt     time.Time `json:"finished_at"`
-	WorkingDir     string    `json:"working_directory"`
-	ClaudeVersion  string    `json:"claude_version"`
-	ClaudeArgs     []string  `json:"claude_args"`
-	RootModel      string    `json:"root_model"`
-	SubagentModel  string    `json:"subagent_model"`
-	MaxConcurrency string    `json:"max_tool_use_concurrency"`
-	ProxyBinary    string    `json:"proxy_binary"`
-	ProxySHA256    string    `json:"proxy_sha256"`
-	ProxyPort      int       `json:"proxy_port"`
-	ExitCode       int       `json:"exit_code"`
+	RunID           string            `json:"run_id"`
+	SessionID       string            `json:"session_id"`
+	StartedAt       time.Time         `json:"started_at"`
+	FinishedAt      time.Time         `json:"finished_at"`
+	WorkingDir      string            `json:"working_directory"`
+	ClaudeVersion   string            `json:"claude_version"`
+	ClaudeArgs      []string          `json:"claude_args"`
+	RootModel       string            `json:"root_model"`
+	SubagentModel   string            `json:"subagent_model"`
+	MaxConcurrency  string            `json:"max_tool_use_concurrency"`
+	ProxyBinary     string            `json:"proxy_binary"`
+	ProxySHA256     string            `json:"proxy_sha256"`
+	ProxyPort       int               `json:"proxy_port"`
+	ExitCode        int               `json:"exit_code"`
+	Stack           StackStatus       `json:"observability_stack"`
+	ProxyReadyMS    int64             `json:"proxy_ready_ms"`
+	ClaudeRuntimeMS int64             `json:"claude_runtime_ms"`
+	OTELFlushOK     bool              `json:"otel_flush_ok"`
+	Telemetry       map[string]string `json:"telemetry_privacy"`
 }
 
 // Run launches an isolated instrumented proxy and one Claude session.
@@ -106,6 +117,46 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	values := envMap(baseEnv)
 	values["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + strconv.Itoa(port)
 	values["CLAUDEX_NEXT_RUN_ID"] = runID
+	stack := StackStatus{Image: LGTMImage, Grafana: GrafanaURL, Endpoint: LGTMEndpoint}
+	explicitEndpoint := strings.TrimSpace(values["OTEL_EXPORTER_OTLP_ENDPOINT"])
+	if explicitEndpoint != "" {
+		stack.Available = true
+		stack.Endpoint = explicitEndpoint
+	} else if !strings.EqualFold(strings.TrimSpace(values["CLAUDEX_NEXT_OTEL_STACK"]), "off") {
+		stack = EnsureLGTM(ctx, ExecCommandRunner{}, WaitForHTTP)
+		if stack.Available {
+			if errDashboard := ProvisionGrafana(ctx, stack.Grafana, nil); errDashboard != nil {
+				stack.DashboardError = errDashboard.Error()
+			} else {
+				stack.Dashboard = true
+			}
+		}
+	}
+	if stack.Available {
+		ConfigureClaudeOTEL(values, stack.Endpoint, runID)
+	}
+	_ = writeJSON(filepath.Join(runDir, "observability-stack.json"), stack)
+
+	var launcherTelemetry *observability.Telemetry
+	var launcherSpan trace.Span
+	if stack.Available {
+		launcherEnv := cloneEnv(values)
+		launcherEnv["OTEL_SERVICE_NAME"] = "claudex-next"
+		for key, value := range launcherEnv {
+			_ = os.Setenv(key, value)
+		}
+		launcherTelemetry, _ = observability.StartService(ctx, "claudex-next")
+		ctx, launcherSpan = otel.Tracer("claudex-next").Start(ctx, "claudex-next.run",
+			trace.WithTimestamp(startedAt),
+			trace.WithAttributes(attribute.String("claudex.run_id", runID), attribute.Bool("lgtm.started", stack.Started), attribute.Bool("grafana.dashboard.provisioned", stack.Dashboard)),
+		)
+		launcherSpan.AddEvent("observability.stack.ready")
+		carrier := propagation.HeaderCarrier{}
+		otel.GetTextMapPropagator().Inject(ctx, carrier)
+		if traceparent := carrier.Get("traceparent"); traceparent != "" {
+			values["TRACEPARENT"] = traceparent
+		}
+	}
 
 	proxyLog, errProxyLog := os.OpenFile(filepath.Join(runDir, "proxy", "process.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if errProxyLog != nil {
@@ -114,8 +165,11 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	defer func() { _ = proxyLog.Close() }()
 	proxyCmd := exec.CommandContext(ctx, opts.ProxyBin, "--config", runtimeConfig, "--local-model")
 	proxyCmd.Dir = filepath.Join(runDir, "proxy")
-	proxyEnv := envMap(os.Environ())
+	proxyEnv := cloneEnv(values)
 	proxyEnv["WRITABLE_PATH"] = filepath.Join(runDir, "proxy")
+	if stack.Available {
+		ConfigureProxyOTEL(proxyEnv, stack.Endpoint, runID)
+	}
 	proxyCmd.Env = flattenEnv(proxyEnv)
 	proxyCmd.Stdout = proxyLog
 	proxyCmd.Stderr = proxyLog
@@ -123,8 +177,13 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		return runDir, 1, fmt.Errorf("start proxy %s: %w", opts.ProxyBin, errStart)
 	}
 	defer stopProcess(proxyCmd)
+	proxyReadyStartedAt := time.Now()
 	if errReady := waitForProxy(ctx, port, 15*time.Second); errReady != nil {
 		return runDir, 1, fmt.Errorf("proxy did not become ready (see %s): %w", proxyLog.Name(), errReady)
+	}
+	proxyReadyMS := time.Since(proxyReadyStartedAt).Milliseconds()
+	if launcherSpan != nil {
+		launcherSpan.AddEvent("proxy.ready", trace.WithAttributes(attribute.Int64("duration.ms", proxyReadyMS)))
 	}
 
 	debugPath := filepath.Join(runDir, "claude", "debug.log")
@@ -159,10 +218,33 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	if opts.Stderr != nil {
 		_, _ = fmt.Fprintf(opts.Stderr, "\n[claudex-next] run: %s\n[claudex-next] artifacts: %s\n\n", runID, runDir)
 	}
+	claudeStartedAt := time.Now()
+	if launcherSpan != nil {
+		launcherSpan.AddEvent("claude.started")
+	}
 	errRun := claudeCmd.Run()
+	claudeRuntimeMS := time.Since(claudeStartedAt).Milliseconds()
 	exitCode := exitStatus(errRun)
-	stopProcess(proxyCmd)
+	if launcherSpan != nil {
+		launcherSpan.AddEvent("claude.exited", trace.WithAttributes(attribute.Int("process.exit.code", exitCode), attribute.Int64("duration.ms", claudeRuntimeMS)))
+		if errRun != nil {
+			launcherSpan.SetStatus(codes.Error, "Claude exited unsuccessfully")
+		}
+	}
+	proxyStopped := stopProcess(proxyCmd)
+	if launcherSpan != nil {
+		launcherSpan.AddEvent("proxy.stopped", trace.WithAttributes(attribute.Bool("graceful", proxyStopped)))
+	}
 	_ = proxyLog.Sync()
+	otelFlushOK := false
+	if launcherSpan != nil {
+		launcherSpan.End()
+	}
+	if launcherTelemetry != nil {
+		flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+		otelFlushOK = launcherTelemetry.Shutdown(flushCtx) == nil
+		cancelFlush()
+	}
 	if observedSessionID := sessionIDFromRequestLogs(filepath.Join(runDir, "proxy", "logs")); observedSessionID != "" {
 		sessionID = observedSessionID
 	}
@@ -174,6 +256,8 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		ClaudeVersion: commandVersion(opts.ClaudeBin), ClaudeArgs: redactArgs(claudeArgs), RootModel: flagValue(claudeArgs, "--model"),
 		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ExitCode: exitCode,
+		Stack: stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
+		Telemetry: telemetryPrivacy(values),
 	}
 	if errWrite := writeJSON(filepath.Join(runDir, "manifest.json"), manifest); errWrite != nil {
 		return runDir, exitCode, errWrite
@@ -188,11 +272,27 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	if errWrite := os.WriteFile(filepath.Join(runDir, "summary.md"), []byte(RenderMarkdown(manifest, summary)), 0o600); errWrite != nil {
 		return runDir, exitCode, fmt.Errorf("write summary: %w", errWrite)
 	}
+	if errChecksums := writeChecksums(runDir); errChecksums != nil {
+		return runDir, exitCode, errChecksums
+	}
 	updateLatest(opts.RunsDir, runDir)
 	if opts.Stderr != nil {
 		_, _ = fmt.Fprintf(opts.Stderr, "\n[claudex-next] summary: %s\n", filepath.Join(runDir, "summary.md"))
 	}
 	return runDir, exitCode, errRun
+}
+
+func fileContains(path, needle string) bool {
+	payload, errRead := os.ReadFile(path)
+	return errRead == nil && strings.Contains(string(payload), needle)
+}
+
+func telemetryPrivacy(values map[string]string) map[string]string {
+	out := make(map[string]string)
+	for _, key := range []string{"OTEL_LOG_USER_PROMPTS", "OTEL_LOG_ASSISTANT_RESPONSES", "OTEL_LOG_TOOL_DETAILS", "OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_RAW_API_BODIES"} {
+		out[key] = values[key]
+	}
+	return out
 }
 
 func defaults(opts *Options, home string) {
@@ -256,19 +356,29 @@ func waitForProxy(ctx context.Context, port int, timeout time.Duration) error {
 	return fmt.Errorf("timeout after %s", timeout)
 }
 
-func stopProcess(cmd *exec.Cmd) {
+func stopProcess(cmd *exec.Cmd) bool {
 	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
-		return
+		return true
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()
 	select {
 	case <-done:
+		return true
 	case <-time.After(3 * time.Second):
 		_ = cmd.Process.Kill()
 		<-done
+		return false
 	}
+}
+
+func cloneEnv(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 func exitStatus(err error) int {
@@ -384,6 +494,37 @@ func updateLatest(runsDir, runDir string) {
 	latest := filepath.Join(filepath.Dir(runsDir), "latest")
 	_ = os.Remove(latest)
 	_ = os.Symlink(runDir, latest)
+}
+
+func writeChecksums(runDir string) error {
+	var paths []string
+	errWalk := filepath.WalkDir(runDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || path == filepath.Join(runDir, "checksums.sha256") {
+			return nil
+		}
+		paths = append(paths, path)
+		return nil
+	})
+	if errWalk != nil {
+		return fmt.Errorf("enumerate run evidence: %w", errWalk)
+	}
+	sort.Strings(paths)
+	var output strings.Builder
+	for _, path := range paths {
+		hash, errHash := fileSHA256(path)
+		if errHash != nil {
+			return fmt.Errorf("checksum %s: %w", path, errHash)
+		}
+		relative, _ := filepath.Rel(runDir, path)
+		fmt.Fprintf(&output, "%s  %s\n", hash, relative)
+	}
+	if errWrite := os.WriteFile(filepath.Join(runDir, "checksums.sha256"), []byte(output.String()), 0o600); errWrite != nil {
+		return fmt.Errorf("write evidence checksums: %w", errWrite)
+	}
+	return nil
 }
 
 func RenderMarkdown(manifest Manifest, summary RunSummary) string {
