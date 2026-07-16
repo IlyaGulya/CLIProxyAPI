@@ -49,6 +49,24 @@ func TestClaudeCodePromptCacheStableAcrossRequests(t *testing.T) {
 	}
 }
 
+func TestClaudeCodePromptCacheIsolatesAuthAndModel(t *testing.T) {
+	ctx := context.Background()
+	payload := []byte(`{"metadata":{"user_id":"{\"session_id\":\"cache-isolation-session\"}"}}`)
+	base, ok, errBase := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-luna", "auth-a", payload, nil)
+	if errBase != nil || !ok || base.ID == "" {
+		t.Fatalf("base cache = %#v, ok=%v, err=%v", base, ok, errBase)
+	}
+	same, _, _ := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-luna", "auth-a", payload, nil)
+	otherAuth, _, _ := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-luna", "auth-b", payload, nil)
+	otherModel, _, _ := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-sol", "auth-a", payload, nil)
+	if same.ID != base.ID {
+		t.Fatalf("same auth/model cache ID = %q, want %q", same.ID, base.ID)
+	}
+	if otherAuth.ID == base.ID || otherModel.ID == base.ID || otherAuth.ID == otherModel.ID {
+		t.Fatalf("cache isolation failed: base=%q other_auth=%q other_model=%q", base.ID, otherAuth.ID, otherModel.ID)
+	}
+}
+
 func TestExtractClaudeCodeSessionIDPrefersHeaderOverPayload(t *testing.T) {
 	payload := []byte(`{"metadata":{"user_id":"{"session_id":"payload-session"}"}}`)
 	headers := http.Header{}

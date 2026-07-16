@@ -1106,6 +1106,37 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 	}
 }
 
+func TestCodexPromptCacheMetricFieldsTrackStablePrefixWithoutRawKey(t *testing.T) {
+	first := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"private-key","instructions":"stable","tools":[{"type":"function","name":"Agent"}],"reasoning":{"effort":"high"},"input":[{"role":"user","content":"one"}]}`)
+	second := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"private-key","instructions":"stable","tools":[{"type":"function","name":"Agent"}],"reasoning":{"effort":"high"},"input":[{"role":"user","content":"two"}]}`)
+	changed := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"private-key","instructions":"stable","tools":[{"type":"function","name":"Different"}],"reasoning":{"effort":"high"},"input":[{"role":"user","content":"two"}]}`)
+	developerPrefix := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"private-key","instructions":"","tools":[],"input":[{"role":"developer","content":[{"type":"input_text","text":"prefix one"}]},{"role":"user","content":"one"}]}`)
+	changedDeveloperPrefix := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"private-key","instructions":"","tools":[],"input":[{"role":"developer","content":[{"type":"input_text","text":"prefix two"}]},{"role":"user","content":"one"}]}`)
+
+	firstFields := codexPromptCacheMetricFields(first)
+	secondFields := codexPromptCacheMetricFields(second)
+	changedFields := codexPromptCacheMetricFields(changed)
+	developerFields := codexPromptCacheMetricFields(developerPrefix)
+	changedDeveloperFields := codexPromptCacheMetricFields(changedDeveloperPrefix)
+	if firstFields["prompt_cache_scope"] == "" || firstFields["prompt_prefix_fingerprint"] == "" {
+		t.Fatalf("missing cache metric fields: %#v", firstFields)
+	}
+	if firstFields["prompt_cache_scope"] != secondFields["prompt_cache_scope"] || firstFields["prompt_prefix_fingerprint"] != secondFields["prompt_prefix_fingerprint"] {
+		t.Fatalf("input-only change destabilized cache fields: first=%#v second=%#v", firstFields, secondFields)
+	}
+	if firstFields["prompt_prefix_fingerprint"] == changedFields["prompt_prefix_fingerprint"] {
+		t.Fatalf("tool change did not alter prefix fingerprint: %#v", changedFields)
+	}
+	if developerFields["prompt_prefix_fingerprint"] == changedDeveloperFields["prompt_prefix_fingerprint"] || developerFields["instructions_bytes"].(int) == 0 {
+		t.Fatalf("developer prefix was not fingerprinted: first=%#v changed=%#v", developerFields, changedDeveloperFields)
+	}
+	for _, fields := range []map[string]any{firstFields, secondFields, changedFields} {
+		if strings.Contains(fmt.Sprint(fields), "private-key") || strings.Contains(fmt.Sprint(fields), "stable") {
+			t.Fatalf("cache metric fields leaked raw content: %#v", fields)
+		}
+	}
+}
+
 func TestCodexAutoExecutorUsesWebsocketForUpstreamPreference(t *testing.T) {
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"websockets": "true"}}
 	if codexShouldUseWebsockets(context.Background(), auth) {

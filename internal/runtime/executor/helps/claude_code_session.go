@@ -104,11 +104,18 @@ func extractClaudeCodeSessionIDFromPayload(payload []byte) string {
 
 // ClaudeCodePromptCache maps a Claude Code session to a stable upstream prompt_cache_key.
 func ClaudeCodePromptCache(ctx context.Context, modelName string, payload []byte, headers http.Header) (CodexCache, bool, error) {
+	return ClaudeCodePromptCacheForAuth(ctx, modelName, "", payload, headers)
+}
+
+// ClaudeCodePromptCacheForAuth maps a Claude Code root/model/auth scope to a
+// stable upstream prompt_cache_key. Auth isolation prevents cache identity
+// from crossing credentials when the scheduler routes equivalent sessions.
+func ClaudeCodePromptCacheForAuth(ctx context.Context, modelName string, authID string, payload []byte, headers http.Header) (CodexCache, bool, error) {
 	sessionID := ExtractClaudeCodeSessionID(ctx, payload, headers)
 	if sessionID == "" {
 		return CodexCache{}, false, nil
 	}
-	key := CodexPromptCacheKey(modelName, "claude:"+sessionID)
+	key := CodexPromptCacheKey(modelName, "claude:"+strings.TrimSpace(authID)+":"+sessionID)
 	if cache, ok, errCache := GetCodexCacheRequired(ctx, key); errCache != nil || ok {
 		return cache, ok, errCache
 	}

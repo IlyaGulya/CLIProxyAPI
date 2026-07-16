@@ -236,7 +236,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContext(ctx, from, req, body)
+	body, wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContext(ctx, from, req, body, auth.ID)
 	if errPromptCache != nil {
 		return resp, errPromptCache
 	}
@@ -469,7 +469,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContext(ctx, from, req, body)
+	body, wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContext(ctx, from, req, body, auth.ID)
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
@@ -522,18 +522,23 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if sess != nil && from.String() == "claude" {
 		requestBody, incrementalObservation = sess.prepareCodexIncrementalRequestObserved(clientBody)
 	}
+	cacheMetricFields := codexPromptCacheMetricFields(requestBody)
 	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_prepared", map[string]any{
-		"session_id":               executionSessionID,
-		"model":                    baseModel,
-		"source_format":            from.String(),
-		"elapsed_us":               time.Since(traceStartedAt).Microseconds(),
-		"client_body_bytes":        len(clientBody),
-		"upstream_body_bytes":      len(requestBody),
-		"input_items":              gjson.GetBytes(requestBody, "input.#").Int(),
-		"incremental":              incrementalObservation.incremental,
-		"incremental_reset_reason": incrementalObservation.resetReason,
-		"overflow":                 sessionOverflow,
-		"has_previous_response":    strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
+		"session_id":                executionSessionID,
+		"model":                     baseModel,
+		"source_format":             from.String(),
+		"elapsed_us":                time.Since(traceStartedAt).Microseconds(),
+		"client_body_bytes":         len(clientBody),
+		"upstream_body_bytes":       len(requestBody),
+		"input_items":               gjson.GetBytes(requestBody, "input.#").Int(),
+		"incremental":               incrementalObservation.incremental,
+		"incremental_reset_reason":  incrementalObservation.resetReason,
+		"overflow":                  sessionOverflow,
+		"has_previous_response":     strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
+		"prompt_cache_scope":        cacheMetricFields["prompt_cache_scope"],
+		"prompt_prefix_fingerprint": cacheMetricFields["prompt_prefix_fingerprint"],
+		"instructions_bytes":        cacheMetricFields["instructions_bytes"],
+		"tools_count":               cacheMetricFields["tools_count"],
 	})
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, requestBody)
@@ -941,6 +946,50 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	return fallback
 }
 
+func codexPromptCacheMetricFields(body []byte) map[string]any {
+	instructionsBytes := len(gjson.GetBytes(body, "instructions").String())
+	stableInputPrefix := make([]string, 0, 2)
+	gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
+		role := strings.TrimSpace(item.Get("role").String())
+		if role != "developer" && role != "system" {
+			return false
+		}
+		stableInputPrefix = append(stableInputPrefix, item.Raw)
+		item.Get("content").ForEach(func(_, content gjson.Result) bool {
+			instructionsBytes += len(content.Get("text").String())
+			return true
+		})
+		return true
+	})
+	fields := map[string]any{
+		"prompt_cache_scope":        "",
+		"prompt_prefix_fingerprint": "",
+		"instructions_bytes":        instructionsBytes,
+		"tools_count":               gjson.GetBytes(body, "tools.#").Int(),
+	}
+	cacheKey := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	if cacheKey == "" {
+		return fields
+	}
+	fields["prompt_cache_scope"] = "codex-cache:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("cache-scope\x00"+cacheKey)).String()
+	var prefix strings.Builder
+	for _, path := range []string{"model", "instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "include", "text", "service_tier"} {
+		value := gjson.GetBytes(body, path)
+		prefix.WriteString(path)
+		prefix.WriteByte(0)
+		prefix.WriteString(value.Raw)
+		prefix.WriteByte(0)
+	}
+	for _, item := range stableInputPrefix {
+		prefix.WriteString("input_prefix")
+		prefix.WriteByte(0)
+		prefix.WriteString(item)
+		prefix.WriteByte(0)
+	}
+	fields["prompt_prefix_fingerprint"] = "codex-prefix:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(prefix.String())).String()
+	return fields
+}
+
 type codexGenerateFalseWarmupResult struct {
 	responseID   string
 	inputTokens  int64
@@ -1128,11 +1177,11 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 }
 
 func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
-	body, headers, _ := applyCodexPromptCacheHeadersWithContext(context.Background(), from, req, rawJSON)
+	body, headers, _ := applyCodexPromptCacheHeadersWithContext(context.Background(), from, req, rawJSON, "")
 	return body, headers
 }
 
-func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header, error) {
+func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, authID string) ([]byte, http.Header, error) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
 		return rawJSON, headers, nil
@@ -1140,7 +1189,7 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, nil)
+		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, req.Model, authID, req.Payload, nil)
 		if errCache != nil {
 			return nil, nil, errCache
 		}
