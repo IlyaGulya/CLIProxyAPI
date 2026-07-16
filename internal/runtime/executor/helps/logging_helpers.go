@@ -3,6 +3,7 @@ package helps
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"net/http"
@@ -419,6 +420,41 @@ func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage stri
 	builder.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
 
 	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
+}
+
+// RecordAPIWebsocketMetric appends a structured, prompt-free timing/counter
+// event to the upstream websocket timeline. It intentionally shares the
+// request-log lifecycle so a single per-request artifact contains both the raw
+// protocol transcript and enough phase metrics to explain end-to-end latency.
+func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name string, fields map[string]any) {
+	if !requestLogCaptureEnabled(cfg) {
+		return
+	}
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil {
+		return
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	record := make(map[string]any, len(fields)+3)
+	record["timestamp"] = time.Now().Format(time.RFC3339Nano)
+	record["event"] = "api.websocket.metric"
+	record["name"] = name
+	for key, value := range fields {
+		key = strings.TrimSpace(key)
+		if key == "" || key == "timestamp" || key == "event" || key == "name" {
+			continue
+		}
+		record[key] = value
+	}
+	payload, errMarshal := json.Marshal(record)
+	if errMarshal != nil {
+		log.WithError(errMarshal).Warn("failed to marshal api websocket metric")
+		return
+	}
+	appendAPIWebsocketTimeline(ginCtx, payload)
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {

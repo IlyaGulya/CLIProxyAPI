@@ -53,3 +53,39 @@ func TestRecordAPIResponseMetadataStoresHeadersWhenRequestLogDisabled(t *testing
 		t.Fatalf("response header = %q, want %q", got.Get("X-Upstream-Request-Id"), "upstream-req-1")
 	}
 }
+
+func TestRecordAPIWebsocketMetricWritesStructuredPromptFreeTimelineEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	RecordAPIWebsocketMetric(ctx, &config.Config{SDKConfig: config.SDKConfig{RequestLog: true}}, "connection_ready", map[string]any{
+		"duration_us": 1234,
+		"reused":      true,
+		"event":       "must-not-overwrite",
+	})
+
+	value, exists := ginCtx.Get(apiWebsocketTimelineKey)
+	if !exists {
+		t.Fatal("API websocket metric timeline was not captured")
+	}
+	timeline, ok := value.([]byte)
+	if !ok {
+		t.Fatalf("API websocket metric timeline type = %T, want []byte", value)
+	}
+	got := string(timeline)
+	for _, want := range []string{
+		`"event":"api.websocket.metric"`,
+		`"name":"connection_ready"`,
+		`"duration_us":1234`,
+		`"reused":true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("metric timeline = %q, missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "must-not-overwrite") {
+		t.Fatalf("metric timeline allowed reserved event override: %q", got)
+	}
+}

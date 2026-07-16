@@ -414,6 +414,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	traceStartedAt := time.Now()
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
@@ -486,7 +487,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
+			lockStartedAt := time.Now()
 			sess.reqMu.Lock()
+			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "session_lock_acquired", map[string]any{
+				"session_id": executionSessionID,
+				"wait_us":    time.Since(lockStartedAt).Microseconds(),
+			})
 			if sess.codexHTTPFallback() {
 				sess.reqMu.Unlock()
 				return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
@@ -497,6 +503,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if sess != nil && from.String() == "claude" {
 		requestBody = sess.prepareCodexIncrementalRequest(clientBody)
 	}
+	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_prepared", map[string]any{
+		"session_id":            executionSessionID,
+		"model":                 baseModel,
+		"source_format":         from.String(),
+		"elapsed_us":            time.Since(traceStartedAt).Microseconds(),
+		"client_body_bytes":     len(clientBody),
+		"upstream_body_bytes":   len(requestBody),
+		"input_items":           gjson.GetBytes(requestBody, "input.#").Int(),
+		"incremental":           strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
+		"has_previous_response": strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
+	})
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, requestBody)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
@@ -515,7 +532,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
+	connectStartedAt := time.Now()
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "connection_ready", map[string]any{
+		"session_id":  executionSessionID,
+		"duration_us": time.Since(connectStartedAt).Microseconds(),
+		"reused":      sess != nil && respHS == nil && errDial == nil,
+		"success":     errDial == nil,
+	})
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
@@ -556,7 +580,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		sess.setActive(readCh)
 	}
 
-	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+	sendStartedAt := time.Now()
+	errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody)
+	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_sent", map[string]any{
+		"session_id":  executionSessionID,
+		"duration_us": time.Since(sendStartedAt).Microseconds(),
+		"elapsed_us":  time.Since(traceStartedAt).Microseconds(),
+		"bytes":       len(wsReqBody),
+		"success":     errSend == nil,
+	})
+	if errSend != nil {
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
@@ -593,6 +626,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errSendRetry
 			}
+			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_retry_sent", map[string]any{
+				"session_id": executionSessionID,
+				"elapsed_us": time.Since(traceStartedAt).Microseconds(),
+				"bytes":      len(wsReqBodyRetry),
+			})
 			conn = connRetry
 			wsReqBody = wsReqBodyRetry
 		} else {
@@ -608,9 +646,30 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	go func() {
 		terminateReason := "completed"
 		var terminateErr error
+		var firstEventAt time.Time
+		var firstReasoningDeltaAt time.Time
+		var firstOutputTextDeltaAt time.Time
+		var upstreamFrames int64
+		var upstreamBytes int64
+		var translatedChunks int64
+		var translationDuration time.Duration
+		var downstreamBlockedDuration time.Duration
 
 		defer close(out)
 		defer func() {
+			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_finished", map[string]any{
+				"session_id":                 executionSessionID,
+				"reason":                     terminateReason,
+				"elapsed_us":                 time.Since(traceStartedAt).Microseconds(),
+				"first_event_us":             elapsedSinceOrZero(traceStartedAt, firstEventAt).Microseconds(),
+				"first_reasoning_delta_us":   elapsedSinceOrZero(traceStartedAt, firstReasoningDeltaAt).Microseconds(),
+				"first_output_text_delta_us": elapsedSinceOrZero(traceStartedAt, firstOutputTextDeltaAt).Microseconds(),
+				"upstream_frames":            upstreamFrames,
+				"upstream_bytes":             upstreamBytes,
+				"translated_chunks":          translatedChunks,
+				"translation_us":             translationDuration.Microseconds(),
+				"downstream_blocked_us":      downstreamBlockedDuration.Microseconds(),
+			})
 			if sess != nil {
 				sess.clearActive(readCh)
 				if terminateReason == "context_done" {
@@ -626,6 +685,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}()
 
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			blockedAt := time.Now()
+			defer func() { downstreamBlockedDuration += time.Since(blockedAt) }()
 			if ctx == nil {
 				out <- chunk
 				return true
@@ -683,6 +744,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 			reporter.MarkFirstResponseByte()
+			upstreamFrames++
+			upstreamBytes += int64(len(payload))
+			if firstEventAt.IsZero() {
+				firstEventAt = time.Now()
+				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_upstream_event", map[string]any{
+					"session_id":    executionSessionID,
+					"elapsed_us":    firstEventAt.Sub(traceStartedAt).Microseconds(),
+					"since_send_us": firstEventAt.Sub(sendStartedAt).Microseconds(),
+					"bytes":         len(payload),
+				})
+			}
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
@@ -699,6 +771,22 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			eventType := gjson.GetBytes(payload, "type").String()
+			if eventType == "response.reasoning_summary_text.delta" && firstReasoningDeltaAt.IsZero() {
+				firstReasoningDeltaAt = time.Now()
+				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_reasoning_delta", map[string]any{
+					"session_id":    executionSessionID,
+					"elapsed_us":    firstReasoningDeltaAt.Sub(traceStartedAt).Microseconds(),
+					"since_send_us": firstReasoningDeltaAt.Sub(sendStartedAt).Microseconds(),
+				})
+			}
+			if eventType == "response.output_text.delta" && firstOutputTextDeltaAt.IsZero() {
+				firstOutputTextDeltaAt = time.Now()
+				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_output_text_delta", map[string]any{
+					"session_id":    executionSessionID,
+					"elapsed_us":    firstOutputTextDeltaAt.Sub(traceStartedAt).Microseconds(),
+					"since_send_us": firstOutputTextDeltaAt.Sub(sendStartedAt).Microseconds(),
+				})
+			}
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
@@ -733,8 +821,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if sess != nil && (eventType == "response.completed" || eventType == "response.done") {
 				sess.completeCodexIncrementalRequest(clientPayload)
 			}
+			translateStartedAt := time.Now()
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param)
+			translationDuration += time.Since(translateStartedAt)
+			translatedChunks += int64(len(chunks))
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
@@ -1948,6 +2039,13 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 
 func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {
 	log.Infof("codex websockets: upstream connected session=%s auth=%s url=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
+}
+
+func elapsedSinceOrZero(start time.Time, end time.Time) time.Duration {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start)
 }
 
 func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string, reason string, err error) {
