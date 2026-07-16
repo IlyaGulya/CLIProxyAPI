@@ -55,6 +55,19 @@ type SDKConfig struct {
 	// evicted; excess requests use a one-shot websocket instead.
 	CodexWebsocketMaxSessions int `yaml:"codex-websocket-max-sessions,omitempty" json:"codex-websocket-max-sessions,omitempty"`
 
+	// CodexWebsocketSpeculativePreconnect opens bounded, prompt-free upstream
+	// websocket connections when a Claude Agent tool call is observed, allowing
+	// the subsequent child agent request to avoid a cold handshake.
+	CodexWebsocketSpeculativePreconnect bool `yaml:"codex-websocket-speculative-preconnect" json:"codex-websocket-speculative-preconnect"`
+
+	// CodexWebsocketPreconnectMaxIdle bounds speculative upstream websocket
+	// connections, including in-flight dials. Values <= 0 use the default (2).
+	CodexWebsocketPreconnectMaxIdle int `yaml:"codex-websocket-preconnect-max-idle,omitempty" json:"codex-websocket-preconnect-max-idle,omitempty"`
+
+	// CodexWebsocketPreconnectTTLSeconds controls how long an unused speculative
+	// websocket may remain idle. Values <= 0 use the default (30 seconds).
+	CodexWebsocketPreconnectTTLSeconds int `yaml:"codex-websocket-preconnect-ttl-seconds,omitempty" json:"codex-websocket-preconnect-ttl-seconds,omitempty"`
+
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 

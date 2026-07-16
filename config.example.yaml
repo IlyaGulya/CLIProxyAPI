@@ -195,6 +195,15 @@ codex-prefer-upstream-websockets: false
 codex-websocket-session-ttl-seconds: 600
 # Maximum Claude-compatible persistent upstream websocket sessions; <= 0 uses 128.
 codex-websocket-max-sessions: 128
+# Speculatively open a prompt-free upstream websocket after a Claude Agent tool call
+# so the subsequent child agent can avoid the upstream handshake latency.
+# Disabled by default. The pool is global, bounded, route/auth isolated, and applies
+# a route-scoped cooldown after an upstream 429 handshake response.
+codex-websocket-speculative-preconnect: false
+# Maximum total unused speculative connections plus in-flight dials; <= 0 uses 2.
+codex-websocket-preconnect-max-idle: 2
+# How long an unused speculative connection remains available; <= 0 uses 30 seconds.
+codex-websocket-preconnect-ttl-seconds: 30
 
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0

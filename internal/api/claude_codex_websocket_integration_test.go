@@ -122,6 +122,130 @@ func TestClaudeMessagesRoutesThroughPersistentCodexWebsocket(t *testing.T) {
 	}
 }
 
+func TestClaudeMessagesAgentToolSpeculativelyPreconnectsChildWebsocket(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverErrors := make(chan error, 4)
+	spareConnected := make(chan struct{})
+	childPayload := make(chan []byte, 1)
+	var connections atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrors <- fmt.Errorf("upgrade websocket: %w", errUpgrade)
+			return
+		}
+		connectionIndex := connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		switch connectionIndex {
+		case 1:
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				serverErrors <- fmt.Errorf("read root request: %w", errRead)
+				return
+			}
+			added := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc-agent","type":"function_call","name":"Agent","arguments":"","call_id":"call-agent","status":"in_progress"}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, added); errWrite != nil {
+				serverErrors <- fmt.Errorf("write Agent added event: %w", errWrite)
+				return
+			}
+			select {
+			case <-spareConnected:
+			case <-time.After(3 * time.Second):
+				serverErrors <- fmt.Errorf("speculative websocket did not connect before root completion")
+				return
+			}
+			item := `{"id":"fc-agent","type":"function_call","name":"Agent","arguments":"{\"description\":\"child\",\"prompt\":\"reply\"}","call_id":"call-agent","status":"completed"}`
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.done","output_index":0,"item":`+item+`}`)); errWrite != nil {
+				serverErrors <- fmt.Errorf("write Agent done event: %w", errWrite)
+				return
+			}
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-root-agent","model":"gpt-5.6-sol","output":[` + item + `],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				serverErrors <- fmt.Errorf("write root completion: %w", errWrite)
+			}
+		case 2:
+			close(spareConnected)
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				serverErrors <- fmt.Errorf("read child request from speculative websocket: %w", errRead)
+				return
+			}
+			childPayload <- bytes.Clone(payload)
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-child","model":"gpt-5.6-luna","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				serverErrors <- fmt.Errorf("write child completion: %w", errWrite)
+			}
+		default:
+			serverErrors <- fmt.Errorf("unexpected websocket connection %d", connectionIndex)
+		}
+	}))
+	t.Cleanup(func() {
+		upstream.CloseClientConnections()
+		upstream.Close()
+	})
+
+	server := newTestServer(t)
+	server.handlers.Cfg.CodexPreferUpstreamWebsockets = true
+	server.cfg.CodexPreferUpstreamWebsockets = true
+	server.cfg.CodexWebsocketSpeculativePreconnect = true
+	server.cfg.CodexWebsocketPreconnectMaxIdle = 2
+	server.cfg.DisableImageGeneration = proxyconfig.DisableImageGenerationAll
+	server.handlers.AuthManager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(server.cfg))
+	credential := &cliproxyauth.Auth{
+		ID:       "codex-ws-speculative-agent",
+		Provider: "codex",
+		Status:   cliproxyauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   upstream.URL,
+			"websockets": "true",
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(credential.ID, credential.Provider, []*registry.ModelInfo{{ID: "gpt-5.6-sol"}, {ID: "gpt-5.6-luna"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(credential.ID) })
+	if _, errRegister := server.handlers.AuthManager.Register(context.Background(), credential); errRegister != nil {
+		t.Fatalf("register Codex credential: %v", errRegister)
+	}
+	t.Cleanup(func() { runtimeexecutor.CloseCodexWebsocketSessionsForAuthID(credential.ID, "test_cleanup") })
+
+	rootPayload := `{"model":"gpt-5.6-sol","tools":[{"name":"Agent","description":"spawn child","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"spawn one child"}],"max_tokens":128,"stream":true}`
+	rootReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(rootPayload))
+	rootReq.Header.Set("Authorization", "Bearer test-key")
+	rootReq.Header.Set(helps.ClaudeCodeSessionHeader, "speculative-root-session")
+	rootRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(rootRR, rootReq)
+	if rootRR.Code != http.StatusOK || !strings.Contains(rootRR.Body.String(), "message_stop") {
+		t.Fatalf("root response status=%d body=%s", rootRR.Code, rootRR.Body.String())
+	}
+
+	childRequestBody := `{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"child work"}],"max_tokens":128,"stream":true}`
+	childReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(childRequestBody))
+	childReq.Header.Set("Authorization", "Bearer test-key")
+	childReq.Header.Set(helps.ClaudeCodeSessionHeader, "speculative-root-session")
+	childReq.Header.Set(helps.ClaudeCodeAgentHeader, "child-agent-1")
+	childRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(childRR, childReq)
+	if childRR.Code != http.StatusOK || !strings.Contains(childRR.Body.String(), "message_stop") {
+		t.Fatalf("child response status=%d body=%s", childRR.Code, childRR.Body.String())
+	}
+
+	select {
+	case payload := <-childPayload:
+		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5.6-luna" {
+			t.Fatalf("child model = %q, want gpt-5.6-luna; payload=%s", got, payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("child request was not sent over the speculative websocket")
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("websocket connections = %d, want root plus one speculative child connection", got)
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+}
+
 func TestClaudeMessagesRootAndSubagentDoNotSerializeOnOneWebsocket(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	serverErrors := make(chan error, 4)

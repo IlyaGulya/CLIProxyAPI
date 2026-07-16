@@ -654,6 +654,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var translatedChunks int64
 		var translationDuration time.Duration
 		var downstreamBlockedDuration time.Duration
+		speculativeAgentCalls := make(map[string]struct{})
 
 		defer close(out)
 		defer func() {
@@ -771,6 +772,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			eventType := gjson.GetBytes(payload, "type").String()
+			if from.String() == "claude" && strings.HasPrefix(executionSessionID, helps.ClaudeCodeWebsocketSessionPrefix) {
+				if agentCallKey, ok := codexAgentToolCallKey(payload); ok {
+					if _, seen := speculativeAgentCalls[agentCallKey]; !seen {
+						speculativeAgentCalls[agentCallKey] = struct{}{}
+						e.scheduleSpeculativePreconnect(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
+					}
+				}
+			}
 			if eventType == "response.reasoning_summary_text.delta" && firstReasoningDeltaAt.IsZero() {
 				firstReasoningDeltaAt = time.Now()
 				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_reasoning_delta", map[string]any{
@@ -1837,6 +1846,18 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 		}
 		return conn, nil, nil
 	}
+	if pooledConn := e.takeSpeculativePreconnect(ctx, authID, wsURL, sess.sessionID); pooledConn != nil {
+		sess.connMu.Lock()
+		sess.conn = pooledConn
+		sess.wsURL = wsURL
+		sess.authID = authID
+		sess.readerConn = pooledConn
+		sess.connMu.Unlock()
+		sess.configureConn(pooledConn)
+		go e.readUpstreamLoop(sess, pooledConn)
+		logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
+		return pooledConn, nil, nil
+	}
 
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
@@ -2063,6 +2084,7 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	if authID == "" {
 		return
 	}
+	globalCodexWebsocketPreconnectPool.closeAuth(authID)
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "auth_removed"
