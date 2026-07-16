@@ -4,6 +4,7 @@ cli-proxy-api
 
 # Configuration
 config.yaml
+!.beads/config.yaml
 .env
 
 # Generated content
@@ -47,7 +48,6 @@ GEMINI.md
 .agents/*
 .opencode/*
 .idea/*
-.beads/*
 .bmad/*
 _bmad/*
 _bmad-output/*
@@ -56,3 +56,5 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+# br doctor per-run artifacts
+.doctor/
