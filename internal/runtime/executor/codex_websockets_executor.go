@@ -2116,6 +2116,9 @@ func (s *codexWebsocketSession) completeCodexIncrementalRequest(completedPayload
 }
 
 func codexIncrementalInput(previousRequest, previousOutput, currentRequest []byte) ([]byte, bool) {
+	if !codexIncrementalPropertiesMatch(previousRequest, currentRequest) {
+		return nil, false
+	}
 	var previousObject map[string]any
 	var currentObject map[string]any
 	if json.Unmarshal(previousRequest, &previousObject) != nil || json.Unmarshal(currentRequest, &currentObject) != nil {
@@ -2126,16 +2129,6 @@ func codexIncrementalInput(previousRequest, previousOutput, currentRequest []byt
 	if !previousInputOK || !currentInputOK {
 		return nil, false
 	}
-	delete(previousObject, "input")
-	delete(currentObject, "input")
-	for _, ignored := range []string{"client_metadata", "stream_options", "type"} {
-		delete(previousObject, ignored)
-		delete(currentObject, ignored)
-	}
-	if !reflect.DeepEqual(previousObject, currentObject) {
-		return nil, false
-	}
-
 	var responseOutput []any
 	if len(previousOutput) != 0 && json.Unmarshal(previousOutput, &responseOutput) != nil {
 		return nil, false
