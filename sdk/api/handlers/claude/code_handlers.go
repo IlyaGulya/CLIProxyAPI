@@ -233,6 +233,8 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	resp, upstreamHeaders, errMsg := h.ExecuteCountWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	if errMsg != nil {
+		normalizeClaudeFallbackError(errMsg)
+		recordClaudeFallbackEligibility(c.Request.Context(), modelName, errMsg)
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -382,6 +384,8 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
 	if errMsg != nil {
+		normalizeClaudeFallbackError(errMsg)
+		recordClaudeFallbackEligibility(c.Request.Context(), modelName, errMsg)
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -476,6 +480,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				errChan = nil
 				continue
 			}
+			normalizeClaudeFallbackError(errMsg)
 			if isClaudeStreamIdleError(errMsg) {
 				observability.RecordWebsocketMetric(c.Request.Context(), "stream_idle_timeout", "", "", map[string]any{
 					"boundary":             "before_downstream_commit",
@@ -483,6 +488,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 					"duration_us":          idleTimeout.Microseconds(),
 				}, false)
 			}
+			recordClaudeFallbackEligibility(c.Request.Context(), modelName, errMsg)
 			// Upstream failed immediately. Return proper error status and JSON.
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {

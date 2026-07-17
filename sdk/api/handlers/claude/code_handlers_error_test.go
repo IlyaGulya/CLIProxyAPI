@@ -140,11 +140,11 @@ func TestClaudeMessagesUnknownModelReturnsAvailableModelsWithoutUpstreamAttempt(
 
 			handler.ClaudeMessages(c)
 
-			if recorder.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			if recorder.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
 			}
-			if got := gjson.GetBytes(recorder.Body.Bytes(), "error.type").String(); got != "invalid_request_error" {
-				t.Fatalf("error.type = %q, want invalid_request_error; body=%s", got, recorder.Body.String())
+			if got := gjson.GetBytes(recorder.Body.Bytes(), "error.type").String(); got != "not_found_error" {
+				t.Fatalf("error.type = %q, want not_found_error; body=%s", got, recorder.Body.String())
 			}
 			message := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String()
 			for _, want := range []string{"claude-sonnet-5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"} {

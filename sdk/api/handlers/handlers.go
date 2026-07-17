@@ -1668,10 +1668,19 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	return providers, resolvedModelName, nil
 }
 
+type UnknownModelError struct{ Message string }
+
+func (e *UnknownModelError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
 func unknownModelError(modelName string) error {
 	available := availableModelIDsForError()
 	if len(available) == 0 {
-		return fmt.Errorf("model %q is not configured; no models are currently available", modelName)
+		return &UnknownModelError{Message: fmt.Sprintf("model %q is not configured; no models are currently available", modelName)}
 	}
 
 	visible := available
@@ -1685,7 +1694,7 @@ func unknownModelError(modelName string) error {
 	if remaining > 0 {
 		message += fmt.Sprintf(" (and %d more)", remaining)
 	}
-	return errors.New(message)
+	return &UnknownModelError{Message: message}
 }
 
 func availableModelIDsForError() []string {
