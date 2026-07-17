@@ -83,6 +83,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	// Process messages and transform their contents to appropriate formats.
 	messagesResult := rootResult.Get("messages")
 	if messagesResult.IsArray() {
+		pendingServerWebSearch := map[string][]byte{}
 		messageResults := messagesResult.Array()
 
 		for i := 0; i < len(messageResults); i++ {
@@ -106,6 +107,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			message := newMessage()
 			contentIndex := 0
 			hasContent := false
+			messagePendingServerWebSearch := make([]string, 0)
 
 			flushMessage := func() {
 				if hasContent {
@@ -253,6 +255,44 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						}
 
 						template, _ = sjson.SetRawBytes(template, "input.-1", functionCallOutputMessage)
+					case "server_tool_use":
+						if messageContentResult.Get("name").String() != "web_search" {
+							continue
+						}
+						flushMessage()
+						id := messageContentResult.Get("id").String()
+						item := []byte(`{"type":"web_search_call","id":"","status":"completed","action":{"type":"search","query":""},"results":[]}`)
+						item, _ = sjson.SetBytes(item, "id", id)
+						item, _ = sjson.SetBytes(item, "action.query", messageContentResult.Get("input.query").String())
+						pendingServerWebSearch[id] = item
+						messagePendingServerWebSearch = append(messagePendingServerWebSearch, id)
+					case "web_search_tool_result":
+						id := messageContentResult.Get("tool_use_id").String()
+						item, ok := pendingServerWebSearch[id]
+						if !ok {
+							continue
+						}
+						if content := messageContentResult.Get("content"); content.IsArray() {
+							results := []byte(`[]`)
+							content.ForEach(func(_, result gjson.Result) bool {
+								if result.Get("type").String() != "web_search_result" {
+									return true
+								}
+								resultCopy := []byte(result.Raw)
+								resultCopy, _ = sjson.DeleteBytes(resultCopy, "type")
+								results, _ = sjson.SetRawBytes(results, "-1", resultCopy)
+								return true
+							})
+							item, _ = sjson.SetRawBytes(item, "results", results)
+						}
+						template, _ = sjson.SetRawBytes(template, "input.-1", item)
+						delete(pendingServerWebSearch, id)
+					}
+				}
+				for _, id := range messagePendingServerWebSearch {
+					if item, ok := pendingServerWebSearch[id]; ok {
+						template, _ = sjson.SetRawBytes(template, "input.-1", item)
+						delete(pendingServerWebSearch, id)
 					}
 				}
 				flushMessage()
@@ -386,7 +426,7 @@ func shortenCodexCallIDIfNeeded(id string) string {
 }
 
 func isClaudeWebSearchToolType(toolType string) bool {
-	return toolType == "web_search_20250305" || toolType == "web_search_20260209"
+	return toolType == "web_search_20250305" || toolType == "web_search_20260209" || toolType == "web_search_20260318"
 }
 
 func buildClaudeWebSearchToolNameSet(tools gjson.Result) map[string]struct{} {

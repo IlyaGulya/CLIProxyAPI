@@ -45,6 +45,9 @@ func (e *CodexWebsocketsExecutor) prepareWebsocketRequest(ctx context.Context, a
 
 func (p codexWebsocketRequestPlanner) Plan(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, streaming bool) (preparedCodexWebsocketRequest, error) {
 	prepared := preparedCodexWebsocketRequest{baseModel: thinking.ParseSuffix(req.Model).ModelName, from: opts.SourceFormat, to: sdktranslator.FromString("codex"), responseFormat: cliproxyexecutor.ResponseFormatOrSource(opts)}
+	if err := validateCodexClaudeServerTools(prepared.from, req.Payload); err != nil {
+		return prepared, err
+	}
 	prepared.apiKey, _ = codexCreds(auth)
 	_, baseURL := codexCreds(auth)
 	if baseURL == "" {

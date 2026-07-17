@@ -1111,6 +1111,18 @@ func TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlock
 	}
 }
 
+func TestConvertCodexResponseToClaudeWebSearchResultPreservesReplayFields(t *testing.T) {
+	t.Parallel()
+	response := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6-sol","usage":{"input_tokens":3,"output_tokens":2,"server_tool_use":{"web_search_requests":1}},"output":[{"type":"web_search_call","id":"ws_123","action":{"type":"search","query":"compatibility"},"results":[{"title":"Protocol docs","url":"https://example.test/docs","page_age":"2 days ago","encrypted_content":"enc_replay"}]}]}}`)
+	out := ConvertCodexResponseToClaudeNonStream(context.Background(), "", []byte(`{"tools":[{"type":"web_search_20260318","name":"web_search"}]}`), nil, response, nil)
+	if gjson.GetBytes(out, "content.1.content.0.page_age").String() != "2 days ago" || gjson.GetBytes(out, "content.1.content.0.encrypted_content").String() != "enc_replay" {
+		t.Fatalf("web search replay fields lost: %s", out)
+	}
+	if gjson.GetBytes(out, "usage.server_tool_use.web_search_requests").Int() != 1 {
+		t.Fatalf("billing counter lost: %s", out)
+	}
+}
+
 func TestConvertCodexResponseToClaudeNonStream_WebSearchStopReasonEndTurn(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":"search weather"}]}`)

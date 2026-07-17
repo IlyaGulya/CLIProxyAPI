@@ -146,6 +146,12 @@ func codexWebSearchResultContent(root, item gjson.Result) []byte {
 			title = url
 		}
 		block, _ = sjson.SetBytes(block, "title", title)
+		if pageAge := result.Get("page_age"); pageAge.Exists() && pageAge.Type != gjson.Null {
+			block, _ = sjson.SetRawBytes(block, "page_age", []byte(pageAge.Raw))
+		}
+		if encrypted := result.Get("encrypted_content"); encrypted.Exists() && encrypted.String() != "" {
+			block, _ = sjson.SetBytes(block, "encrypted_content", encrypted.String())
+		}
 		content, _ = sjson.SetRawBytes(content, "-1", block)
 		return true
 	})

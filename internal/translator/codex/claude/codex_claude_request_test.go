@@ -397,6 +397,36 @@ func TestConvertClaudeRequestToCodex_WebSearchToolMapping(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodexLatestWebSearchAndResponseInclusion(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-sol","tools":[{"type":"web_search_20260318","name":"web_search","response_inclusion":"excluded","use_cache":false,"allowed_domains":["example.com"]}],"messages":[{"role":"user","content":"search"}]}`)
+	out := ConvertClaudeRequestToCodex("gpt-5.6-sol", input, true)
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("latest web search type = %q: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.filters.allowed_domains.0").String(); got != "example.com" {
+		t.Fatalf("allowed domains lost: %s", out)
+	}
+	if gjson.GetBytes(out, "tools.0.response_inclusion").Exists() || gjson.GetBytes(out, "tools.0.use_cache").Exists() {
+		t.Fatalf("Claude-only controls leaked upstream: %s", out)
+	}
+}
+
+func TestConvertClaudeRequestToCodexReplaysServerWebSearchHistory(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"assistant","content":[{"type":"server_tool_use","id":"ws_1","name":"web_search","input":{"query":"compatibility"}},{"type":"web_search_tool_result","tool_use_id":"ws_1","content":[{"type":"web_search_result","title":"Docs","url":"https://example.test","encrypted_content":"enc_1"}]},{"type":"text","text":"found it"}]},{"role":"user","content":"continue"}]}`)
+	out := ConvertClaudeRequestToCodex("gpt-5.6-sol", input, true)
+	if gjson.GetBytes(out, "input.0.type").String() != "web_search_call" || gjson.GetBytes(out, "input.0.action.query").String() != "compatibility" {
+		t.Fatalf("server tool call was not replayed: %s", out)
+	}
+	if gjson.GetBytes(out, "input.0.results.0.encrypted_content").String() != "enc_1" {
+		t.Fatalf("server tool result was not replayed: %s", out)
+	}
+	if strings.Contains(string(out), `"type":"function_call_output"`) {
+		t.Fatalf("server tool result became a client tool result: %s", out)
+	}
+}
+
 func TestConvertClaudeRequestToCodex_WebSearchToolChoiceUsesDeclaredTypedToolName(t *testing.T) {
 	inputJSON := `{
 		"model": "claude-opus-4-7",
