@@ -344,6 +344,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			// Send message_delta with usage
 			messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(effectiveOpenAIFinishReason(param)))
+			messageDeltaJSON = attachOpenAIRefusalDetails(messageDeltaJSON, "delta.stop_details", effectiveOpenAIFinishReason(param), "")
 			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.input_tokens", inputTokens)
 			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.output_tokens", outputTokens)
 			if cachedTokens > 0 {
@@ -406,6 +407,7 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	if param.FinishReason != "" && !param.MessageDeltaSent {
 		messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(effectiveOpenAIFinishReason(param)))
+		messageDeltaJSON = attachOpenAIRefusalDetails(messageDeltaJSON, "delta.stop_details", effectiveOpenAIFinishReason(param), "")
 		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
 		param.MessageDeltaSent = true
 	}
@@ -471,6 +473,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		// Set stop reason
 		if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
 			out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAIFinishReasonToAnthropic(finishReason.String()))
+			out = attachOpenAIRefusalDetails(out, "stop_details", finishReason.String(), choice.Get("message.refusal").String())
 		}
 	}
 
@@ -496,13 +499,25 @@ func mapOpenAIFinishReasonToAnthropic(openAIReason string) string {
 		return "max_tokens"
 	case "tool_calls":
 		return "tool_use"
-	case "content_filter":
-		return "end_turn" // Anthropic doesn't have direct equivalent
+	case "content_filter", "refusal":
+		return "refusal"
 	case "function_call": // Legacy OpenAI
 		return "tool_use"
 	default:
 		return "end_turn"
 	}
+}
+
+func attachOpenAIRefusalDetails(out []byte, path, finishReason, explanation string) []byte {
+	if mapOpenAIFinishReasonToAnthropic(finishReason) != "refusal" {
+		return out
+	}
+	details := []byte(`{"type":"refusal","category":null,"explanation":null}`)
+	if strings.TrimSpace(explanation) != "" {
+		details, _ = sjson.SetBytes(details, "explanation", explanation)
+	}
+	out, _ = sjson.SetRawBytes(out, path, details)
+	return out
 }
 
 func (p *ConvertOpenAIResponseToAnthropicParams) toolContentBlockIndex(openAIToolIndex int) int {
@@ -627,6 +642,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 		if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
 			out, _ = sjson.SetBytes(out, "stop_reason", mapOpenAIFinishReasonToAnthropic(finishReason.String()))
+			out = attachOpenAIRefusalDetails(out, "stop_details", finishReason.String(), choice.Get("message.refusal").String())
 			stopReasonSet = true
 		}
 

@@ -248,8 +248,9 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 
 	usageResult := gjson.GetBytes(rawJSON, "usageMetadata")
 	if usageResult.Exists() && bytes.Contains(rawJSON, []byte(`"finishReason"`)) && !(*param).(*Params).HasFinalEvents {
-		// Only send final events if we have actually output content
-		if (*param).(*Params).HasContent {
+		// Refusals and context-limit completions may legally contain no content,
+		// but Claude still requires a terminal message_delta.
+		{
 			if (*param).(*Params).ResponseType != 0 {
 				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
 				(*param).(*Params).ResponseType = 0
@@ -258,8 +259,20 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			template := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 			if (*param).(*Params).SawToolCall {
 				template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-			} else if finish := gjson.GetBytes(rawJSON, "candidates.0.finishReason"); finish.Exists() && finish.String() == "MAX_TOKENS" {
-				template = []byte(`{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+			} else if finish := gjson.GetBytes(rawJSON, "candidates.0.finishReason"); finish.Exists() {
+				switch finish.String() {
+				case "MAX_TOKENS":
+					template, _ = sjson.SetBytes(template, "delta.stop_reason", "max_tokens")
+				case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+					template, _ = sjson.SetBytes(template, "delta.stop_reason", "refusal")
+					details := []byte(`{"type":"refusal","category":null,"explanation":null}`)
+					if explanation := gjson.GetBytes(rawJSON, "candidates.0.finishMessage").String(); explanation != "" {
+						details, _ = sjson.SetBytes(details, "explanation", explanation)
+					}
+					template, _ = sjson.SetRawBytes(template, "delta.stop_details", details)
+				case "MODEL_CONTEXT_WINDOW_EXCEEDED":
+					template, _ = sjson.SetBytes(template, "delta.stop_reason", "model_context_window_exceeded")
+				}
 			}
 
 			thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
@@ -374,6 +387,10 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 			switch finish.String() {
 			case "MAX_TOKENS":
 				stopReason = "max_tokens"
+			case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+				stopReason = "refusal"
+			case "MODEL_CONTEXT_WINDOW_EXCEEDED":
+				stopReason = "model_context_window_exceeded"
 			case "STOP", "FINISH_REASON_UNSPECIFIED", "UNKNOWN":
 				stopReason = "end_turn"
 			default:
@@ -382,6 +399,13 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 		}
 	}
 	out, _ = sjson.SetBytes(out, "stop_reason", stopReason)
+	if stopReason == "refusal" {
+		details := []byte(`{"type":"refusal","category":null,"explanation":null}`)
+		if explanation := root.Get("candidates.0.finishMessage").String(); explanation != "" {
+			details, _ = sjson.SetBytes(details, "explanation", explanation)
+		}
+		out, _ = sjson.SetRawBytes(out, "stop_details", details)
+	}
 
 	if inputTokens == int64(0) && outputTokens == int64(0) && !root.Get("usageMetadata").Exists() {
 		out, _ = sjson.DeleteBytes(out, "usage")

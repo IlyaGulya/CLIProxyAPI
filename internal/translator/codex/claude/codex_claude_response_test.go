@@ -97,6 +97,32 @@ func TestConvertCodexResponseToClaude_StreamCyberPolicyError(t *testing.T) {
 	}
 }
 
+func TestConvertCodexResponseToClaudePreservesRefusalDetailsAndExtendedUsage(t *testing.T) {
+	t.Parallel()
+	terminal := []byte(`{"type":"response.completed","response":{"id":"resp_refusal","model":"gpt-5.6-sol","stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"declined"},"container":{"id":"ctr_1","expires_at":"2026-07-17T00:00:00Z"},"service_tier":"priority","output":[],"usage":{"input_tokens":12,"output_tokens":0,"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":0},"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":2,"web_fetch_requests":1},"inference_geo":"us"}}}`)
+
+	nonstream := ConvertCodexResponseToClaudeNonStream(context.Background(), "", nil, nil, terminal, nil)
+	for path, want := range map[string]string{
+		"stop_reason": "refusal", "stop_details.type": "refusal", "stop_details.category": "cyber",
+		"container.id": "ctr_1", "usage.service_tier": "priority", "usage.inference_geo": "us",
+	} {
+		if got := gjson.GetBytes(nonstream, path).String(); got != want {
+			t.Fatalf("nonstream %s = %q, want %q: %s", path, got, want, nonstream)
+		}
+	}
+	if got := gjson.GetBytes(nonstream, "usage.server_tool_use.web_search_requests").Int(); got != 2 {
+		t.Fatalf("server tool usage = %d: %s", got, nonstream)
+	}
+
+	var param any
+	chunks := ConvertCodexResponseToClaude(context.Background(), "", nil, nil, append([]byte("data: "), terminal...), &param)
+	stream := bytes.Join(chunks, nil)
+	delta, ok := firstClaudeStreamPayloadForEvent(string(stream), "message_delta")
+	if !ok || delta.Get("delta.stop_details.category").String() != "cyber" || delta.Get("usage.service_tier").String() != "priority" {
+		t.Fatalf("stream terminal metadata missing: %s", stream)
+	}
+}
+
 func TestConvertCodexResponseToClaude_StreamErrorTypeFallbackMessage(t *testing.T) {
 	ctx := context.Background()
 	var param any

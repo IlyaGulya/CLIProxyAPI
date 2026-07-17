@@ -103,6 +103,26 @@ func lastStopReason(events []sseEvent) string {
 
 const streamReq = `{"stream":true}`
 
+func TestOpenAIContentFilterMapsToClaudeRefusal(t *testing.T) {
+	t.Parallel()
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":4,"completion_tokens":0}}`,
+	)
+	if got := lastStopReason(events); got != "refusal" {
+		t.Fatalf("stream stop_reason = %q, want refusal", got)
+	}
+	for _, event := range events {
+		if event.Type == "message_delta" && gjson.Get(event.Payload, "delta.stop_details.type").String() != "refusal" {
+			t.Fatalf("stream refusal details missing: %s", event.Payload)
+		}
+	}
+
+	out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", nil, nil, []byte(`{"id":"c1","model":"m","choices":[{"finish_reason":"content_filter","message":{"refusal":"declined"}}],"usage":{"prompt_tokens":4,"completion_tokens":0}}`), nil)
+	if gjson.GetBytes(out, "stop_reason").String() != "refusal" || gjson.GetBytes(out, "stop_details.explanation").String() != "declined" {
+		t.Fatalf("nonstream refusal semantics missing: %s", out)
+	}
+}
+
 func TestConvertOpenAIResponseToClaude_StreamIgnoresNullToolNameDelta(t *testing.T) {
 	originalRequest := []byte(streamReq)
 	var param any

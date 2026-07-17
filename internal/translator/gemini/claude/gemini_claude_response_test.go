@@ -5,6 +5,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBlock(t *testing.T) {
@@ -58,5 +60,19 @@ func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBloc
 	}
 	if !strings.Contains(outputText, `"type":"message_stop"`) {
 		t.Fatalf("DONE chunk must still emit message_stop after final events: %s", outputText)
+	}
+}
+
+func TestConvertGeminiResponseToClaudeZeroOutputSafetyIsRefusal(t *testing.T) {
+	t.Parallel()
+	raw := []byte(`{"candidates":[{"finishReason":"SAFETY","finishMessage":"declined"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":0},"modelVersion":"gemini-test","responseId":"resp-refusal"}`)
+	var param any
+	stream := bytes.Join(ConvertGeminiResponseToClaude(context.Background(), "gemini-test", nil, nil, raw, &param), nil)
+	if !strings.Contains(string(stream), `"stop_reason":"refusal"`) || !strings.Contains(string(stream), `"explanation":"declined"`) {
+		t.Fatalf("zero-output stream refusal missing: %s", stream)
+	}
+	nonstream := ConvertGeminiResponseToClaudeNonStream(context.Background(), "gemini-test", nil, nil, raw, nil)
+	if gjson.GetBytes(nonstream, "stop_reason").String() != "refusal" || gjson.GetBytes(nonstream, "stop_details.explanation").String() != "declined" {
+		t.Fatalf("nonstream refusal missing: %s", nonstream)
 	}
 }

@@ -147,6 +147,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		if cachedTokens > 0 {
 			template, _ = sjson.SetBytes(template, "usage.cache_read_input_tokens", cachedTokens)
 		}
+		template = applyCodexClaudeTerminalMetadata(template, "delta.", responseData)
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_delta", template, 2)
 		output = translatorcommon.AppendSSEEventBytes(output, "message_stop", []byte(`{"type":"message_stop"}`), 2)
@@ -358,6 +359,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	if cachedTokens > 0 {
 		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
 	}
+	out = applyCodexClaudeTerminalMetadata(out, "", responseData)
 
 	hasToolCall := false
 	webSearchSeen := make(map[string]struct{})
@@ -506,6 +508,34 @@ func setClaudeStopSequence(out []byte, path string, responseData gjson.Result) [
 	if stopSequence := codexStopSequence(responseData); stopSequence.Exists() && stopSequence.String() != "" {
 		out, _ = sjson.SetRawBytes(out, path, []byte(stopSequence.Raw))
 	}
+	return out
+}
+
+// applyCodexClaudeTerminalMetadata preserves successful terminal metadata that
+// Claude Code uses for refusal handling, billing diagnostics and continuation.
+// The deltaPrefix is "delta." for message_delta and empty for a Message.
+func applyCodexClaudeTerminalMetadata(out []byte, deltaPrefix string, responseData gjson.Result) []byte {
+	copyRaw := func(destination string, value gjson.Result) {
+		if !value.Exists() || value.Type == gjson.Null {
+			return
+		}
+		out, _ = sjson.SetRawBytes(out, destination, []byte(value.Raw))
+	}
+	copyRaw(deltaPrefix+"stop_details", responseData.Get("stop_details"))
+	copyRaw(deltaPrefix+"container", responseData.Get("container"))
+
+	usage := responseData.Get("usage")
+	for _, field := range []string{
+		"cache_creation_input_tokens", "cache_creation", "output_tokens_details",
+		"server_tool_use", "inference_geo",
+	} {
+		copyRaw("usage."+field, usage.Get(field))
+	}
+	serviceTier := usage.Get("service_tier")
+	if !serviceTier.Exists() {
+		serviceTier = responseData.Get("service_tier")
+	}
+	copyRaw("usage.service_tier", serviceTier)
 	return out
 }
 
