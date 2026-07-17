@@ -81,15 +81,21 @@ type codexWebsocketPreconnectPool struct {
 	cooldown       map[codexWebsocketPreconnectKey]time.Time
 	authGeneration map[string]uint64
 	nextID         uint64
+	ctx            context.Context
+	wg             sync.WaitGroup
 }
 
-func newCodexWebsocketPreconnectPool() *codexWebsocketPreconnectPool {
+func newCodexWebsocketPreconnectPool(ctx context.Context) *codexWebsocketPreconnectPool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &codexWebsocketPreconnectPool{
 		idle:           make(map[codexWebsocketPreconnectKey][]codexWebsocketPreconnectEntry),
 		dialingByKey:   make(map[codexWebsocketPreconnectKey]int),
 		changed:        make(map[codexWebsocketPreconnectKey]chan struct{}),
 		cooldown:       make(map[codexWebsocketPreconnectKey]time.Time),
 		authGeneration: make(map[string]uint64),
+		ctx:            ctx,
 	}
 }
 
@@ -156,8 +162,10 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 	headerCopy := headers.Clone()
 	warmupTemplate = bytes.Clone(warmupTemplate)
 	rootCorrelation, executionCorrelation := helps.ClaudeCodeCorrelationIDs(ctx, nil, nil)
+	e.backgroundWG.Add(1)
 	go func() {
-		dialCtx, cancel := context.WithTimeout(context.Background(), codexResponsesWebsocketHandshakeTO)
+		defer e.backgroundWG.Done()
+		dialCtx, cancel := context.WithTimeout(e.runtimeCtx, codexResponsesWebsocketHandshakeTO)
 		defer cancel()
 		startedAt := time.Now()
 		conn, resp, errDial := e.dialCodexWebsocket(dialCtx, authCopy, key.wsURL, headerCopy)
@@ -360,7 +368,20 @@ func (p *codexWebsocketPreconnectPool) completeReservationObserved(key codexWebs
 	p.idle[key] = append(p.idle[key], entry)
 	p.mu.Unlock()
 
-	time.AfterFunc(ttl, func() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		timer := time.NewTimer(ttl)
+		defer timer.Stop()
+		var done <-chan struct{}
+		if p.ctx != nil {
+			done = p.ctx.Done()
+		}
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+		}
 		if expired := p.remove(key, entry.id); expired != nil {
 			_ = expired.Close()
 			if onExpire != nil {
@@ -368,7 +389,7 @@ func (p *codexWebsocketPreconnectPool) completeReservationObserved(key codexWebs
 			}
 			log.WithFields(log.Fields{"auth": key.authID, "url": key.wsURL}).Debug("codex websockets: speculative preconnect expired")
 		}
-	})
+	}()
 	return true
 }
 

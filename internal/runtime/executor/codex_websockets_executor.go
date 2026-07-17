@@ -54,11 +54,14 @@ const (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	store    *codexWebsocketSessionStore
-	pool     *codexWebsocketPreconnectPool
-	draining bool
-	drainMu  sync.RWMutex
-	drainWG  sync.WaitGroup
+	store         *codexWebsocketSessionStore
+	pool          *codexWebsocketPreconnectPool
+	draining      bool
+	drainMu       sync.RWMutex
+	drainWG       sync.WaitGroup
+	runtimeCtx    context.Context
+	runtimeCancel context.CancelFunc
+	backgroundWG  sync.WaitGroup
 }
 
 type codexWebsocketSessionStore struct {
@@ -138,10 +141,13 @@ func (s *codexWebsocketSession) connectionObservation(conn *websocket.Conn) (tim
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	return &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
 		store:         newCodexWebsocketSessionStore(),
-		pool:          newCodexWebsocketPreconnectPool(),
+		pool:          newCodexWebsocketPreconnectPool(runtimeCtx),
+		runtimeCtx:    runtimeCtx,
+		runtimeCancel: runtimeCancel,
 	}
 }
 
@@ -2530,6 +2536,9 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		e.drainMu.Lock()
 		e.draining = true
 		e.drainMu.Unlock()
+		if e.runtimeCancel != nil {
+			e.runtimeCancel()
+		}
 		if e.pool != nil {
 			e.pool.closeAll()
 		}
