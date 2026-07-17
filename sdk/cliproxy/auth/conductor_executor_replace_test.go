@@ -129,3 +129,20 @@ func TestManagerCloseAuthExecutionSessionsUsesRegisteredExecutorOwnership(t *tes
 		t.Fatalf("close reasons = %#v, want [auth_removed]", exec.closeReasons)
 	}
 }
+
+func TestManagerSchedulerObserverIsInjectedAndTransportNeutral(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	observed := make(chan SchedulerSelectionObservation, 1)
+	manager.SetSchedulerSelectionObserver(func(_ context.Context, event SchedulerSelectionObservation) {
+		observed <- event
+	})
+	_, _ = manager.SelectAuth(context.Background(), "codex", "gpt-test", cliproxyexecutor.Options{})
+	select {
+	case event := <-observed:
+		if event.Model != "gpt-test" || event.Duration < 0 || event.Success {
+			t.Fatalf("unexpected observation: %#v", event)
+		}
+	default:
+		t.Fatal("scheduler observer was not called")
+	}
+}

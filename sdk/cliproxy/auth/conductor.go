@@ -21,7 +21,6 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -268,7 +267,24 @@ type Manager struct {
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
-	refreshLocks sync.Map
+	refreshLocks      sync.Map
+	schedulerObserver func(context.Context, SchedulerSelectionObservation)
+}
+
+// SchedulerSelectionObservation is a bounded, transport-neutral scheduler event.
+type SchedulerSelectionObservation struct {
+	Duration time.Duration
+	Model    string
+	Success  bool
+}
+
+func (m *Manager) SetSchedulerSelectionObserver(observer func(context.Context, SchedulerSelectionObservation)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.schedulerObserver = observer
+	m.mu.Unlock()
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -4743,11 +4759,12 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (selectedAuth *Auth, selectedExecutor ProviderExecutor, selectedErr error) {
 	startedAt := time.Now()
 	defer func() {
-		observability.RecordWebsocketMetric(ctx, "scheduler_selection", "", "", map[string]any{
-			"duration_us": time.Since(startedAt).Microseconds(),
-			"model":       model,
-			"success":     selectedErr == nil && selectedAuth != nil,
-		}, false)
+		m.mu.RLock()
+		observer := m.schedulerObserver
+		m.mu.RUnlock()
+		if observer != nil {
+			observer(ctx, SchedulerSelectionObservation{Duration: time.Since(startedAt), Model: model, Success: selectedErr == nil && selectedAuth != nil})
+		}
 	}()
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)

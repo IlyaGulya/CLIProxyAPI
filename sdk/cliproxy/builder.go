@@ -11,6 +11,7 @@ import (
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -268,6 +269,13 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
+	coreManager.SetSchedulerSelectionObserver(func(ctx context.Context, event coreauth.SchedulerSelectionObservation) {
+		observability.RecordWebsocketMetric(ctx, "scheduler_selection", "", "", map[string]any{
+			"duration_us": event.Duration.Microseconds(),
+			"model":       event.Model,
+			"success":     event.Success,
+		}, false)
+	})
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
 	if pluginHost != nil {
