@@ -112,3 +112,25 @@ type temporaryTestError struct{}
 func (*temporaryTestError) Error() string   { return "temporary" }
 func (*temporaryTestError) Timeout() bool   { return true }
 func (*temporaryTestError) Temporary() bool { return true }
+
+func BenchmarkCodexRetryPolicy(b *testing.B) {
+	errTimeout := &temporaryTestError{}
+	input := codexRetryInput{Err: errTimeout, MaxAttempts: 1}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = decideCodexRetry(input)
+	}
+}
+
+func BenchmarkCodexSessionStateLifecycle(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		machine := newCodexSessionStateMachine()
+		_, _ = machine.transition(codexSessionDialing)
+		_, _ = machine.transition(codexSessionReady)
+		_, _ = machine.transition(codexSessionBusy)
+		_, _ = machine.transition(codexSessionReady)
+		_, _ = machine.transition(codexSessionDraining)
+		_, _ = machine.transition(codexSessionClosed)
+	}
+}

@@ -485,3 +485,26 @@ func TestIntersectsAllRequiresOneTraceSharedByEveryService(t *testing.T) {
 		t.Fatal("pairwise-only trace was accepted as three-service correlation")
 	}
 }
+
+func TestCorrelatedServiceTracesWaitsForTempoIngestion(t *testing.T) {
+	t.Parallel()
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		traceID := []string{"launcher-only", "claude-only", "proxy-only"}[(requests-1)%3]
+		if requests > 3 {
+			traceID = "shared"
+		}
+		_, _ = io.WriteString(w, `{"traces":[{"traceID":"`+traceID+`"}]}`)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ok, err := correlatedServiceTraces(ctx, server.Client(), server.URL, "run-1", 10*time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("correlatedServiceTraces() = %t, %v", ok, err)
+	}
+	if requests <= 3 {
+		t.Fatalf("verifier did not retry incomplete ingestion: requests=%d", requests)
+	}
+}

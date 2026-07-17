@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type VerificationReport struct {
@@ -62,16 +64,13 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 		"claude_metrics_present":    "/api/datasources/proxy/uid/prometheus/api/v1/query?query=" + url.QueryEscape(`sum({__name__=~"claude_code_.*|claudex_claude_.*"})`),
 		"correlated_logs_present":   "/api/datasources/proxy/uid/loki/loki/api/v1/query_range?query=" + url.QueryEscape(fmt.Sprintf(`{service_name=~"claude-code|cli-proxy-api|claudex-next"} | claudex_run_id="%s"`, manifest.RunID)) + "&limit=20",
 	}
-	serviceTraces := make([]map[string]struct{}, 0, 3)
-	for _, service := range []string{"claudex-next", "claude-code", "cli-proxy-api"} {
-		query := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && resource.service.name = "%s" }`, manifest.RunID, service))
-		traces, errTraces := grafanaTempoTraceIDs(ctx, client, query)
-		if errTraces != nil {
-			report.BackendErrors["correlated_traces_present"] = errTraces.Error()
-		}
-		serviceTraces = append(serviceTraces, traces)
+	correlationCtx, cancelCorrelation := context.WithTimeout(ctx, 5*time.Second)
+	correlated, errCorrelated := correlatedServiceTraces(correlationCtx, client, grafanaURL, manifest.RunID, 250*time.Millisecond)
+	cancelCorrelation()
+	report.Checks["correlated_traces_present"] = correlated
+	if errCorrelated != nil {
+		report.BackendErrors["correlated_traces_present"] = errCorrelated.Error()
 	}
-	report.Checks["correlated_traces_present"] = intersectsAll(serviceTraces...)
 	solTraceQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.model = "gpt-5.6-sol" }`, manifest.RunID))
 	lunaTraceQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.model = "gpt-5.6-luna" }`, manifest.RunID))
 	solTraces, errSolTraces := grafanaTempoTraceIDs(ctx, client, solTraceQuery)
@@ -168,6 +167,37 @@ func intersectsAll(sets ...map[string]struct{}) bool {
 		}
 	}
 	return false
+}
+
+func correlatedServiceTraces(ctx context.Context, client *http.Client, grafanaURL, runID string, interval time.Duration) (bool, error) {
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	for {
+		serviceTraces := make([]map[string]struct{}, 0, 3)
+		var queryErr error
+		for _, service := range []string{"claudex-next", "claude-code", "cli-proxy-api"} {
+			query := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && resource.service.name = "%s" }`, runID, service))
+			traces, errTraces := grafanaTempoTraceIDs(ctx, client, query)
+			if errTraces != nil {
+				queryErr = errors.Join(queryErr, errTraces)
+			}
+			serviceTraces = append(serviceTraces, traces)
+		}
+		if intersectsAll(serviceTraces...) {
+			return true, nil
+		}
+		if queryErr != nil {
+			return false, queryErr
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, nil
+		case <-timer.C:
+		}
+	}
 }
 
 func grafanaPromValue(ctx context.Context, client *http.Client, endpoint string) (float64, error) {

@@ -182,6 +182,17 @@ func TestWebsocketAttributesPreserveExplicitFalseAndZero(t *testing.T) {
 	}
 }
 
+func BenchmarkWebsocketAttributesEncoding(b *testing.B) {
+	attributes := WebsocketAttributes{
+		Model: "gpt-5.6-sol", ConnectionSource: "session_reuse", Success: Some(true),
+		DurationUS: Some(int64(1250)), InputTokens: Some(int64(4096)), OutputTokens: Some(int64(128)),
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = attributes.fields()
+	}
+}
+
 func TestInSessionModelSwitchingAndDetachedPreconnectLinks(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
