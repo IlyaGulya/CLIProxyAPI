@@ -81,6 +81,10 @@ type SDKConfig struct {
 	// choose a target below the configured global idle/TTL caps. Opt-in.
 	CodexWebsocketAdaptivePreconnect bool `yaml:"codex-websocket-adaptive-preconnect" json:"codex-websocket-adaptive-preconnect"`
 
+	// CodexCacheAwareCompaction enables conservative cache/replay economics
+	// telemetry and scheduling decisions. Hard context safety always wins.
+	CodexCacheAwareCompaction bool `yaml:"codex-cache-aware-compaction" json:"codex-cache-aware-compaction"`
+
 	// CodexWebsocketCircuitBreaker enables route-scoped suppression of repeatedly
 	// failing upstream websocket attempts. Disabled by default during rollout.
 	CodexWebsocketCircuitBreaker bool `yaml:"codex-websocket-circuit-breaker" json:"codex-websocket-circuit-breaker"`

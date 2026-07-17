@@ -143,6 +143,16 @@
           "legendFormat": "{{model}} {{finish_reason}}"
         }],
         "gridPos": {"x": 0, "y": 66, "w": 24, "h": 8}
+      },
+      {
+        "id": 15, "type": "timeseries", "title": "Cache-aware compaction schedule",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "sum by (model, finish_reason) (increase(claudex_proxy_events_total{event_name=\"compaction_schedule_decision\",model=~\"$model\"}[6h]))",
+          "legendFormat": "{{model}} {{finish_reason}}"
+        }],
+        "gridPos": {"x": 0, "y": 74, "w": 24, "h": 8}
       }
     ]
   },

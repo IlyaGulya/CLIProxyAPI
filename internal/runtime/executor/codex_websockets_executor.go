@@ -57,8 +57,9 @@ func codexWebsocketIdleTimeout(cfg *config.Config) time.Duration {
 // not available over WebSocket (e.g. /responses/compact) and for websocket upgrade failures.
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
-	circuit            *codexWebsocketCircuit
-	adaptivePreconnect *codexAdaptivePreconnectController
+	circuit             *codexWebsocketCircuit
+	adaptivePreconnect  *codexAdaptivePreconnectController
+	compactionScheduler *codexCompactionScheduler
 
 	sessions      *codexWebsocketSessionManager
 	draining      bool
@@ -160,6 +161,9 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 		executor.adaptivePreconnect = newCodexAdaptivePreconnectController(codexAdaptivePreconnectConfig{
 			MaxTarget: runtimeCfg.PreconnectMaxIdle, MinTTL: 5 * time.Second, MaxTTL: runtimeCfg.PreconnectTTL,
 		})
+	}
+	if cfg != nil && cfg.CodexCacheAwareCompaction {
+		executor.compactionScheduler = newCodexCompactionScheduler(codexCompactionSchedulerConfig{})
 	}
 	return executor
 }
@@ -546,6 +550,25 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	incrementalObservation := codexIncrementalObservation{resetReason: "not_applicable"}
 	if sess != nil && from.String() == "claude" {
 		requestBody, incrementalObservation = sess.prepareCodexIncrementalRequestObserved(clientBody)
+	}
+	if e.compactionScheduler != nil {
+		contextTokens := int64(len(clientBody)+3) / 4
+		decision := e.compactionScheduler.decide(codexCompactionEconomics{
+			ContextTokens: contextTokens, ReservedOutputTokens: 32_000, ContextWindowTokens: 272_000, SafetyMarginTokens: 12_000,
+			PrefixContinuous: incrementalObservation.incremental, ReplayBytes: int64(len(clientBody)), ExpectedCompactedBytes: int64(len(requestBody)),
+		})
+		trigger := "replay"
+		if decision.Compact {
+			trigger = "compact_required"
+			if incrementalObservation.compaction.Applied {
+				trigger = "compact_applied"
+			}
+		}
+		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "compaction_schedule_decision", observability.WebsocketAttributes{
+			SessionID: executionSessionID, Model: baseModel, Reason: decision.Reason, Trigger: trigger,
+			ClientBodyBytes: observability.Some(int64(len(clientBody))), UpstreamBodyBytes: observability.Some(int64(len(requestBody))),
+			PredictedSavingsBytes: observability.Some(decision.PredictedSavingsBytes),
+		}, nil)
 	}
 	cacheMetricFields := codexPromptCacheMetricFields(requestBody)
 	cacheEnabled, cacheTTL, cacheDecision := helps.ClaudePromptCacheDecision(originalPayloadSource)

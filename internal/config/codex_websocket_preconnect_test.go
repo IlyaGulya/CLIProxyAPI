@@ -10,6 +10,7 @@ codex-websocket-preconnect-replenish: true
 codex-websocket-preconnect-max-idle: 4
 codex-websocket-preconnect-ttl-seconds: 9
 codex-websocket-adaptive-preconnect: true
+codex-cache-aware-compaction: true
 `))
 	if errParse != nil {
 		t.Fatalf("ParseConfigBytes() error = %v", errParse)
@@ -31,5 +32,8 @@ codex-websocket-adaptive-preconnect: true
 	}
 	if !cfg.CodexWebsocketAdaptivePreconnect {
 		t.Fatal("codex-websocket-adaptive-preconnect was not parsed")
+	}
+	if !cfg.CodexCacheAwareCompaction {
+		t.Fatal("codex-cache-aware-compaction was not parsed")
 	}
 }

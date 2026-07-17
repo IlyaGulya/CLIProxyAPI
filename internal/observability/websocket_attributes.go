@@ -94,6 +94,7 @@ type WebsocketAttributes struct {
 	AdaptiveTarget             Optional[int64]
 	AdaptiveHitRateBasisPoints Optional[int64]
 	CounterfactualWaitUS       Optional[int64]
+	PredictedSavingsBytes      Optional[int64]
 }
 
 func (a WebsocketAttributes) fields() map[string]any {
@@ -176,6 +177,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 	addOptional(fields, "adaptive_target", a.AdaptiveTarget)
 	addOptional(fields, "adaptive_hit_rate_basis_points", a.AdaptiveHitRateBasisPoints)
 	addOptional(fields, "counterfactual_wait_us", a.CounterfactualWaitUS)
+	addOptional(fields, "predicted_savings_bytes", a.PredictedSavingsBytes)
 	return fields
 }
 

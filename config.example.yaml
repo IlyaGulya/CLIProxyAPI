@@ -212,6 +212,8 @@ codex-websocket-preconnect-max-idle: 2
 codex-websocket-preconnect-ttl-seconds: 30
 # Adapt the per-route target/TTL within the hard caps above.
 codex-websocket-adaptive-preconnect: false
+# Compare cached replay with Compaction V2 economics (opt-in).
+codex-cache-aware-compaction: false
 # Route-scoped websocket failure circuit breaker. Keep disabled until the
 # candidate transport has been observed in your environment.
 codex-websocket-circuit-breaker: false
