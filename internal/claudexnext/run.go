@@ -45,25 +45,27 @@ type Options struct {
 }
 
 type Manifest struct {
-	RunID           string            `json:"run_id"`
-	SessionID       string            `json:"session_id"`
-	StartedAt       time.Time         `json:"started_at"`
-	FinishedAt      time.Time         `json:"finished_at"`
-	WorkingDir      string            `json:"working_directory"`
-	ClaudeVersion   string            `json:"claude_version"`
-	ClaudeArgs      []string          `json:"claude_args"`
-	RootModel       string            `json:"root_model"`
-	SubagentModel   string            `json:"subagent_model"`
-	MaxConcurrency  string            `json:"max_tool_use_concurrency"`
-	ProxyBinary     string            `json:"proxy_binary"`
-	ProxySHA256     string            `json:"proxy_sha256"`
-	ProxyPort       int               `json:"proxy_port"`
-	ExitCode        int               `json:"exit_code"`
-	Stack           StackStatus       `json:"observability_stack"`
-	ProxyReadyMS    int64             `json:"proxy_ready_ms"`
-	ClaudeRuntimeMS int64             `json:"claude_runtime_ms"`
-	OTELFlushOK     bool              `json:"otel_flush_ok"`
-	Telemetry       map[string]string `json:"telemetry_privacy"`
+	RunID              string            `json:"run_id"`
+	SessionID          string            `json:"session_id"`
+	StartedAt          time.Time         `json:"started_at"`
+	FinishedAt         time.Time         `json:"finished_at"`
+	WorkingDir         string            `json:"working_directory"`
+	ClaudeVersion      string            `json:"claude_version"`
+	ClaudeArgs         []string          `json:"claude_args"`
+	RootModel          string            `json:"root_model"`
+	SubagentModel      string            `json:"subagent_model"`
+	MaxConcurrency     string            `json:"max_tool_use_concurrency"`
+	ProxyBinary        string            `json:"proxy_binary"`
+	ProxySHA256        string            `json:"proxy_sha256"`
+	ProxyPort          int               `json:"proxy_port"`
+	ExitCode           int               `json:"exit_code"`
+	Stack              StackStatus       `json:"observability_stack"`
+	ProxyReadyMS       int64             `json:"proxy_ready_ms"`
+	ClaudeRuntimeMS    int64             `json:"claude_runtime_ms"`
+	OTELFlushOK        bool              `json:"otel_flush_ok"`
+	Telemetry          map[string]string `json:"telemetry_privacy"`
+	HarnessSchemaOK    bool              `json:"harness_schema_ok"`
+	HarnessSchemaError string            `json:"harness_schema_error,omitempty"`
 }
 
 type processOwner struct {
@@ -247,6 +249,26 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	errRun := claudeCmd.Run()
 	claudeRuntimeMS := time.Since(claudeStartedAt).Milliseconds()
 	exitCode := exitStatus(errRun)
+	if claudeStdout != nil {
+		_ = claudeStdout.Sync()
+	}
+	harnessSchemaOK := false
+	harnessSchemaError := ""
+	if outputFormat := flagValue(claudeArgs, "--output-format"); outputFormat == "json" || outputFormat == "stream-json" {
+		version := strings.Fields(commandVersion(opts.ClaudeBin))
+		versionName := "unknown"
+		if len(version) > 0 {
+			versionName = version[0]
+		}
+		report, errSchema := CaptureClaudeHarnessSchema(filepath.Join(runDir, "claude", "stdout.log"), outputFormat, versionName)
+		if errSchema != nil {
+			harnessSchemaError = errSchema.Error()
+		} else if errWrite := writeJSON(filepath.Join(runDir, "harness-schema.json"), report); errWrite != nil {
+			harnessSchemaError = errWrite.Error()
+		} else {
+			harnessSchemaOK = true
+		}
+	}
 	if launcherSpan != nil {
 		launcherSpan.AddEvent("claude.exited", trace.WithAttributes(attribute.Int("process.exit.code", exitCode), attribute.Int64("duration.ms", claudeRuntimeMS)))
 		if errRun != nil {
@@ -290,7 +312,8 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ExitCode: exitCode,
 		Stack: stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
-		Telemetry: telemetryPrivacy(values),
+		Telemetry:       telemetryPrivacy(values),
+		HarnessSchemaOK: harnessSchemaOK, HarnessSchemaError: harnessSchemaError,
 	}
 	if errWrite := writeJSON(filepath.Join(runDir, "manifest.json"), manifest); errWrite != nil {
 		return runDir, exitCode, errWrite

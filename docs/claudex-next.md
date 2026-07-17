@@ -109,10 +109,38 @@ The isolated runtime config maps those aliases to `gpt-5.6-sol` and
 
 Run the budget-guarded Sol → Luna → Sol verification with:
 
+## Claude harness compatibility sandbox
+
+Every JSON or stream-JSON run now writes `harness-schema.json` beside the run
+manifest. It contains only event names and field paths/types; session IDs,
+prompts, assistant text, tool inputs and result values are never copied into
+the schema artifact. The original stdout, debug log and transcripts remain in
+the private run directory for diagnosis.
+
+Inspect the versioned probe matrix or summarize an existing harness stream:
+
+```bash
+claudex-next-compat --version 2.1.212
+claudex-next-compat --version 2.1.212 --input ~/.claudex-next/latest/claude/stdout.log
+```
+
+Run one bounded live case (default budget USD 0.20):
+
+```bash
+CLAUDEX_NEXT_COMPAT_CASE=bare scripts/claudex-next-compat-e2e.sh
+```
+
+Supported cases are `bare`, `safe_mode`, `stream_json`, `partial_messages`,
+`forward_subagent_text`, `prompt_suggestions`, `structured_output`,
+`background_agent`, `workflow`, `fork_session`, `no_session_persistence`, and
+`cancellation`. Agent/workflow cases are intentionally opt-in. `fork_session`
+also requires `CLAUDEX_NEXT_COMPAT_SESSION_ID` from a completed run.
+
 ```bash
 go build -o ~/.local/bin/claudex-next ./cmd/claudex-next
 go build -o ~/.local/bin/cli-proxy-api-next ./cmd/server
 go build -o ~/.local/bin/claudex-next-verify ./cmd/claudex-next-verify
+go build -o ~/.local/bin/claudex-next-compat ./cmd/claudex-next-compat
 scripts/claudex-next-otel-e2e.sh
 ```
 

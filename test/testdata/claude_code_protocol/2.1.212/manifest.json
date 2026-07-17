@@ -1,6 +1,6 @@
 {
   "version": "2.1.212",
-  "fixtures": ["messages_request.json", "sse_stream.json", "error.json", "models.json", "harness_stream.json"],
+  "fixtures": ["messages_request.json", "sse_stream.json", "error.json", "models.json", "harness_stream.json", "harness_schema.json"],
   "classifications": {
     "messages_request.json": {
       "anthropic_version": "passthrough",
@@ -78,6 +78,22 @@
       "events[].subtype": "passthrough",
       "events[].terminal_reason": "passthrough",
       "events[].type": "passthrough"
+    },
+    "harness_schema.json": {
+      "event_count": "emulated",
+      "events.assistant": "emulated",
+      "events.result:success": "emulated",
+      "events.system:init": "emulated",
+      "field_types.is_error[]": "emulated",
+      "field_types.message.content[].text[]": "emulated",
+      "field_types.message.content[].type[]": "emulated",
+      "field_types.message.id[]": "emulated",
+      "field_types.model[]": "emulated",
+      "field_types.parent_tool_use_id[]": "emulated",
+      "field_types.session_id[]": "emulated",
+      "field_types.subtype[]": "emulated",
+      "field_types.type[]": "emulated",
+      "version": "passthrough"
     }
   }
 }
