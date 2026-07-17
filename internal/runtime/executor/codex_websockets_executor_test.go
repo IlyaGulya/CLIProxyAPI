@@ -1492,14 +1492,14 @@ func TestCanonicalizeCodexCacheableRequestPreservesToolOrderAndLargeIntegers(t *
 }
 
 func TestPrepareWebsocketRequestSharesCanonicalPolicyAcrossModes(t *testing.T) {
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	planner := newCodexWebsocketRequestPlanner(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
 	auth := &cliproxyauth.Auth{ID: "auth-prepare", Provider: "codex", Attributes: map[string]string{"api_key": "token", "base_url": "https://example.test/codex"}}
 	payload := []byte(`{"model":"gpt-5.6-sol","stream_options":{"include_usage":true},"input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"B","parameters":{"maximum":9007199254740993}},{"type":"function","name":"A"}]}`)
 	req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), ResponseFormat: sdktranslator.FromString("openai-response"), OriginalRequest: payload}
 
-	nonStream, errNonStream := exec.prepareWebsocketRequest(context.Background(), auth, req, opts, false)
-	stream, errStream := exec.prepareWebsocketRequest(context.Background(), auth, req, opts, true)
+	nonStream, errNonStream := planner.Plan(context.Background(), auth, req, opts, false)
+	stream, errStream := planner.Plan(context.Background(), auth, req, opts, true)
 	if errNonStream != nil || errStream != nil {
 		t.Fatalf("prepare errors: non-stream=%v stream=%v", errNonStream, errStream)
 	}

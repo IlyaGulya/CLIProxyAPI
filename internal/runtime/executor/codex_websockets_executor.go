@@ -70,6 +70,7 @@ type codexWebsocketSessionStore struct {
 type codexWebsocketSession struct {
 	sessionID string
 	lastUsed  time.Time
+	lifecycle codexSessionStateMachine
 
 	reqMu sync.Mutex
 
@@ -198,6 +199,9 @@ func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
 		s.activeCancel = activeCancel
 	}
 	s.activeMu.Unlock()
+	if ch != nil {
+		s.moveLifecycle(codexSessionBusy)
+	}
 }
 
 func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
@@ -205,6 +209,7 @@ func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
 		return
 	}
 	s.activeMu.Lock()
+	cleared := false
 	if s.activeCh == ch {
 		s.activeCh = nil
 		if s.activeCancel != nil {
@@ -212,8 +217,24 @@ func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
 		}
 		s.activeCancel = nil
 		s.activeDone = nil
+		cleared = true
 	}
 	s.activeMu.Unlock()
+	if cleared {
+		s.moveLifecycle(codexSessionReady)
+	}
+}
+
+func (s *codexWebsocketSession) moveLifecycle(next codexSessionState) {
+	if s == nil {
+		return
+	}
+	if s.lifecycle.state() == next || s.lifecycle.state() == codexSessionClosed {
+		return
+	}
+	if _, errTransition := s.lifecycle.transition(next); errTransition != nil {
+		log.WithError(errTransition).WithFields(log.Fields{"session_id": s.sessionID, "target_state": next.String()}).Debug("codex websockets: lifecycle transition rejected")
+	}
 }
 
 func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, payload []byte) error {
@@ -793,8 +814,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
 				closeCode = codexWebsocketCloseCode(mappedErr)
-				retryable := shouldRetryCodexWebsocketReadError(mappedErr)
-				if !downstreamCommitted && transportRetries == 0 && retryable {
+				decision := decideCodexRetry(codexRetryInput{
+					Err:                 mappedErr,
+					DownstreamCommitted: downstreamCommitted,
+					Attempts:            transportRetries,
+					MaxAttempts:         1,
+				})
+				if decision.Action == codexRetryReconnect {
 					transportRetries++
 					helpFields := map[string]any{
 						"session_id":           executionSessionID,
@@ -883,18 +909,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					helpFields["connection_source"] = retrySource
 					helps.RecordAPIWebsocketMetric(ctx, e.cfg, "transport_retry_exhausted", helpFields)
 				} else {
-					suppressionReason := "retry_exhausted"
-					if downstreamCommitted {
-						suppressionReason = "downstream_committed"
-					} else if !retryable {
-						suppressionReason = "non_retriable"
-					}
 					helps.RecordAPIWebsocketMetric(ctx, e.cfg, "transport_retry_suppressed", map[string]any{
 						"session_id":           executionSessionID,
 						"attempt":              transportRetries,
-						"boundary":             codexWebsocketRetryBoundary(downstreamCommitted),
+						"boundary":             decision.Boundary,
 						"reason":               codexWebsocketRetryReason(mappedErr),
-						"suppression_reason":   suppressionReason,
+						"suppression_reason":   decision.Reason,
 						"downstream_committed": downstreamCommitted,
 					})
 				}
@@ -1166,13 +1186,6 @@ func (s codexWebsocketSemanticState) incompleteToolCalls() int64 {
 		return 0
 	}
 	return incomplete
-}
-
-func codexWebsocketRetryBoundary(downstreamCommitted bool) string {
-	if downstreamCommitted {
-		return "post_output"
-	}
-	return "pre_output"
 }
 
 func buildCodexWebsocketRequestBody(body []byte) []byte {
@@ -2298,6 +2311,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 		}
 		return conn, nil, codexWebsocketConnectionSessionReuse, nil
 	}
+	sess.moveLifecycle(codexSessionDialing)
 	if pooledConn := e.takeSpeculativePreconnect(ctx, auth, authID, wsURL, headers, sess.sessionID); pooledConn != nil {
 		sess.connMu.Lock()
 		sess.conn = pooledConn
@@ -2308,11 +2322,13 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 		sess.configureConn(pooledConn)
 		go e.readUpstreamLoop(sess, pooledConn)
 		logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
+		sess.moveLifecycle(codexSessionReady)
 		return pooledConn, nil, codexWebsocketConnectionSpeculative, nil
 	}
 
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
+		sess.moveLifecycle(codexSessionIdle)
 		return nil, resp, codexWebsocketConnectionCold, errDial
 	}
 
@@ -2334,6 +2350,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 	sess.configureConn(conn)
 	go e.readUpstreamLoop(sess, conn)
 	logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
+	sess.moveLifecycle(codexSessionReady)
 	return conn, resp, codexWebsocketConnectionCold, nil
 }
 
@@ -2419,6 +2436,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	sess.connMu.Unlock()
 
 	sess.resetCodexIncrementalState()
+	sess.moveLifecycle(codexSessionIdle)
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	sess.notifyUpstreamDisconnect(err)
 	if errClose := e.closeCodexConnection(conn); errClose != nil {
@@ -2497,6 +2515,7 @@ func (e *CodexWebsocketsExecutor) closeCodexWebsocketSession(sess *codexWebsocke
 	if reason == "" {
 		reason = "session_closed"
 	}
+	sess.moveLifecycle(codexSessionDraining)
 
 	sess.connMu.Lock()
 	conn := sess.conn
@@ -2510,12 +2529,14 @@ func (e *CodexWebsocketsExecutor) closeCodexWebsocketSession(sess *codexWebsocke
 	sess.connMu.Unlock()
 
 	if conn == nil {
+		sess.moveLifecycle(codexSessionClosed)
 		return
 	}
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
 	if errClose := e.closeCodexConnection(conn); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}
+	sess.moveLifecycle(codexSessionClosed)
 }
 
 func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {
