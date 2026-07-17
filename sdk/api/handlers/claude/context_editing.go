@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync"
 
 	"github.com/tidwall/gjson"
+	"github.com/tiktoken-go/tokenizer"
 )
 
 const clearedToolResultText = "[Tool result cleared to preserve context]"
@@ -23,7 +25,14 @@ type claudeContextPressureResult struct {
 	ReservedOutput  int
 	EffectiveWindow int
 	Overflow        bool
+	Method          string
 }
+
+var (
+	claudePreflightTokenizerOnce sync.Once
+	claudePreflightTokenizer     tokenizer.Codec
+	claudePreflightTokenizerErr  error
+)
 
 // claudeContextPressure applies the same 95% effective-window reserve exposed
 // by Codex model metadata. It is intentionally conservative: preflight exists
@@ -35,12 +44,65 @@ func claudeContextPressure(input []byte) claudeContextPressureResult {
 	if reserved < 0 {
 		reserved = 0
 	}
-	estimated := approximateTokens(input)
+	estimated, method := estimateClaudeGPTInputTokens(input)
 	return claudeContextPressureResult{
 		EstimatedInput:  estimated,
 		ReservedOutput:  reserved,
 		EffectiveWindow: effectiveWindow,
 		Overflow:        estimated+reserved > effectiveWindow,
+		Method:          method,
+	}
+}
+
+func estimateClaudeGPTInputTokens(input []byte) (int, string) {
+	var root any
+	if json.Unmarshal(input, &root) != nil {
+		return approximateTokens(input), "bytes_fallback"
+	}
+	images := 0
+	sanitized := sanitizeClaudeTokenInput(root, &images)
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		return approximateTokens(input), "bytes_fallback"
+	}
+	claudePreflightTokenizerOnce.Do(func() {
+		claudePreflightTokenizer, claudePreflightTokenizerErr = tokenizer.ForModel(tokenizer.GPT5)
+	})
+	if claudePreflightTokenizerErr != nil || claudePreflightTokenizer == nil {
+		return approximateTokens(encoded) + images*85, "bytes_fallback"
+	}
+	count, err := claudePreflightTokenizer.Count(string(encoded))
+	if err != nil {
+		return approximateTokens(encoded) + images*85, "bytes_fallback"
+	}
+	return count + images*85, "gpt5_tokenizer"
+}
+
+func sanitizeClaudeTokenInput(value any, images *int) any {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]any, len(typed))
+		for index := range typed {
+			out[index] = sanitizeClaudeTokenInput(typed[index], images)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		isImage := strings.Contains(strings.ToLower(stringValue(typed["type"])), "image")
+		isBase64 := strings.EqualFold(stringValue(typed["type"]), "base64")
+		if isImage {
+			*images++
+		}
+		for key, child := range typed {
+			if isBase64 && key == "data" {
+				out[key] = "[image bytes omitted]"
+				continue
+			}
+			out[key] = sanitizeClaudeTokenInput(child, images)
+		}
+		return out
+	default:
+		return value
 	}
 }
 

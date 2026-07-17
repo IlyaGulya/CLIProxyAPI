@@ -45,13 +45,41 @@ func TestApplyClaudeContextEditingHonorsTriggerAndExcludedTools(t *testing.T) {
 
 func TestClaudeContextPreflightReservesOutputHeadroom(t *testing.T) {
 	t.Parallel()
-	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + strings.Repeat("x", 910000) + `"}]}`)
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + strings.Repeat(" antidisestablishmentarianism", 50000) + `"}]}`)
 	pressure := claudeContextPressure(input)
 	if !pressure.Overflow || pressure.EffectiveWindow != 258400 || pressure.ReservedOutput != 32000 {
 		t.Fatalf("pressure = %+v", pressure)
 	}
 	if safe := claudeContextPressure([]byte(`{"model":"gpt-5.6-sol","max_tokens":1000,"messages":[{"role":"user","content":"hello"}]}`)); safe.Overflow {
 		t.Fatalf("small request rejected: %+v", safe)
+	}
+}
+
+func TestClaudeContextPreflightDoesNotRejectLargeButTokenSafeCompactPayload(t *testing.T) {
+	t.Parallel()
+	// Mirrors the observed reactive-compaction regression: a roughly 950 KB
+	// prose-heavy JSON request represented about 169k model tokens. A bytes/4
+	// estimate rejected it 16 times even though it fit with output headroom.
+	prose := strings.Repeat("This is compact context with repeated prose and repository state. ", 15000)
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + prose + `"}]}`)
+	if len(input) < 900000 {
+		t.Fatalf("fixture too small: %d bytes", len(input))
+	}
+	pressure := claudeContextPressure(input)
+	if pressure.Overflow {
+		t.Fatalf("token-safe compact payload rejected: %+v", pressure)
+	}
+	if pressure.EstimatedInput < 100000 || pressure.EstimatedInput > 220000 {
+		t.Fatalf("unexpected token estimate for compact fixture: %+v", pressure)
+	}
+}
+
+func TestClaudeContextPreflightDoesNotTokenizeBase64AsText(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":1000,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + strings.Repeat("A", 1200000) + `"}}]}]}`)
+	pressure := claudeContextPressure(input)
+	if pressure.Overflow || pressure.EstimatedInput > 10000 {
+		t.Fatalf("base64 image bytes counted as text tokens: %+v", pressure)
 	}
 }
 

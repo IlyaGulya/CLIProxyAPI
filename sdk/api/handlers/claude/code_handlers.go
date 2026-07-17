@@ -102,6 +102,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 			"input_tokens":             pressure.EstimatedInput,
 			"reserved_output_tokens":   pressure.ReservedOutput,
 			"effective_context_window": pressure.EffectiveWindow,
+			"estimation_method":        pressure.Method,
 		}, false)
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{
 			Message: "Prompt is too long: input plus requested output exceeds this model's context window",
