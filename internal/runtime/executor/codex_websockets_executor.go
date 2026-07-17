@@ -870,6 +870,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
 							retryAttributes.ConnectionSource = string(retrySource)
 							helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_succeeded", retryAttributes, nil)
+							e.recordReconnectStatus(ctx, executionSessionID, baseModel, codexReconnectStatusInput{
+								Attempt: transportRetries, MaxAttempts: 1, Elapsed: time.Since(retryStartedAt), Recovered: true,
+							})
 							continue
 						}
 						errDialRetry = errSendRetry
@@ -889,6 +892,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
 					retryAttributes.ConnectionSource = string(retrySource)
 					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_exhausted", retryAttributes, nil)
+					e.recordReconnectStatus(ctx, executionSessionID, baseModel, codexReconnectStatusInput{
+						Attempt: transportRetries, MaxAttempts: 1, Elapsed: time.Since(retryStartedAt), Terminal: true,
+					})
 				} else {
 					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_suppressed", observability.WebsocketAttributes{
 						SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)), Boundary: string(decision.Boundary),
@@ -2645,9 +2651,10 @@ func (e *CodexAutoExecutor) allowWebsocketRoute(ctx context.Context, auth *clipr
 	decision := e.circuit.allow(codexCircuitRoute(auth, model))
 	if !decision.allowed {
 		helps.RecordAPIWebsocketEvent(ctx, e.httpExec.cfg, "circuit_suppressed", observability.WebsocketAttributes{
-			Model: model, Reason: decision.state.String(), SuppressionReason: "route_circuit_open",
+			Model: model, Reason: decision.state.String(), Trigger: "https_fallback", SuppressionReason: "route_circuit_open",
 			AgeUS: observability.Some(decision.cooldownRemaining.Microseconds()),
 		}, nil)
+		e.wsExec.recordReconnectStatus(ctx, "", model, codexReconnectStatusInput{CircuitOpen: true})
 	} else if decision.state == circuitHalfOpen {
 		helps.RecordAPIWebsocketEvent(ctx, e.httpExec.cfg, "circuit_probe", observability.WebsocketAttributes{
 			Model: model, Reason: decision.state.String(),
@@ -2673,6 +2680,20 @@ func (e *CodexWebsocketsExecutor) recordCircuitSuccess(ctx context.Context, auth
 	e.circuit.success(codexCircuitRoute(auth, model))
 	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "circuit_success", observability.WebsocketAttributes{
 		Model: model, Success: observability.Some(true),
+	}, nil)
+}
+
+func (e *CodexWebsocketsExecutor) recordReconnectStatus(ctx context.Context, sessionID, model string, input codexReconnectStatusInput) {
+	decision := decideCodexReconnectStatus(input)
+	helpName := "transport_reconnect_status_suppressed"
+	if decision.Visible {
+		helpName = "transport_reconnect_status"
+	}
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, helpName, observability.WebsocketAttributes{
+		SessionID: sessionID, Model: model, Trigger: decision.Status,
+		Attempt: observability.Some(int64(input.Attempt)), TransportRetries: observability.Some(int64(input.MaxAttempts)),
+		DurationUS: observability.Some(input.Elapsed.Microseconds()), SuppressionReason: decision.SuppressionReason,
+		Success: observability.Some(input.Recovered),
 	}, nil)
 }
 
