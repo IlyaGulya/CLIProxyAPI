@@ -33,6 +33,14 @@ func (e *Error) StatusCode() int {
 	return e.HTTPStatus
 }
 
+// ErrorCode returns the stable machine-readable error code.
+func (e *Error) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}
+
 // IsRequestScoped reports whether the failure is tied to the current request
 // rather than the selected credential.
 func (e *Error) IsRequestScoped() bool {

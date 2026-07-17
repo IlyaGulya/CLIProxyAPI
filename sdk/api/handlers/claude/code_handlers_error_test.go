@@ -1,21 +1,43 @@
 package claude
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+type stalledClaudeStreamExecutor struct{}
+
+func (*stalledClaudeStreamExecutor) Identifier() string { return "codex" }
+func (*stalledClaudeStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("unexpected non-streaming request")
+}
+func (*stalledClaudeStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return &coreexecutor.StreamResult{Chunks: make(chan coreexecutor.StreamChunk)}, nil
+}
+func (*stalledClaudeStreamExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+func (*stalledClaudeStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("unexpected token count request")
+}
+func (*stalledClaudeStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("unexpected HTTP request")
+}
 
 type writeHeaderCountingWriter struct {
 	gin.ResponseWriter
@@ -180,5 +202,52 @@ func TestWriteClaudeTerminalStreamErrorDoesNotRewriteCommittedStatus(t *testing.
 	}
 	if !strings.Contains(body, `"type":"error"`) {
 		t.Fatalf("missing Claude error envelope: %s", body)
+	}
+}
+
+func TestClaudeStreamingIdleBeforeFirstEventReturnsGatewayTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&stalledClaudeStreamExecutor{})
+	auth := &coreauth.Auth{ID: "claude-stalled-stream", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5.6-sol"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	handler := NewClaudeCodeAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{
+		Streaming: config.StreamingConfig{IdleTimeoutSeconds: 1},
+	}, manager))
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"gpt-5.6-sol","max_tokens":64,"stream":true,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	started := time.Now()
+
+	handler.ClaudeMessages(c)
+
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("elapsed = %s, want watchdog near 1s", elapsed)
+	}
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); !strings.Contains(got, handlers.ErrStreamIdleTimeout.Error()) {
+		t.Fatalf("error.message = %q, want idle timeout detail", got)
+	}
+}
+
+func TestIsClaudeStreamIdleErrorRecognizesStableConductorCode(t *testing.T) {
+	msg := &interfaces.ErrorMessage{Error: fmt.Errorf("bootstrap failed: %w", &coreauth.Error{
+		Code: "stream_idle_timeout", Message: "stream idle timeout", HTTPStatus: http.StatusGatewayTimeout,
+	})}
+	if !isClaudeStreamIdleError(msg) {
+		t.Fatal("idle timeout wrapped by conductor was not recognized")
+	}
+	if isClaudeStreamIdleError(&interfaces.ErrorMessage{Error: errors.New("other failure")}) {
+		t.Fatal("unrelated failure was recognized as idle timeout")
 	}
 }

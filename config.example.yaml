@@ -221,6 +221,7 @@ nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
+#   idle-timeout-seconds: 300 # Default: 0 (disabled). Keep-alives do not reset it.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).

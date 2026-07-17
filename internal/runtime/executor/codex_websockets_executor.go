@@ -44,6 +44,13 @@ const (
 	codexWebsocketMaxIncrementalStateBytes = 8 << 20
 )
 
+func codexWebsocketIdleTimeout(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.Streaming.IdleTimeoutSeconds > 0 {
+		return time.Duration(cfg.Streaming.IdleTimeoutSeconds) * time.Second
+	}
+	return codexResponsesWebsocketIdleTimeout
+}
+
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
 //
 // It preserves the existing CodexExecutor HTTP implementation as a fallback for endpoints
@@ -412,7 +419,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
 		}
-		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh, codexWebsocketIdleTimeout(e.cfg))
 		if errRead != nil {
 			mappedErr := mapCodexWebsocketReadError(errRead)
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
@@ -766,7 +773,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 				return
 			}
-			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh, codexWebsocketIdleTimeout(e.cfg))
 			if errRead != nil {
 				if sess != nil && ctx != nil && ctx.Err() != nil {
 					terminateReason = "context_done"
@@ -1278,12 +1285,12 @@ func codexGenerateFalseWarmupFailureReason(err error) string {
 	return "transport_error"
 }
 
-func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
+func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead, idleTimeout time.Duration) (int, []byte, error) {
 	if sess == nil {
 		if conn == nil {
 			return 0, nil, fmt.Errorf("codex websockets executor: websocket conn is nil")
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		return msgType, payload, errRead
 	}
@@ -2284,7 +2291,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		return
 	}
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(codexWebsocketIdleTimeout(e.cfg)))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
 			sess.activeMu.Lock()

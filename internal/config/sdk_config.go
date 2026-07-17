@@ -106,6 +106,10 @@ type StreamingConfig struct {
 	// <= 0 disables keep-alives. Default is 0.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 
+	// IdleTimeoutSeconds bounds how long a stream may produce no upstream data.
+	// Keep-alive comments do not reset this watchdog. <= 0 disables it.
+	IdleTimeoutSeconds int `yaml:"idle-timeout-seconds,omitempty" json:"idle-timeout-seconds,omitempty"`
+
 	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.

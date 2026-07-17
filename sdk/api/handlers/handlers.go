@@ -228,6 +228,15 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// StreamingIdleTimeout returns the maximum interval without upstream stream data.
+// Returning 0 disables the watchdog. Heartbeats sent downstream do not count as data.
+func StreamingIdleTimeout(cfg *config.SDKConfig) time.Duration {
+	if cfg == nil || cfg.Streaming.IdleTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.Streaming.IdleTimeoutSeconds) * time.Second
+}
+
 // NonStreamingKeepAliveInterval returns the keep-alive interval for non-streaming responses.
 // Returning 0 disables keep-alives (default when unset).
 func NonStreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
@@ -1155,6 +1164,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
+	if idleTimeout := StreamingIdleTimeout(h.Cfg); idleTimeout > 0 {
+		reqMeta[coreexecutor.StreamBootstrapIdleTimeoutMetadataKey] = idleTimeout
+	}
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)

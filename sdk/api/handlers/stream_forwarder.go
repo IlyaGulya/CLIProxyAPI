@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -8,10 +9,20 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 )
 
+var ErrStreamIdleTimeout = errors.New("stream idle timeout")
+
 type StreamForwardOptions struct {
 	// KeepAliveInterval overrides the configured streaming keep-alive interval.
 	// If nil, the configured default is used. If set to <= 0, keep-alives are disabled.
 	KeepAliveInterval *time.Duration
+
+	// IdleTimeout bounds the interval between upstream data chunks. If nil, the
+	// configured default is used; <= 0 disables the watchdog. Keep-alives do not
+	// reset this timer.
+	IdleTimeout *time.Duration
+
+	// OnIdle observes watchdog expiry without exposing request content.
+	OnIdle func(timeout time.Duration)
 
 	// WriteChunk writes a single data chunk to the response body. It should not flush.
 	WriteChunk func(chunk []byte)
@@ -61,6 +72,30 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		keepAliveC = keepAlive.C
 	}
 
+	idleTimeout := StreamingIdleTimeout(h.Cfg)
+	if opts.IdleTimeout != nil {
+		idleTimeout = *opts.IdleTimeout
+	}
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if idleTimeout > 0 {
+		idleTimer = time.NewTimer(idleTimeout)
+		defer idleTimer.Stop()
+		idleC = idleTimer.C
+	}
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleTimeout)
+	}
+
 	var terminalErr *interfaces.ErrorMessage
 	for {
 		select {
@@ -94,6 +129,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				cancel(nil)
 				return
 			}
+			resetIdle()
 			writeChunk(chunk)
 			flusher.Flush()
 		case errMsg, ok := <-errs:
@@ -116,6 +152,20 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 		case <-keepAliveC:
 			writeKeepAlive()
 			flusher.Flush()
+		case <-idleC:
+			if opts.OnIdle != nil {
+				opts.OnIdle(idleTimeout)
+			}
+			errMsg := &interfaces.ErrorMessage{
+				StatusCode: http.StatusGatewayTimeout,
+				Error:      ErrStreamIdleTimeout,
+			}
+			if opts.WriteTerminalError != nil {
+				opts.WriteTerminalError(errMsg)
+				flusher.Flush()
+			}
+			cancel(ErrStreamIdleTimeout)
+			return
 		}
 	}
 }

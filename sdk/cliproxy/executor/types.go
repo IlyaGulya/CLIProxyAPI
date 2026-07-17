@@ -31,6 +31,11 @@ const ServiceTierMetadataKey = "service_tier"
 // Missing or true means generation is enabled; only an explicit false disables generation.
 const GenerateMetadataKey = "generate"
 
+// StreamBootstrapIdleTimeoutMetadataKey bounds waiting for the first non-empty
+// upstream stream chunk. Its value is a time.Duration. It is a transport hint
+// and must never be forwarded to providers.
+const StreamBootstrapIdleTimeoutMetadataKey = "stream_bootstrap_idle_timeout"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

@@ -447,6 +447,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	cliCtx, _ = h.codexUpstreamWebsocketContext(cliCtx, rawJSON, c.Request.Header)
 
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	idleTimeout := handlers.StreamingIdleTimeout(h.Cfg)
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -454,7 +455,16 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	// Peek at the first chunk to determine success or failure before setting headers
+	// Peek at the first chunk to determine success or failure before setting headers.
+	// This boundary needs its own watchdog because ForwardStream starts only after
+	// the first upstream payload has committed the downstream response.
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if idleTimeout > 0 {
+		idleTimer = time.NewTimer(idleTimeout)
+		defer idleTimer.Stop()
+		idleC = idleTimer.C
+	}
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -466,6 +476,13 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				errChan = nil
 				continue
 			}
+			if isClaudeStreamIdleError(errMsg) {
+				observability.RecordWebsocketMetric(c.Request.Context(), "stream_idle_timeout", "", "", map[string]any{
+					"boundary":             "before_downstream_commit",
+					"downstream_committed": false,
+					"duration_us":          idleTimeout.Microseconds(),
+				}, false)
+			}
 			// Upstream failed immediately. Return proper error status and JSON.
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
@@ -473,6 +490,16 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			} else {
 				cliCancel(nil)
 			}
+			return
+		case <-idleC:
+			observability.RecordWebsocketMetric(c.Request.Context(), "stream_idle_timeout", "", "", map[string]any{
+				"boundary":             "before_downstream_commit",
+				"downstream_committed": false,
+				"duration_us":          idleTimeout.Microseconds(),
+			}, false)
+			errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusGatewayTimeout, Error: handlers.ErrStreamIdleTimeout}
+			h.WriteErrorResponse(c, errMsg)
+			cliCancel(handlers.ErrStreamIdleTimeout)
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
@@ -515,6 +542,17 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	}
 }
 
+func isClaudeStreamIdleError(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	if errors.Is(errMsg.Error, handlers.ErrStreamIdleTimeout) {
+		return true
+	}
+	var coded interface{ ErrorCode() string }
+	return errors.As(errMsg.Error, &coded) && coded.ErrorCode() == "stream_idle_timeout"
+}
+
 func (h *ClaudeCodeAPIHandler) codexUpstreamWebsocketContext(ctx context.Context, rawJSON []byte, headers http.Header) (context.Context, string) {
 	if h == nil || h.Cfg == nil || !h.Cfg.CodexPreferUpstreamWebsockets {
 		return ctx, ""
@@ -545,6 +583,13 @@ func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces
 
 func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		OnIdle: func(timeout time.Duration) {
+			observability.RecordWebsocketMetric(c.Request.Context(), "stream_idle_timeout", "", "", map[string]any{
+				"boundary":             "after_downstream_commit",
+				"downstream_committed": true,
+				"duration_us":          timeout.Microseconds(),
+			}, false)
+		},
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return
