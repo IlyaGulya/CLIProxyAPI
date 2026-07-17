@@ -793,6 +793,64 @@ func TestCodexAutoExecutorFallsBackToHTTPWhenWebsocketUnsupported(t *testing.T) 
 	}
 }
 
+func TestCodexAutoExecutorCircuitSuppressesFailingRoute(t *testing.T) {
+	var websocketAttempts atomic.Int32
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			websocketAttempts.Add(1)
+			http.Error(w, "websocket unavailable", http.StatusUpgradeRequired)
+			return
+		}
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-http","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{
+		DisableImageGeneration:                config.DisableImageGenerationAll,
+		CodexWebsocketCircuitBreaker:          true,
+		CodexWebsocketCircuitFailureThreshold: 2,
+		CodexWebsocketCircuitCooldownSeconds:  60,
+	}})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{
+		"api_key": "sk-test", "base_url": server.URL, "websockets": "true",
+	}}
+	req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"hello"}]}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+	ctx := cliproxyexecutor.WithPreferUpstreamWebsocket(context.Background())
+	for range 3 {
+		result, errExecute := exec.ExecuteStream(ctx, auth, req, opts)
+		if errExecute != nil {
+			t.Fatal(errExecute)
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+		}
+	}
+	if got := websocketAttempts.Load(); got != 2 {
+		t.Fatalf("websocket attempts = %d, want 2 before circuit suppression", got)
+	}
+	if got := httpRequests.Load(); got != 3 {
+		t.Fatalf("http requests = %d, want 3", got)
+	}
+
+	authOther := *auth
+	authOther.ID = "auth-b"
+	result, errExecute := exec.ExecuteStream(ctx, &authOther, req, opts)
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	for range result.Chunks {
+	}
+	if got := websocketAttempts.Load(); got != 3 {
+		t.Fatalf("other route websocket attempts = %d, want 3", got)
+	}
+}
+
 func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsocket(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	errorPayload := []byte(`{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached","message":"too many websockets"}}`)

@@ -113,6 +113,16 @@
           "legendFormat": "{{model}} {{chain_source}} {{incremental_reset_reason}}"
         }],
         "gridPos": {"x": 0, "y": 42, "w": 24, "h": 8}
+      },
+      {
+        "id": 12, "type": "timeseries", "title": "WebSocket circuit decisions",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "sum by (event_name, model, finish_reason, suppression_reason) (increase(claudex_proxy_events_total{event_name=~\"circuit_(failure|success|suppressed|probe)\",model=~\"$model\"}[6h]))",
+          "legendFormat": "{{model}} {{event_name}} {{finish_reason}} {{suppression_reason}}"
+        }],
+        "gridPos": {"x": 0, "y": 50, "w": 24, "h": 8}
       }
     ]
   },

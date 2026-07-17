@@ -439,6 +439,7 @@ func TestProvisionGrafanaDashboardUsesStableUIDAndNoSecrets(t *testing.T) {
 		"claudex-next-overview", "claudex.run_id", "claudex_proxy", "tempo", "prometheus", "loki",
 		"Mid-response WebSocket failures", "transport_close_code", "stream_last_event_type",
 		"tool_call_in_progress", "downstream_committed", "connection_age",
+		"WebSocket circuit decisions", "circuit_(failure|success|suppressed|probe)",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)

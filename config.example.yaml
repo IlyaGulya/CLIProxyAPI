@@ -210,6 +210,11 @@ codex-websocket-preconnect-replenish: false
 codex-websocket-preconnect-max-idle: 2
 # How long an unused speculative connection remains available; <= 0 uses 30 seconds.
 codex-websocket-preconnect-ttl-seconds: 30
+# Route-scoped websocket failure circuit breaker. Keep disabled until the
+# candidate transport has been observed in your environment.
+codex-websocket-circuit-breaker: false
+codex-websocket-circuit-failure-threshold: 3
+codex-websocket-circuit-cooldown-seconds: 30
 
 # Reroute only Claude Code auto-mode safety classifier requests that match its
 # narrow internal payload signature. Empty disables rewriting. claudex-next

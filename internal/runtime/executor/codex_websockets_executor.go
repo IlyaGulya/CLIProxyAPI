@@ -57,6 +57,7 @@ func codexWebsocketIdleTimeout(cfg *config.Config) time.Duration {
 // not available over WebSocket (e.g. /responses/compact) and for websocket upgrade failures.
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
+	circuit *codexWebsocketCircuit
 
 	sessions      *codexWebsocketSessionManager
 	draining      bool
@@ -343,6 +344,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if shouldFallbackCodexWebsocketHandshake(ctx, respHS) {
+			e.recordCircuitFailure(ctx, auth, req.Model, "handshake_rejected")
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -463,6 +465,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, clientPayload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
+			e.recordCircuitSuccess(ctx, auth, req.Model)
 			return resp, nil
 		}
 	}
@@ -601,6 +604,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if shouldFallbackCodexWebsocketHandshake(ctx, respHS) {
+			e.recordCircuitFailure(ctx, auth, req.Model, "handshake_rejected")
 			if sess != nil {
 				if shouldPersistCodexWebsocketFallback(respHS) {
 					sess.activateCodexHTTPFallback()
@@ -640,6 +644,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		Success: observability.Some(errSend == nil),
 	}, nil)
 	if errSend != nil {
+		e.recordCircuitFailure(ctx, auth, req.Model, "send_error")
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
@@ -715,6 +720,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 		defer close(out)
 		defer func() {
+			if terminateReason == "completed" {
+				e.recordCircuitSuccess(ctx, auth, req.Model)
+			} else if terminateReason == "read_error" || terminateReason == "unexpected_binary" {
+				e.recordCircuitFailure(ctx, auth, req.Model, terminateReason)
+			}
 			if sess != nil {
 				connectionAge, connectionRequestCount = sess.connectionObservation(conn)
 			}
@@ -2556,13 +2566,22 @@ func (e *CodexWebsocketsExecutor) CloseAuthExecutionSessions(authID string, reas
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
+	circuit  *codexWebsocketCircuit
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
-	return &CodexAutoExecutor{
+	auto := &CodexAutoExecutor{
 		httpExec: NewCodexExecutor(cfg),
 		wsExec:   NewCodexWebsocketsExecutor(cfg),
 	}
+	if cfg != nil && cfg.CodexWebsocketCircuitBreaker {
+		auto.circuit = newCodexWebsocketCircuit(codexWebsocketCircuitConfig{
+			failureThreshold: cfg.CodexWebsocketCircuitFailureThreshold,
+			cooldown:         time.Duration(cfg.CodexWebsocketCircuitCooldownSeconds) * time.Second,
+		})
+		auto.wsExec.circuit = auto.circuit
+	}
+	return auto
 }
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
@@ -2586,6 +2605,9 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
 	if codexShouldUseWebsockets(ctx, auth) {
+		if !e.allowWebsocketRoute(ctx, auth, req.Model) {
+			return e.httpExec.Execute(ctx, auth, req, opts)
+		}
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
@@ -2596,9 +2618,58 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
 	if codexShouldUseWebsockets(ctx, auth) {
+		if !e.allowWebsocketRoute(ctx, auth, req.Model) {
+			return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+		}
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+}
+
+func codexCircuitRoute(auth *cliproxyauth.Auth, model string) codexWebsocketRoute {
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	return codexWebsocketRoute{provider: "codex", authID: authID, model: model}
+}
+
+func (e *CodexAutoExecutor) allowWebsocketRoute(ctx context.Context, auth *cliproxyauth.Auth, model string) bool {
+	if e == nil || e.circuit == nil {
+		return true
+	}
+	decision := e.circuit.allow(codexCircuitRoute(auth, model))
+	if !decision.allowed {
+		helps.RecordAPIWebsocketEvent(ctx, e.httpExec.cfg, "circuit_suppressed", observability.WebsocketAttributes{
+			Model: model, Reason: decision.state.String(), SuppressionReason: "route_circuit_open",
+			AgeUS: observability.Some(decision.cooldownRemaining.Microseconds()),
+		}, nil)
+	} else if decision.state == circuitHalfOpen {
+		helps.RecordAPIWebsocketEvent(ctx, e.httpExec.cfg, "circuit_probe", observability.WebsocketAttributes{
+			Model: model, Reason: decision.state.String(),
+		}, nil)
+	}
+	return decision.allowed
+}
+
+func (e *CodexWebsocketsExecutor) recordCircuitFailure(ctx context.Context, auth *cliproxyauth.Auth, model, reason string) {
+	if e == nil || e.circuit == nil {
+		return
+	}
+	e.circuit.failure(codexCircuitRoute(auth, model), reason)
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "circuit_failure", observability.WebsocketAttributes{
+		Model: model, Reason: reason, Success: observability.Some(false),
+	}, nil)
+}
+
+func (e *CodexWebsocketsExecutor) recordCircuitSuccess(ctx context.Context, auth *cliproxyauth.Auth, model string) {
+	if e == nil || e.circuit == nil {
+		return
+	}
+	e.circuit.success(codexCircuitRoute(auth, model))
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "circuit_success", observability.WebsocketAttributes{
+		Model: model, Success: observability.Some(true),
+	}, nil)
 }
 
 func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

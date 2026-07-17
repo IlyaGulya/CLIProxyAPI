@@ -77,6 +77,18 @@ type SDKConfig struct {
 	// websocket may remain idle. Values <= 0 use the default (30 seconds).
 	CodexWebsocketPreconnectTTLSeconds int `yaml:"codex-websocket-preconnect-ttl-seconds,omitempty" json:"codex-websocket-preconnect-ttl-seconds,omitempty"`
 
+	// CodexWebsocketCircuitBreaker enables route-scoped suppression of repeatedly
+	// failing upstream websocket attempts. Disabled by default during rollout.
+	CodexWebsocketCircuitBreaker bool `yaml:"codex-websocket-circuit-breaker" json:"codex-websocket-circuit-breaker"`
+
+	// CodexWebsocketCircuitFailureThreshold opens a route circuit after this many
+	// consecutive transport failures. Values <= 0 use the default (3).
+	CodexWebsocketCircuitFailureThreshold int `yaml:"codex-websocket-circuit-failure-threshold,omitempty" json:"codex-websocket-circuit-failure-threshold,omitempty"`
+
+	// CodexWebsocketCircuitCooldownSeconds controls when a single half-open probe
+	// may retry an open route. Values <= 0 use the default (30 seconds).
+	CodexWebsocketCircuitCooldownSeconds int `yaml:"codex-websocket-circuit-cooldown-seconds,omitempty" json:"codex-websocket-circuit-cooldown-seconds,omitempty"`
+
 	// ClaudeCodeAutoModeClassifierModel reroutes Claude Code's internal auto-mode
 	// safety classifier requests to the configured model. Empty disables rewriting.
 	// Only requests matching the classifier's narrow payload signature are changed.
