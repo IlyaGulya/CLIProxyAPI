@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1295,17 +1294,10 @@ func canonicalCodexPrefixJSON(path string, raw json.RawMessage) []byte {
 		return nil
 	}
 	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
 		return raw
-	}
-	if path == "tools" {
-		if tools, ok := value.([]any); ok {
-			sort.SliceStable(tools, func(i, j int) bool {
-				left, _ := tools[i].(map[string]any)
-				right, _ := tools[j].(map[string]any)
-				return fmt.Sprint(left["type"], "\x00", left["name"]) < fmt.Sprint(right["type"], "\x00", right["name"])
-			})
-		}
 	}
 	canonical, err := json.Marshal(value)
 	if err != nil {
@@ -1322,15 +1314,10 @@ func canonicalizeCodexCacheableRequest(body []byte) []byte {
 		return body
 	}
 	var request map[string]any
-	if err := json.Unmarshal(body, &request); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&request); err != nil {
 		return body
-	}
-	if tools, ok := request["tools"].([]any); ok {
-		sort.SliceStable(tools, func(i, j int) bool {
-			left, _ := tools[i].(map[string]any)
-			right, _ := tools[j].(map[string]any)
-			return fmt.Sprint(left["type"], "\x00", left["name"]) < fmt.Sprint(right["type"], "\x00", right["name"])
-		})
 	}
 	canonical, err := json.Marshal(request)
 	if err != nil {
@@ -1538,7 +1525,7 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, req.Model, authID, req.Payload, nil)
+		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, "codex", req.Model, authID, req.Payload, nil)
 		if errCache != nil {
 			return nil, nil, errCache
 		}

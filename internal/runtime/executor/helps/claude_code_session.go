@@ -104,22 +104,22 @@ func extractClaudeCodeSessionIDFromPayload(payload []byte) string {
 
 // ClaudeCodePromptCache maps a Claude Code session to a stable upstream prompt_cache_key.
 func ClaudeCodePromptCache(ctx context.Context, modelName string, payload []byte, headers http.Header) (CodexCache, bool, error) {
-	return ClaudeCodePromptCacheForAuth(ctx, modelName, "", payload, headers)
+	return ClaudeCodePromptCacheForAuth(ctx, "codex", modelName, "", payload, headers)
 }
 
 // ClaudeCodePromptCacheForAuth maps a Claude Code root/model/auth scope to a
 // stable upstream prompt_cache_key. Auth isolation prevents cache identity
 // from crossing credentials when the scheduler routes equivalent sessions.
-func ClaudeCodePromptCacheForAuth(ctx context.Context, modelName string, authID string, payload []byte, headers http.Header) (CodexCache, bool, error) {
+func ClaudeCodePromptCacheForAuth(ctx context.Context, provider, modelName, authID string, payload []byte, headers http.Header) (CodexCache, bool, error) {
 	sessionID := ExtractClaudeCodeSessionID(ctx, payload, headers)
 	if sessionID == "" {
 		return CodexCache{}, false, nil
 	}
-	key := CodexPromptCacheKey(modelName, "claude:"+strings.TrimSpace(authID)+":"+sessionID)
+	key := CodexPromptCacheKey(modelName, "claude:"+strings.TrimSpace(provider)+":"+strings.TrimSpace(authID)+":"+sessionID)
 	if cache, ok, errCache := GetCodexCacheRequired(ctx, key); errCache != nil || ok {
 		return cache, ok, errCache
 	}
-	cache := CodexCache{ID: ClaudeCodePromptCacheID(modelName, authID, sessionID), Expire: time.Now().Add(time.Hour)}
+	cache := CodexCache{ID: ClaudeCodePromptCacheID(provider, modelName, authID, sessionID), Expire: time.Now().Add(time.Hour)}
 	if errSet := SetCodexCacheRequired(ctx, key, cache); errSet != nil {
 		return CodexCache{}, false, errSet
 	}
@@ -128,7 +128,7 @@ func ClaudeCodePromptCacheForAuth(ctx context.Context, modelName string, authID 
 
 // ClaudeCodePromptCacheID is stable across proxy processes while remaining
 // opaque and isolated by upstream model, credential, and Claude session.
-func ClaudeCodePromptCacheID(modelName, authID, sessionID string) string {
-	identity := strings.TrimSpace(modelName) + "\x00" + strings.TrimSpace(authID) + "\x00" + strings.TrimSpace(sessionID)
+func ClaudeCodePromptCacheID(provider, modelName, authID, sessionID string) string {
+	identity := strings.TrimSpace(provider) + "\x00" + strings.TrimSpace(modelName) + "\x00" + strings.TrimSpace(authID) + "\x00" + strings.TrimSpace(sessionID)
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:claude-prompt-cache\x00"+identity)).String()
 }

@@ -19,18 +19,19 @@ func TestExtractClaudeCodeSessionIDFromPayloadJSON(t *testing.T) {
 }
 
 func TestClaudeCodePromptCacheIDDeterministicWithoutStore(t *testing.T) {
-	first := ClaudeCodePromptCacheID(" gpt-5.6-luna ", " auth-a ", "session-a")
-	second := ClaudeCodePromptCacheID("gpt-5.6-luna", "auth-a", "session-a")
+	first := ClaudeCodePromptCacheID(" codex ", " gpt-5.6-luna ", " auth-a ", "session-a")
+	second := ClaudeCodePromptCacheID("codex", "gpt-5.6-luna", "auth-a", "session-a")
 	if first == "" || first != second {
 		t.Fatalf("deterministic cache ID mismatch: first=%q second=%q", first, second)
 	}
 	if strings.Contains(first, "auth-a") || strings.Contains(first, "session-a") || strings.Contains(first, "gpt-5.6-luna") {
 		t.Fatalf("cache ID leaked raw identity: %q", first)
 	}
-	if first == ClaudeCodePromptCacheID("gpt-5.6-luna", "auth-b", "session-a") ||
-		first == ClaudeCodePromptCacheID("gpt-5.6-sol", "auth-a", "session-a") ||
-		first == ClaudeCodePromptCacheID("gpt-5.6-luna", "auth-a", "session-b") {
-		t.Fatalf("cache ID did not isolate model/auth/session: %q", first)
+	if first == ClaudeCodePromptCacheID("codex", "gpt-5.6-luna", "auth-b", "session-a") ||
+		first == ClaudeCodePromptCacheID("codex", "gpt-5.6-sol", "auth-a", "session-a") ||
+		first == ClaudeCodePromptCacheID("codex", "gpt-5.6-luna", "auth-a", "session-b") ||
+		first == ClaudeCodePromptCacheID("openai", "gpt-5.6-luna", "auth-a", "session-a") {
+		t.Fatalf("cache ID did not isolate provider/model/auth/session: %q", first)
 	}
 }
 
@@ -69,13 +70,13 @@ func TestClaudeCodePromptCacheStableAcrossRequests(t *testing.T) {
 func TestClaudeCodePromptCacheIsolatesAuthAndModel(t *testing.T) {
 	ctx := context.Background()
 	payload := []byte(`{"metadata":{"user_id":"{\"session_id\":\"cache-isolation-session\"}"}}`)
-	base, ok, errBase := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-luna", "auth-a", payload, nil)
+	base, ok, errBase := ClaudeCodePromptCacheForAuth(ctx, "codex", "gpt-5.6-luna", "auth-a", payload, nil)
 	if errBase != nil || !ok || base.ID == "" {
 		t.Fatalf("base cache = %#v, ok=%v, err=%v", base, ok, errBase)
 	}
-	same, _, _ := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-luna", "auth-a", payload, nil)
-	otherAuth, _, _ := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-luna", "auth-b", payload, nil)
-	otherModel, _, _ := ClaudeCodePromptCacheForAuth(ctx, "gpt-5.6-sol", "auth-a", payload, nil)
+	same, _, _ := ClaudeCodePromptCacheForAuth(ctx, "codex", "gpt-5.6-luna", "auth-a", payload, nil)
+	otherAuth, _, _ := ClaudeCodePromptCacheForAuth(ctx, "codex", "gpt-5.6-luna", "auth-b", payload, nil)
+	otherModel, _, _ := ClaudeCodePromptCacheForAuth(ctx, "codex", "gpt-5.6-sol", "auth-a", payload, nil)
 	if same.ID != base.ID {
 		t.Fatalf("same auth/model cache ID = %q, want %q", same.ID, base.ID)
 	}

@@ -1456,7 +1456,7 @@ func TestCodexPromptCacheMetricFieldsTrackStablePrefixWithoutRawKey(t *testing.T
 
 func TestCodexPromptCacheMetricFieldsCanonicalizeEquivalentJSON(t *testing.T) {
 	first := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"key","tools":[{"name":"B","type":"function","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}}},{"type":"function","name":"A","parameters":{"required":["x"],"type":"object"}}],"reasoning":{"summary":"auto","effort":"high"},"input":[]}`)
-	second := []byte(`{"reasoning":{"effort":"high","summary":"auto"},"tools":[{"parameters":{"type":"object","required":["x"]},"name":"A","type":"function"},{"parameters":{"properties":{"a":{"type":"number"},"z":{"type":"string"}},"type":"object"},"name":"B","type":"function"}],"prompt_cache_key":"key","model":"gpt-5.6-luna","input":[]}`)
+	second := []byte(`{"reasoning":{"effort":"high","summary":"auto"},"tools":[{"parameters":{"properties":{"a":{"type":"number"},"z":{"type":"string"}},"type":"object"},"type":"function","name":"B"},{"parameters":{"type":"object","required":["x"]},"name":"A","type":"function"}],"prompt_cache_key":"key","model":"gpt-5.6-luna","input":[]}`)
 	firstFields := codexPromptCacheMetricFields(first)
 	secondFields := codexPromptCacheMetricFields(second)
 	if firstFields["prompt_prefix_fingerprint"] != secondFields["prompt_prefix_fingerprint"] {
@@ -1464,11 +1464,30 @@ func TestCodexPromptCacheMetricFieldsCanonicalizeEquivalentJSON(t *testing.T) {
 	}
 }
 
+func TestCodexPromptCacheMetricFieldsPreserveToolOrder(t *testing.T) {
+	first := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"key","tools":[{"name":"A","type":"function"},{"name":"B","type":"function"}],"input":[]}`)
+	second := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"key","tools":[{"name":"B","type":"function"},{"name":"A","type":"function"}],"input":[]}`)
+	if got, want := codexPromptCacheMetricFields(first)["prompt_prefix_fingerprint"], codexPromptCacheMetricFields(second)["prompt_prefix_fingerprint"]; got == want {
+		t.Fatalf("tool order was erased from fingerprint: %q", got)
+	}
+}
+
 func TestCanonicalizeCodexCacheableRequestMakesEquivalentToolPrefixesByteStable(t *testing.T) {
 	first := []byte(`{"model":"gpt-5.6-luna","tools":[{"name":"B","type":"function","parameters":{"properties":{"z":{"type":"string"},"a":{"type":"number"}},"type":"object"}},{"name":"A","type":"function"}],"input":[{"role":"user","content":"one"}]}`)
-	second := []byte(`{"input":[{"content":"one","role":"user"}],"tools":[{"type":"function","name":"A"},{"parameters":{"type":"object","properties":{"a":{"type":"number"},"z":{"type":"string"}}},"type":"function","name":"B"}],"model":"gpt-5.6-luna"}`)
+	second := []byte(`{"input":[{"content":"one","role":"user"}],"tools":[{"parameters":{"type":"object","properties":{"a":{"type":"number"},"z":{"type":"string"}}},"type":"function","name":"B"},{"type":"function","name":"A"}],"model":"gpt-5.6-luna"}`)
 	if got, want := string(canonicalizeCodexCacheableRequest(first)), string(canonicalizeCodexCacheableRequest(second)); got != want {
 		t.Fatalf("canonical requests differ:\nfirst:  %s\nsecond: %s", got, want)
+	}
+}
+
+func TestCanonicalizeCodexCacheableRequestPreservesToolOrderAndLargeIntegers(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"B","type":"function","parameters":{"maximum":9007199254740993}},{"name":"A","type":"function"}],"input":[]}`)
+	canonical := canonicalizeCodexCacheableRequest(body)
+	if got := gjson.GetBytes(canonical, "tools.0.name").String(); got != "B" {
+		t.Fatalf("first tool = %q, want B", got)
+	}
+	if got := gjson.GetBytes(canonical, "tools.0.parameters.maximum").Raw; got != "9007199254740993" {
+		t.Fatalf("large integer = %q, want exact value", got)
 	}
 }
 

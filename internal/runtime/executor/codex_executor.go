@@ -1523,7 +1523,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		if auth != nil {
 			authID = auth.ID
 		}
-		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, req.Model, authID, req.Payload, nil)
+		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, "codex", req.Model, authID, req.Payload, nil)
 		if errCache != nil {
 			return nil, nil, codexIdentityConfuseState{}, errCache
 		}
