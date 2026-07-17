@@ -50,7 +50,7 @@ func TestExtractClaudeCodeSessionIDFromHeader(t *testing.T) {
 
 func TestClaudeCodePromptCacheStableAcrossRequests(t *testing.T) {
 	ctx := context.Background()
-	payload := []byte(`{"metadata":{"user_id":"{\"session_id\":\"cache-session-2\"}"}}`)
+	payload := []byte(`{"cache_control":{"type":"automatic"},"metadata":{"user_id":"{\"session_id\":\"cache-session-2\"}"},"messages":[{"role":"user","content":"hi"}]}`)
 	first, ok, err := ClaudeCodePromptCache(ctx, "grok-composer-2.5-fast", payload, nil)
 	if err != nil {
 		t.Fatalf("ClaudeCodePromptCache first error: %v", err)
@@ -69,7 +69,7 @@ func TestClaudeCodePromptCacheStableAcrossRequests(t *testing.T) {
 
 func TestClaudeCodePromptCacheIsolatesAuthAndModel(t *testing.T) {
 	ctx := context.Background()
-	payload := []byte(`{"metadata":{"user_id":"{\"session_id\":\"cache-isolation-session\"}"}}`)
+	payload := []byte(`{"cache_control":{"type":"automatic"},"metadata":{"user_id":"{\"session_id\":\"cache-isolation-session\"}"},"messages":[{"role":"user","content":"hi"}]}`)
 	base, ok, errBase := ClaudeCodePromptCacheForAuth(ctx, "codex", "gpt-5.6-luna", "auth-a", payload, nil)
 	if errBase != nil || !ok || base.ID == "" {
 		t.Fatalf("base cache = %#v, ok=%v, err=%v", base, ok, errBase)

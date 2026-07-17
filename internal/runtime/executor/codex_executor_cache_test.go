@@ -79,6 +79,7 @@ func TestCodexExecutorCacheHelper_ClaudeUsesClaudeCodeSessionID(t *testing.T) {
 		Model: "gpt-5.4-claude-cache-session",
 		Payload: []byte(`{
 			"model":"gpt-5.4",
+			"cache_control":{"type":"automatic"},
 			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"cache-session-1\"}"},
 			"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]
 		}`),
@@ -87,6 +88,7 @@ func TestCodexExecutorCacheHelper_ClaudeUsesClaudeCodeSessionID(t *testing.T) {
 		Model: "gpt-5.4-claude-cache-session",
 		Payload: []byte(`{
 			"model":"gpt-5.4",
+			"cache_control":{"type":"automatic"},
 			"metadata":{"user_id":"{\"device_id\":\"device-b\",\"account_uuid\":\"\",\"session_id\":\"cache-session-1\"}"},
 			"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]
 		}`),
@@ -272,11 +274,11 @@ func TestCodexExecutorCacheHelper_ClaudeUsesSessionHeader(t *testing.T) {
 
 	firstReq := cliproxyexecutor.Request{
 		Model:   "gpt-5.4-claude-cache-header",
-		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]}`),
+		Payload: []byte(`{"model":"gpt-5.4","cache_control":{"type":"automatic"},"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]}`),
 	}
 	secondReq := cliproxyexecutor.Request{
 		Model:   "gpt-5.4-claude-cache-header",
-		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]}`),
+		Payload: []byte(`{"model":"gpt-5.4","cache_control":{"type":"automatic"},"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]}`),
 	}
 	rawJSON := []byte(`{"model":"gpt-5.4","stream":true}`)
 	url := "https://example.com/responses"

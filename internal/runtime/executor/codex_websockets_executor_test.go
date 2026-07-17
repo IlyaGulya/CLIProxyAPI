@@ -1370,6 +1370,7 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	firstReq := cliproxyexecutor.Request{
 		Model: "gpt-5-codex-claude-ws-cache-session",
 		Payload: []byte(`{
+			"cache_control":{"type":"automatic"},
 			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"ws-cache-session-1\"}"},
 			"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]
 		}`),
@@ -1377,6 +1378,7 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	secondReq := cliproxyexecutor.Request{
 		Model: "gpt-5-codex-claude-ws-cache-session",
 		Payload: []byte(`{
+			"cache_control":{"type":"automatic"},
 			"metadata":{"user_id":"{\"device_id\":\"device-b\",\"account_uuid\":\"\",\"session_id\":\"ws-cache-session-1\"}"},
 			"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]
 		}`),

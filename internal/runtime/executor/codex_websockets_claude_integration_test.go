@@ -100,8 +100,8 @@ func TestClaudeCodexWebsocketRestartHelper(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "auth-restart", Attributes: map[string]string{"api_key": "sk-test", "base_url": os.Getenv("CLIPROXY_RESTART_URL")}}
 	sessionID := "claude-code:restart-e2e"
 	payloads := [][]byte{
-		[]byte(`{"model":"gpt-5.6-sol","metadata":{"user_id":"{\"session_id\":\"restart-cache-session\"}"},"messages":[{"role":"user","content":"question one"}],"stream":true}`),
-		[]byte(`{"model":"gpt-5.6-sol","metadata":{"user_id":"{\"session_id\":\"restart-cache-session\"}"},"messages":[{"role":"user","content":"question one"},{"role":"assistant","content":"answer one"},{"role":"user","content":"question two"}],"stream":true}`),
+		[]byte(`{"model":"gpt-5.6-sol","cache_control":{"type":"automatic"},"metadata":{"user_id":"{\"session_id\":\"restart-cache-session\"}"},"messages":[{"role":"user","content":"question one"}],"stream":true}`),
+		[]byte(`{"model":"gpt-5.6-sol","cache_control":{"type":"automatic"},"metadata":{"user_id":"{\"session_id\":\"restart-cache-session\"}"},"messages":[{"role":"user","content":"question one"},{"role":"assistant","content":"answer one"},{"role":"user","content":"question two"}],"stream":true}`),
 	}
 	for _, payload := range payloads {
 		result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload, Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}})

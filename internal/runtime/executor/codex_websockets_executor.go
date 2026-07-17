@@ -529,6 +529,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		requestBody, incrementalObservation = sess.prepareCodexIncrementalRequestObserved(clientBody)
 	}
 	cacheMetricFields := codexPromptCacheMetricFields(requestBody)
+	cacheEnabled, cacheTTL, cacheDecision := helps.ClaudePromptCacheDecision(originalPayloadSource)
 	chainSource := "full_replay"
 	if incrementalObservation.incremental {
 		chainSource = "incremental"
@@ -540,6 +541,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		IncrementalResetReason: incrementalObservation.resetReason, ChainSource: chainSource, FreshResponseChain: observability.Some(!incrementalObservation.incremental),
 		Overflow: observability.Some(sessionOverflow), HasPreviousResponse: observability.Some(strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != ""),
 		PromptCacheScope: cacheMetricFields.scope, PromptPrefixFingerprint: cacheMetricFields.prefixFingerprint,
+		PromptCacheEnabled: observability.Some(cacheEnabled), PromptCacheTTL: cacheTTL, PromptCacheDecision: cacheDecision,
 		InstructionsBytes: observability.Some(cacheMetricFields.instructionsBytes), ToolsCount: observability.Some(cacheMetricFields.toolsCount),
 	}, nil)
 	var identityState codexIdentityConfuseState
@@ -1407,6 +1409,9 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
 		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, "codex", req.Model, authID, req.Payload, nil)
 		if errCache != nil {
+			if helps.IsClaudePromptCachePolicyError(errCache) {
+				return nil, nil, statusErr{code: http.StatusBadRequest, msg: errCache.Error()}
+			}
 			return nil, nil, errCache
 		}
 		if ok {

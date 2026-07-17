@@ -1537,6 +1537,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		}
 		cached, ok, errCache := helps.ClaudeCodePromptCacheForAuth(ctx, "codex", req.Model, authID, req.Payload, nil)
 		if errCache != nil {
+			if helps.IsClaudePromptCachePolicyError(errCache) {
+				return nil, nil, codexIdentityConfuseState{}, statusErr{code: http.StatusBadRequest, msg: errCache.Error()}
+			}
 			return nil, nil, codexIdentityConfuseState{}, errCache
 		}
 		if ok {

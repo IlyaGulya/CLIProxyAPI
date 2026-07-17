@@ -2852,7 +2852,7 @@ func TestXAIExecutorComposerReusesClaudeCodeSession(t *testing.T) {
 		Provider: "xai",
 		Metadata: map[string]any{"access_token": "xai-token"},
 	}
-	payload := []byte(`{"model":"grok-composer-2.5-fast","metadata":{"user_id":"{\"session_id\":\"cache-session-1\"}"},"input":"hello"}`)
+	payload := []byte(`{"model":"grok-composer-2.5-fast","cache_control":{"type":"automatic"},"metadata":{"user_id":"{\"session_id\":\"cache-session-1\"}"},"messages":[{"role":"user","content":"hello"}]}`)
 	req := cliproxyexecutor.Request{Model: "grok-composer-2.5-fast", Payload: payload}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: true}
 

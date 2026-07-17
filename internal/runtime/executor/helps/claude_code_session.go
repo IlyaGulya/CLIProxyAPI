@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -17,6 +18,19 @@ const ClaudeCodeAgentHeader = "X-Claude-Code-Agent-Id"
 const ClaudeCodeWebsocketSessionPrefix = "claude-code:"
 
 var claudeCodeSessionSuffixPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
+
+type ClaudePromptCachePolicyError struct{ message string }
+
+func (e ClaudePromptCachePolicyError) Error() string { return e.message }
+
+func IsClaudePromptCachePolicyError(err error) bool {
+	_, ok := err.(ClaudePromptCachePolicyError)
+	return ok
+}
+
+func claudePromptCachePolicyError(format string, args ...any) error {
+	return ClaudePromptCachePolicyError{message: fmt.Sprintf(format, args...)}
+}
 
 // ExtractClaudeCodeSessionID resolves a Claude Code session ID, preferring X-Claude-Code-Session-Id over payload metadata.
 func ExtractClaudeCodeSessionID(ctx context.Context, payload []byte, headers http.Header) string {
@@ -107,23 +121,162 @@ func ClaudeCodePromptCache(ctx context.Context, modelName string, payload []byte
 	return ClaudeCodePromptCacheForAuth(ctx, "codex", modelName, "", payload, headers)
 }
 
+// ClaudePromptCacheDecision exposes only privacy-safe policy metadata for
+// observability; it never returns cache keys, session IDs, or prompt content.
+func ClaudePromptCacheDecision(payload []byte) (bool, string, string) {
+	enabled, ttl, err := claudePromptCachePolicy(payload)
+	if err != nil {
+		return false, "", "invalid"
+	}
+	if !enabled {
+		return false, "", "not_requested"
+	}
+	if ttl >= time.Hour {
+		return true, "1h", "requested"
+	}
+	return true, "5m", "requested"
+}
+
 // ClaudeCodePromptCacheForAuth maps a Claude Code root/model/auth scope to a
 // stable upstream prompt_cache_key. Auth isolation prevents cache identity
 // from crossing credentials when the scheduler routes equivalent sessions.
 func ClaudeCodePromptCacheForAuth(ctx context.Context, provider, modelName, authID string, payload []byte, headers http.Header) (CodexCache, bool, error) {
+	enabled, ttl, errPolicy := claudePromptCachePolicy(payload)
+	if errPolicy != nil {
+		return CodexCache{}, false, errPolicy
+	}
+	if !enabled {
+		return CodexCache{}, false, nil
+	}
 	sessionID := ExtractClaudeCodeSessionID(ctx, payload, headers)
 	if sessionID == "" {
 		return CodexCache{}, false, nil
 	}
 	key := CodexPromptCacheKey(modelName, "claude:"+strings.TrimSpace(provider)+":"+strings.TrimSpace(authID)+":"+sessionID)
-	if cache, ok, errCache := GetCodexCacheRequired(ctx, key); errCache != nil || ok {
-		return cache, ok, errCache
+	if cache, ok, errCache := GetCodexCacheRequired(ctx, key); errCache != nil {
+		return CodexCache{}, false, errCache
+	} else if ok {
+		cache.Expire = time.Now().Add(ttl)
+		if errSet := SetCodexCacheRequired(ctx, key, cache); errSet != nil {
+			return CodexCache{}, false, errSet
+		}
+		return cache, true, nil
 	}
-	cache := CodexCache{ID: ClaudeCodePromptCacheID(provider, modelName, authID, sessionID), Expire: time.Now().Add(time.Hour)}
+	cache := CodexCache{ID: ClaudeCodePromptCacheID(provider, modelName, authID, sessionID), Expire: time.Now().Add(ttl)}
 	if errSet := SetCodexCacheRequired(ctx, key, cache); errSet != nil {
 		return CodexCache{}, false, errSet
 	}
 	return cache, true, nil
+}
+
+func claudePromptCachePolicy(payload []byte) (bool, time.Duration, error) {
+	root := gjson.ParseBytes(payload)
+	top := root.Get("cache_control")
+	topEnabled := top.Exists() && top.Type != gjson.Null
+	topTTL := 5 * time.Minute
+	if topEnabled {
+		topType := strings.ToLower(strings.TrimSpace(top.Get("type").String()))
+		if topType != "ephemeral" && topType != "automatic" {
+			return false, 0, claudePromptCachePolicyError("invalid top-level cache_control type %q", topType)
+		}
+		var err error
+		topTTL, err = claudeCacheControlTTL(top)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+
+	explicitCount := 0
+	maxExplicitTTL := time.Duration(0)
+	lastEligibleControl := gjson.Result{}
+	eligibleCount := 0
+	visit := func(block gjson.Result) error {
+		eligibleCount++
+		control := block.Get("cache_control")
+		lastEligibleControl = control
+		if !control.Exists() || control.Type == gjson.Null {
+			return nil
+		}
+		explicitCount++
+		if strings.ToLower(strings.TrimSpace(control.Get("type").String())) != "ephemeral" {
+			return claudePromptCachePolicyError("invalid block cache_control type %q", control.Get("type").String())
+		}
+		ttl, err := claudeCacheControlTTL(control)
+		if err != nil {
+			return err
+		}
+		if ttl > maxExplicitTTL {
+			maxExplicitTTL = ttl
+		}
+		return nil
+	}
+	for _, tool := range root.Get("tools").Array() {
+		if err := visit(tool); err != nil {
+			return false, 0, err
+		}
+	}
+	system := root.Get("system")
+	if system.Type == gjson.String {
+		eligibleCount++
+		lastEligibleControl = gjson.Result{}
+	} else {
+		for _, block := range system.Array() {
+			if err := visit(block); err != nil {
+				return false, 0, err
+			}
+		}
+	}
+	for _, message := range root.Get("messages").Array() {
+		content := message.Get("content")
+		if content.Type == gjson.String {
+			eligibleCount++
+			lastEligibleControl = gjson.Result{}
+			continue
+		}
+		for _, block := range content.Array() {
+			switch block.Get("type").String() {
+			case "thinking", "redacted_thinking":
+				continue
+			}
+			if err := visit(block); err != nil {
+				return false, 0, err
+			}
+		}
+	}
+	if !topEnabled {
+		if explicitCount == 0 {
+			return false, 0, nil
+		}
+		return true, maxExplicitTTL, nil
+	}
+	if eligibleCount == 0 {
+		return false, 0, nil
+	}
+	if lastEligibleControl.Exists() && lastEligibleControl.Type != gjson.Null {
+		lastTTL, err := claudeCacheControlTTL(lastEligibleControl)
+		if err != nil {
+			return false, 0, err
+		}
+		if lastTTL != topTTL {
+			return false, 0, claudePromptCachePolicyError("automatic cache_control TTL conflicts with the last cacheable block")
+		}
+		return true, topTTL, nil
+	}
+	if explicitCount >= 4 {
+		return false, 0, claudePromptCachePolicyError("automatic cache_control exceeds the four-breakpoint limit")
+	}
+	return true, topTTL, nil
+}
+
+func claudeCacheControlTTL(control gjson.Result) (time.Duration, error) {
+	switch strings.ToLower(strings.TrimSpace(control.Get("ttl").String())) {
+	case "", "5m":
+		return 5 * time.Minute, nil
+	case "1h":
+		return time.Hour, nil
+	default:
+		return 0, claudePromptCachePolicyError("invalid cache_control TTL %q", control.Get("ttl").String())
+	}
 }
 
 // ClaudeCodePromptCacheID is stable across proxy processes while remaining

@@ -26,6 +26,8 @@ type WebsocketAttributes struct {
 	Trigger                 string
 	PromptCacheScope        string
 	PromptPrefixFingerprint string
+	PromptCacheTTL          string
+	PromptCacheDecision     string
 
 	Success             Optional[bool]
 	Reused              Optional[bool]
@@ -42,6 +44,7 @@ type WebsocketAttributes struct {
 	FreshResponseChain  Optional[bool]
 	HasPreviousResponse Optional[bool]
 	ResponseIDPresent   Optional[bool]
+	PromptCacheEnabled  Optional[bool]
 
 	DurationUS                 Optional[int64]
 	ElapsedUS                  Optional[int64]
@@ -93,6 +96,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 		"last_event_type": a.LastEventType, "boundary": a.Boundary, "suppression_reason": a.SuppressionReason,
 		"chain_source": a.ChainSource, "incremental_reset_reason": a.IncrementalResetReason, "trigger": a.Trigger,
 		"prompt_cache_scope": a.PromptCacheScope, "prompt_prefix_fingerprint": a.PromptPrefixFingerprint,
+		"prompt_cache_ttl": a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
 	} {
 		if value != "" {
 			fields[key] = value
@@ -113,6 +117,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 	addOptional(fields, "fresh_response_chain", a.FreshResponseChain)
 	addOptional(fields, "has_previous_response", a.HasPreviousResponse)
 	addOptional(fields, "response_id_present", a.ResponseIDPresent)
+	addOptional(fields, "prompt_cache_enabled", a.PromptCacheEnabled)
 	addOptional(fields, "duration_us", a.DurationUS)
 	addOptional(fields, "elapsed_us", a.ElapsedUS)
 	addOptional(fields, "since_send_us", a.SinceSendUS)
