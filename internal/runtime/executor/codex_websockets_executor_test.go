@@ -1491,6 +1491,32 @@ func TestCanonicalizeCodexCacheableRequestPreservesToolOrderAndLargeIntegers(t *
 	}
 }
 
+func TestPrepareWebsocketRequestSharesCanonicalPolicyAcrossModes(t *testing.T) {
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-prepare", Provider: "codex", Attributes: map[string]string{"api_key": "token", "base_url": "https://example.test/codex"}}
+	payload := []byte(`{"model":"gpt-5.6-sol","stream_options":{"include_usage":true},"input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"B","parameters":{"maximum":9007199254740993}},{"type":"function","name":"A"}]}`)
+	req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), ResponseFormat: sdktranslator.FromString("openai-response"), OriginalRequest: payload}
+
+	nonStream, errNonStream := exec.prepareWebsocketRequest(context.Background(), auth, req, opts, false)
+	stream, errStream := exec.prepareWebsocketRequest(context.Background(), auth, req, opts, true)
+	if errNonStream != nil || errStream != nil {
+		t.Fatalf("prepare errors: non-stream=%v stream=%v", errNonStream, errStream)
+	}
+	if nonStream.baseModel != stream.baseModel || nonStream.wsURL != stream.wsURL || nonStream.headers.Get("Authorization") != stream.headers.Get("Authorization") {
+		t.Fatalf("shared preparation diverged: non-stream=%#v stream=%#v", nonStream, stream)
+	}
+	if got := gjson.GetBytes(nonStream.body, "tools.0.parameters.maximum").Raw; got != "9007199254740993" {
+		t.Fatalf("non-stream large integer = %q", got)
+	}
+	if got := gjson.GetBytes(stream.body, "tools.0.name").String(); got != "B" {
+		t.Fatalf("stream tool order changed, first=%q", got)
+	}
+	if !gjson.GetBytes(nonStream.body, "stream_options").Exists() || gjson.GetBytes(stream.body, "stream_options").Exists() {
+		t.Fatalf("mode-specific stream_options policy failed: non-stream=%s stream=%s", nonStream.body, stream.body)
+	}
+}
+
 func TestCodexAutoExecutorUsesWebsocketForUpstreamPreference(t *testing.T) {
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"websockets": "true"}}
 	if codexShouldUseWebsockets(context.Background(), auth) {
