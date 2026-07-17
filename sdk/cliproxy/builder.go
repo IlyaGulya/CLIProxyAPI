@@ -270,11 +270,14 @@ func (b *Builder) Build() (*Service, error) {
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetSchedulerSelectionObserver(func(ctx context.Context, event coreauth.SchedulerSelectionObservation) {
-		observability.RecordWebsocketMetric(ctx, "scheduler_selection", "", "", map[string]any{
-			"duration_us": event.Duration.Microseconds(),
-			"model":       event.Model,
-			"success":     event.Success,
-		}, false)
+		observability.RecordWebsocketEvent(ctx, observability.WebsocketEvent{
+			Name: "scheduler_selection",
+			Fields: map[string]any{
+				"duration_us": event.Duration.Microseconds(),
+				"model":       event.Model,
+				"success":     event.Success,
+			},
+		})
 	})
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)

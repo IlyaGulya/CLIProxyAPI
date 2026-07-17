@@ -70,31 +70,43 @@ type codexWebsocketPreconnectObservation struct {
 }
 
 type codexWebsocketPreconnectPool struct {
-	mu             sync.Mutex
-	closed         bool
-	idle           map[codexWebsocketPreconnectKey][]codexWebsocketPreconnectEntry
-	dialing        int
-	dialingByKey   map[codexWebsocketPreconnectKey]int
-	changed        map[codexWebsocketPreconnectKey]chan struct{}
-	cooldown       map[codexWebsocketPreconnectKey]time.Time
-	authGeneration map[string]uint64
-	nextID         uint64
-	ctx            context.Context
-	wg             sync.WaitGroup
+	mu              sync.Mutex
+	closed          bool
+	idle            map[codexWebsocketPreconnectKey][]codexWebsocketPreconnectEntry
+	dialing         int
+	dialingByKey    map[codexWebsocketPreconnectKey]int
+	changed         map[codexWebsocketPreconnectKey]chan struct{}
+	cooldown        map[codexWebsocketPreconnectKey]time.Time
+	authGeneration  map[string]uint64
+	nextID          uint64
+	ctx             context.Context
+	wg              sync.WaitGroup
+	closeConnection func(*websocket.Conn) error
 }
 
-func newCodexWebsocketPreconnectPool(ctx context.Context) *codexWebsocketPreconnectPool {
+func newCodexWebsocketPreconnectPool(ctx context.Context, closeConnection func(*websocket.Conn) error) *codexWebsocketPreconnectPool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return &codexWebsocketPreconnectPool{
-		idle:           make(map[codexWebsocketPreconnectKey][]codexWebsocketPreconnectEntry),
-		dialingByKey:   make(map[codexWebsocketPreconnectKey]int),
-		changed:        make(map[codexWebsocketPreconnectKey]chan struct{}),
-		cooldown:       make(map[codexWebsocketPreconnectKey]time.Time),
-		authGeneration: make(map[string]uint64),
-		ctx:            ctx,
+		idle:            make(map[codexWebsocketPreconnectKey][]codexWebsocketPreconnectEntry),
+		dialingByKey:    make(map[codexWebsocketPreconnectKey]int),
+		changed:         make(map[codexWebsocketPreconnectKey]chan struct{}),
+		cooldown:        make(map[codexWebsocketPreconnectKey]time.Time),
+		authGeneration:  make(map[string]uint64),
+		ctx:             ctx,
+		closeConnection: closeConnection,
 	}
+}
+
+func (p *codexWebsocketPreconnectPool) close(conn *websocket.Conn) error {
+	if p != nil && p.closeConnection != nil {
+		return p.closeConnection(conn)
+	}
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
 }
 
 func (e *CodexWebsocketsExecutor) speculativePreconnectSettings() (bool, int, time.Duration) {
@@ -208,7 +220,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 					"duration_ms":    time.Since(warmupStartedAt).Milliseconds(),
 					"failure_reason": failureReason,
 				}).WithError(errWarmup).Debug("codex websockets: generate=false warmup failed")
-				_ = conn.Close()
+				_ = e.pool.close(conn)
 				return
 			}
 			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "generate_false_warmup_ready", rootCorrelation, executionCorrelation, map[string]any{
@@ -241,7 +253,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 				"pool_idle":    idle,
 				"pool_dialing": dialing,
 			})
-			_ = conn.Close()
+			_ = e.pool.close(conn)
 			return
 		}
 		duration := time.Since(startedAt)
@@ -374,7 +386,7 @@ func (p *codexWebsocketPreconnectPool) completeReservationObserved(key codexWebs
 		case <-timer.C:
 		}
 		if expired := p.remove(key, entry.id); expired != nil {
-			_ = expired.Close()
+			_ = p.close(expired)
 			if onExpire != nil {
 				onExpire()
 			}
@@ -473,14 +485,14 @@ func (p *codexWebsocketPreconnectPool) take(key codexWebsocketPreconnectKey, ttl
 		}
 		p.mu.Unlock()
 		for _, conn := range expired {
-			_ = conn.Close()
+			_ = p.close(conn)
 		}
 		return entry.conn, now.Sub(entry.createdAt), true
 	}
 	delete(p.idle, key)
 	p.mu.Unlock()
 	for _, conn := range expired {
-		_ = conn.Close()
+		_ = p.close(conn)
 	}
 	return nil, 0, false
 }
@@ -541,7 +553,7 @@ func (p *codexWebsocketPreconnectPool) closeAuth(authID string) {
 	}
 	p.mu.Unlock()
 	for _, conn := range conns {
-		_ = conn.Close()
+		_ = p.close(conn)
 	}
 }
 
@@ -567,7 +579,7 @@ func (p *codexWebsocketPreconnectPool) closeAll() {
 	}
 	p.mu.Unlock()
 	for _, conn := range conns {
-		_ = conn.Close()
+		_ = p.close(conn)
 	}
 }
 

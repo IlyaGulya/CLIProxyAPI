@@ -42,27 +42,28 @@ import (
 const instrumentationName = "github.com/router-for-me/CLIProxyAPI/v7"
 
 type Telemetry struct {
-	Enabled        bool
-	tracer         trace.Tracer
-	meter          metric.Meter
-	tracerProvider *sdktrace.TracerProvider
-	meterProvider  *sdkmetric.MeterProvider
-	loggerProvider *sdklog.LoggerProvider
-	logger         otellog.Logger
-	runID          string
-	events         metric.Int64Counter
-	requests       metric.Int64Counter
-	latency        metric.Float64Histogram
-	bytes          metric.Int64Counter
-	tokens         metric.Int64Counter
-	claudeRuns     metric.Int64Counter
-	claudeCost     metric.Float64Counter
-	claudeDuration metric.Float64Histogram
-	claudeTokens   metric.Int64Counter
-	activeRequests atomic.Int64
-	poolIdle       atomic.Int64
-	poolDialing    atomic.Int64
-	links          sync.Map
+	Enabled         bool
+	tracer          trace.Tracer
+	meter           metric.Meter
+	tracerProvider  *sdktrace.TracerProvider
+	meterProvider   *sdkmetric.MeterProvider
+	loggerProvider  *sdklog.LoggerProvider
+	logger          otellog.Logger
+	runID           string
+	events          metric.Int64Counter
+	requests        metric.Int64Counter
+	latency         metric.Float64Histogram
+	bytes           metric.Int64Counter
+	tokens          metric.Int64Counter
+	claudeRuns      metric.Int64Counter
+	claudeCost      metric.Float64Counter
+	claudeDuration  metric.Float64Histogram
+	claudeTokens    metric.Int64Counter
+	activeRequests  atomic.Int64
+	poolIdle        atomic.Int64
+	poolDialing     atomic.Int64
+	openConnections atomic.Int64
+	links           sync.Map
 }
 
 var current atomic.Pointer[Telemetry]
@@ -150,7 +151,10 @@ func StartService(ctx context.Context, serviceName string) (*Telemetry, error) {
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	telemetry.tracer = otel.Tracer(instrumentationName)
 	telemetry.meter = otel.Meter(instrumentationName)
-	telemetry.initInstruments()
+	if errInstruments := telemetry.initInstruments(); errInstruments != nil {
+		_ = telemetry.Shutdown(ctx)
+		return telemetry, fmt.Errorf("initialize OTEL instruments: %w", errInstruments)
+	}
 	telemetry.Enabled = telemetry.tracerProvider != nil || telemetry.meterProvider != nil || telemetry.loggerProvider != nil
 	current.Store(telemetry)
 	return telemetry, nil
@@ -213,19 +217,33 @@ func signalURL(endpoint, signal string) string {
 	return trimmed + "/v1/" + signal
 }
 
-func (t *Telemetry) initInstruments() {
+func (t *Telemetry) initInstruments() error {
 	if t.meterProvider == nil {
-		return
+		return nil
 	}
-	t.events, _ = t.meter.Int64Counter("claudex.proxy.events")
-	t.requests, _ = t.meter.Int64Counter("claudex.proxy.requests")
-	t.latency, _ = t.meter.Float64Histogram("claudex.proxy.phase.duration", metric.WithUnit("ms"))
-	t.bytes, _ = t.meter.Int64Counter("claudex.proxy.bytes", metric.WithUnit("By"))
-	t.tokens, _ = t.meter.Int64Counter("claudex.proxy.tokens", metric.WithUnit("{token}"))
-	t.claudeRuns, _ = t.meter.Int64Counter("claudex.claude.runs")
-	t.claudeCost, _ = t.meter.Float64Counter("claudex.claude.cost")
-	t.claudeDuration, _ = t.meter.Float64Histogram("claudex.claude.duration", metric.WithUnit("ms"))
-	t.claudeTokens, _ = t.meter.Int64Counter("claudex.claude.tokens", metric.WithUnit("{token}"))
+	var errs []error
+	var errInstrument error
+	t.events, errInstrument = t.meter.Int64Counter("claudex.proxy.events")
+	errs = append(errs, errInstrument)
+	t.requests, errInstrument = t.meter.Int64Counter("claudex.proxy.requests")
+	errs = append(errs, errInstrument)
+	t.latency, errInstrument = t.meter.Float64Histogram("claudex.proxy.phase.duration", metric.WithUnit("ms"))
+	errs = append(errs, errInstrument)
+	t.bytes, errInstrument = t.meter.Int64Counter("claudex.proxy.bytes", metric.WithUnit("By"))
+	errs = append(errs, errInstrument)
+	t.tokens, errInstrument = t.meter.Int64Counter("claudex.proxy.tokens", metric.WithUnit("{token}"))
+	errs = append(errs, errInstrument)
+	t.claudeRuns, errInstrument = t.meter.Int64Counter("claudex.claude.runs")
+	errs = append(errs, errInstrument)
+	t.claudeCost, errInstrument = t.meter.Float64Counter("claudex.claude.cost")
+	errs = append(errs, errInstrument)
+	t.claudeDuration, errInstrument = t.meter.Float64Histogram("claudex.claude.duration", metric.WithUnit("ms"))
+	errs = append(errs, errInstrument)
+	t.claudeTokens, errInstrument = t.meter.Int64Counter("claudex.claude.tokens", metric.WithUnit("{token}"))
+	errs = append(errs, errInstrument)
+	if errJoined := errors.Join(errs...); errJoined != nil {
+		return errJoined
+	}
 	active, _ := t.meter.Int64ObservableGauge("claudex.proxy.requests.active")
 	poolIdle, _ := t.meter.Int64ObservableGauge("claudex.proxy.pool.idle")
 	poolDialing, _ := t.meter.Int64ObservableGauge("claudex.proxy.pool.dialing")
@@ -235,7 +253,7 @@ func (t *Telemetry) initInstruments() {
 	cpu, _ := t.meter.Float64ObservableGauge("process.cpu.time", metric.WithUnit("s"))
 	rss, _ := t.meter.Int64ObservableGauge("process.memory.rss", metric.WithUnit("By"))
 	openConnections, _ := t.meter.Int64ObservableGauge("process.network.connections.open", metric.WithUnit("{connection}"))
-	_, _ = t.meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
+	_, errCallback := t.meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
 		var memory runtime.MemStats
 		runtime.ReadMemStats(&memory)
 		options := []metric.ObserveOption(nil)
@@ -251,9 +269,17 @@ func (t *Telemetry) initInstruments() {
 		cpuSeconds, rssBytes := processStats()
 		observer.ObserveFloat64(cpu, cpuSeconds, options...)
 		observer.ObserveInt64(rss, rssBytes, options...)
-		observer.ObserveInt64(openConnections, t.activeRequests.Load()+t.poolIdle.Load()+t.poolDialing.Load(), options...)
+		observer.ObserveInt64(openConnections, t.openConnections.Load(), options...)
 		return nil
 	}, active, poolIdle, poolDialing, goRoutines, heap, gcPause, cpu, rss, openConnections)
+	return errCallback
+}
+
+// RecordOpenConnection records an actual transport socket lifecycle transition.
+func RecordOpenConnection(delta int64) {
+	if delta != 0 {
+		Current().openConnections.Add(delta)
+	}
 }
 
 func (t *Telemetry) Shutdown(ctx context.Context) error {
@@ -365,8 +391,21 @@ func WithNetworkTrace(ctx context.Context) context.Context {
 	return httptrace.WithClientTrace(ctx, clientTrace)
 }
 
-// RecordWebsocketMetric projects the existing prompt-free timeline into OTEL.
-func RecordWebsocketMetric(ctx context.Context, name, rootCorrelation, executionCorrelation string, fields map[string]any, detached bool) {
+// WebsocketEvent is the typed boundary for transport lifecycle telemetry.
+type WebsocketEvent struct {
+	Name                 string
+	RootCorrelation      string
+	ExecutionCorrelation string
+	Fields               map[string]any
+	Detached             bool
+}
+
+func RecordWebsocketEvent(ctx context.Context, event WebsocketEvent) {
+	name := event.Name
+	rootCorrelation := event.RootCorrelation
+	executionCorrelation := event.ExecutionCorrelation
+	fields := event.Fields
+	detached := event.Detached
 	t := Current()
 	if !t.Enabled {
 		return
@@ -415,6 +454,12 @@ func RecordWebsocketMetric(ctx context.Context, name, rootCorrelation, execution
 	if strings.Contains(name, "failed") || strings.Contains(name, "error") || strings.Contains(name, "exhausted") {
 		span.SetStatus(codes.Error, boundedEnum(name))
 	}
+}
+
+// RecordWebsocketMetric preserves the legacy call shape while call sites move
+// to the typed WebsocketEvent boundary.
+func RecordWebsocketMetric(ctx context.Context, name, rootCorrelation, executionCorrelation string, fields map[string]any, detached bool) {
+	RecordWebsocketEvent(ctx, WebsocketEvent{Name: name, RootCorrelation: rootCorrelation, ExecutionCorrelation: executionCorrelation, Fields: fields, Detached: detached})
 }
 
 // RecordClaudeRun emits launcher-derived aggregate metrics for short sessions
