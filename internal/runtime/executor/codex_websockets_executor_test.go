@@ -610,17 +610,32 @@ func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOu
 			t.Errorf("write created: %v", errWrite)
 			return
 		}
+		toolStarted := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc-partial","type":"function_call","call_id":"call-partial","name":"Edit","arguments":"","status":"in_progress"}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, toolStarted); errWrite != nil {
+			t.Errorf("write tool start: %v", errWrite)
+			return
+		}
+		toolDelta := []byte(`{"type":"response.function_call_arguments.delta","item_id":"fc-partial","output_index":0,"delta":"{\\"file_path\\":"}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, toolDelta); errWrite != nil {
+			t.Errorf("write tool delta: %v", errWrite)
+			return
+		}
 		_ = conn.UnderlyingConn().Close()
 	}))
 	defer server.Close()
 
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll, RequestLog: true}})
 	auth := &cliproxyauth.Auth{ID: "auth-partial", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"partial"}],"max_tokens":128,"stream":true}`)
-	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}, cliproxyexecutor.Options{
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Request.Header = http.Header{helps.ClaudeCodeSessionHeader: []string{"partial-root"}, helps.ClaudeCodeAgentHeader: []string{"partial-agent"}}
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}, cliproxyexecutor.Options{
 		SourceFormat:    sdktranslator.FromString("claude"),
 		ResponseFormat:  sdktranslator.FromString("claude"),
 		OriginalRequest: payload,
+		Headers:         ginCtx.Request.Header.Clone(),
 		Metadata: map[string]any{
 			cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:post-output-disconnect",
 		},
@@ -647,7 +662,48 @@ func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOu
 	if got := connections.Load(); got != 1 {
 		t.Fatalf("connections = %d, want no replay after downstream output", got)
 	}
+	timelineValue, exists := ginCtx.Get("API_WEBSOCKET_TIMELINE")
+	if !exists {
+		t.Fatal("websocket timeline was not captured")
+	}
+	timeline := string(timelineValue.([]byte))
+	for _, want := range []string{
+		`"name":"request_finished"`,
+		`"reason":"read_error"`,
+		`"close_code":1006`,
+		`"last_event_type":"response.function_call_arguments.delta"`,
+		`"tool_call_started":true`,
+		`"tool_call_completed":false`,
+		`"tool_call_in_progress":true`,
+		`"tool_calls_started":1`,
+		`"tool_calls_completed":0`,
+		`"tool_calls_incomplete":1`,
+		`"downstream_committed":true`,
+		`"connection_request_count":1`,
+	} {
+		if !strings.Contains(timeline, want) {
+			t.Errorf("timeline missing %q: %s", want, timeline)
+		}
+	}
 	exec.CloseExecutionSession("claude-code:post-output-disconnect")
+}
+
+func TestCodexWebsocketConnectionObservationTracksReuse(t *testing.T) {
+	sess := &codexWebsocketSession{}
+	conn := &websocket.Conn{}
+	firstAge, firstCount := sess.observeConnectionUse(conn)
+	if firstAge < 0 || firstCount != 1 {
+		t.Fatalf("first observation = (%s, %d), want non-negative age and count 1", firstAge, firstCount)
+	}
+	time.Sleep(time.Millisecond)
+	secondAge, secondCount := sess.observeConnectionUse(conn)
+	if secondAge <= firstAge || secondCount != 2 {
+		t.Fatalf("second observation = (%s, %d), want increasing age and count 2", secondAge, secondCount)
+	}
+	_, resetCount := sess.observeConnectionUse(&websocket.Conn{})
+	if resetCount != 1 {
+		t.Fatalf("new connection count = %d, want 1", resetCount)
+	}
 }
 
 func TestCodexWebsocketsExecuteStreamStopsAfterOnePreOutputReadRetry(t *testing.T) {

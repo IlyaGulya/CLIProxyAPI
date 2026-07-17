@@ -51,7 +51,8 @@ The stack includes Grafana, Tempo, Prometheus, Loki, and an OpenTelemetry
 Collector. `claudex-next` provisions the `claudex-next: Claude + CLIProxyAPI`
 dashboard automatically. It contains the distributed waterfall, p50/p95 phase
 latencies, speculative hit rate, pool state, cache/token activity, failures,
-model switching, process health, and correlated logs.
+model switching, mid-response WebSocket failure semantics, connection age,
+process health, and correlated logs.
 
 Claude Code exports its native metrics, events, and beta traces. CLIProxyAPI
 exports HTTP request spans, DNS/TCP/TLS/WebSocket phases, upstream first-event
@@ -60,6 +61,14 @@ events, token and byte counters, pool gauges, and Go runtime metrics. All three
 services carry `claudex.run_id`. For non-interactive Claude runs the launcher
 also injects W3C `TRACEPARENT`; CLIProxyAPI extracts the header and links
 detached speculative preconnect spans to the matching execution.
+
+Every `request_finished` WebSocket event records the bounded semantic boundary
+needed to diagnose an interrupted stream without exporting payloads: close
+code, last upstream event type, counts of started/completed/incomplete tool
+calls, whether a tool call remained in progress, whether downstream output was
+already committed, connection source, connection age since first observed use,
+and the connection request count. Tool names, tool arguments, prompts, response
+bodies, session IDs, and raw error strings are excluded from OTEL attributes.
 
 If Docker or Grafana is unavailable, Claude still starts and the complete file
 bundle remains available for analysis. Set `CLAUDEX_NEXT_OTEL_STACK=off` to
@@ -128,14 +137,36 @@ sum by (event_name, finish_reason, retry_boundary) (
 )
 ```
 
+The **Mid-response WebSocket failures** table distinguishes an interrupted
+reasoning turn from an incomplete tool call and a completed tool boundary. The
+same view is available directly in Prometheus:
+
+```promql
+sum by (
+  model,
+  connection_source,
+  transport_close_code,
+  stream_last_event_type,
+  tool_call_in_progress,
+  downstream_committed
+) (
+  increase(claudex_proxy_events_total{
+    event_name="request_finished",
+    finish_reason="read_error"
+  }[6h])
+)
+```
+
 In Tempo Explore, filter `service.name = cli-proxy-api` and the run's
 `claudex.run_id`, then inspect the HTTP request span events named
 `proxy.websocket.transport_retry_*`. They include the bounded close reason,
 pre/post-output boundary, attempt, connection source, duration, and whether
 downstream output was already committed. Session IDs, prompts, response bodies,
 credentials, and raw error strings are not exported as metric or span
-attributes. The same decisions remain in the private per-request timeline when
-request logging is enabled.
+attributes. The corresponding `proxy.websocket.request_finished` event also
+contains `transport.close_code`, `stream.last_event_type`, tool-boundary counts,
+`connection.age.us`, and `connection.request_count`. The same decisions remain
+in the private per-request timeline when request logging is enabled.
 
 Launcher-only flags use the `--next-` namespace so all other arguments pass to
 Claude unchanged:

@@ -86,6 +86,11 @@ type codexWebsocketSession struct {
 
 	writeMu sync.Mutex
 
+	observationMu        sync.Mutex
+	observedConn         *websocket.Conn
+	observedConnAt       time.Time
+	observedConnUseCount int64
+
 	activeMu     sync.Mutex
 	activeCh     chan codexWebsocketRead
 	activeDone   <-chan struct{}
@@ -95,6 +100,41 @@ type codexWebsocketSession struct {
 
 	upstreamDisconnectOnce sync.Once
 	upstreamDisconnectCh   chan error
+}
+
+func (s *codexWebsocketSession) observeConnectionUse(conn *websocket.Conn) (time.Duration, int64) {
+	if s == nil || conn == nil {
+		return 0, 1
+	}
+	now := time.Now()
+	s.observationMu.Lock()
+	if s.observedConn != conn {
+		s.observedConn = conn
+		s.observedConnAt = now
+		s.observedConnUseCount = 0
+	}
+	s.observedConnUseCount++
+	age := now.Sub(s.observedConnAt)
+	count := s.observedConnUseCount
+	s.observationMu.Unlock()
+	return age, count
+}
+
+func (s *codexWebsocketSession) connectionObservation(conn *websocket.Conn) (time.Duration, int64) {
+	if s == nil || conn == nil {
+		return 0, 1
+	}
+	now := time.Now()
+	s.observationMu.Lock()
+	if s.observedConn != conn {
+		s.observedConn = conn
+		s.observedConnAt = now
+		s.observedConnUseCount = 1
+	}
+	age := now.Sub(s.observedConnAt)
+	count := s.observedConnUseCount
+	s.observationMu.Unlock()
+	return age, count
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
@@ -572,13 +612,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	} else {
 		conn, respHS, connectionSource, errDial = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
 	}
+	connectionAge, connectionRequestCount := time.Duration(0), int64(1)
+	if errDial == nil && conn != nil && sess != nil {
+		connectionAge, connectionRequestCount = sess.observeConnectionUse(conn)
+	}
 	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "connection_ready", map[string]any{
-		"session_id":           executionSessionID,
-		"duration_us":          time.Since(connectStartedAt).Microseconds(),
-		"connection_source":    connectionSource,
-		"overflow_base_source": overflowBaseSource,
-		"reused":               connectionSource == codexWebsocketConnectionSessionReuse || connectionSource == codexWebsocketConnectionSpeculative,
-		"success":              errDial == nil,
+		"session_id":               executionSessionID,
+		"duration_us":              time.Since(connectStartedAt).Microseconds(),
+		"connection_age_us":        connectionAge.Microseconds(),
+		"connection_request_count": connectionRequestCount,
+		"connection_source":        connectionSource,
+		"overflow_base_source":     overflowBaseSource,
+		"reused":                   connectionSource == codexWebsocketConnectionSessionReuse || connectionSource == codexWebsocketConnectionSpeculative,
+		"success":                  errDial == nil,
 	})
 	var upstreamHeaders http.Header
 	if respHS != nil {
@@ -703,13 +749,31 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var translationDuration time.Duration
 		var downstreamBlockedDuration time.Duration
 		downstreamCommitted := false
+		closeCode := 0
+		var semanticState codexWebsocketSemanticState
 		speculativeAgentCalls := make(map[string]struct{})
 
 		defer close(out)
 		defer func() {
+			if sess != nil {
+				connectionAge, connectionRequestCount = sess.connectionObservation(conn)
+			}
+			incompleteToolCalls := semanticState.incompleteToolCalls()
 			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_finished", map[string]any{
 				"session_id":                 executionSessionID,
+				"model":                      baseModel,
+				"connection_source":          connectionSource,
 				"reason":                     terminateReason,
+				"close_code":                 closeCode,
+				"last_event_type":            semanticState.lastEventType,
+				"tool_call_started":          semanticState.toolCallsStarted > 0,
+				"tool_call_completed":        semanticState.toolCallsStarted > 0 && incompleteToolCalls == 0,
+				"tool_call_in_progress":      incompleteToolCalls > 0,
+				"tool_calls_started":         semanticState.toolCallsStarted,
+				"tool_calls_completed":       semanticState.toolCallsComplete,
+				"tool_calls_incomplete":      incompleteToolCalls,
+				"connection_age_us":          connectionAge.Microseconds(),
+				"connection_request_count":   connectionRequestCount,
 				"elapsed_us":                 time.Since(traceStartedAt).Microseconds(),
 				"first_event_us":             elapsedSinceOrZero(traceStartedAt, firstEventAt).Microseconds(),
 				"first_reasoning_delta_us":   elapsedSinceOrZero(traceStartedAt, firstReasoningDeltaAt).Microseconds(),
@@ -774,6 +838,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					return
 				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
+				closeCode = codexWebsocketCloseCode(mappedErr)
 				retryable := shouldRetryCodexWebsocketReadError(mappedErr)
 				if !downstreamCommitted && transportRetries == 0 && retryable {
 					transportRetries++
@@ -828,10 +893,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry)
 						if errSendRetry == nil {
 							conn = connRetry
+							connectionSource = retrySource
+							if sess != nil {
+								connectionAge, connectionRequestCount = sess.observeConnectionUse(connRetry)
+							} else {
+								connectionAge, connectionRequestCount = 0, 1
+							}
 							wsReqBody = wsReqBodyRetry
 							identityState = retryIdentityState
 							sendStartedAt = time.Now()
 							param = nil
+							closeCode = 0
+							semanticState = codexWebsocketSemanticState{}
 							speculativeAgentCalls = make(map[string]struct{})
 							helpFields["duration_us"] = time.Since(retryStartedAt).Microseconds()
 							helpFields["connection_source"] = retrySource
@@ -912,6 +985,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+			semanticState.observe(payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
@@ -1088,6 +1162,55 @@ func codexWebsocketRetryReason(err error) string {
 		return "timeout"
 	}
 	return "read_error"
+}
+
+func codexWebsocketCloseCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Code
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return websocket.CloseAbnormalClosure
+	}
+	return 0
+}
+
+type codexWebsocketSemanticState struct {
+	lastEventType     string
+	toolCallsStarted  int64
+	toolCallsComplete int64
+}
+
+func (s *codexWebsocketSemanticState) observe(payload []byte) {
+	if s == nil {
+		return
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	if eventType == "" {
+		return
+	}
+	s.lastEventType = eventType
+	itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
+	if itemType != "function_call" && itemType != "custom_tool_call" {
+		return
+	}
+	switch eventType {
+	case "response.output_item.added":
+		s.toolCallsStarted++
+	case "response.output_item.done":
+		s.toolCallsComplete++
+	}
+}
+
+func (s codexWebsocketSemanticState) incompleteToolCalls() int64 {
+	incomplete := s.toolCallsStarted - s.toolCallsComplete
+	if incomplete < 0 {
+		return 0
+	}
+	return incomplete
 }
 
 func codexWebsocketRetryBoundary(downstreamCommitted bool) string {

@@ -380,7 +380,11 @@ func TestProvisionGrafanaDashboardUsesStableUIDAndNoSecrets(t *testing.T) {
 	if err := ProvisionGrafana(context.Background(), server.URL, server.Client()); err != nil {
 		t.Fatalf("ProvisionGrafana: %v", err)
 	}
-	for _, want := range []string{"claudex-next-overview", "claudex.run_id", "claudex_proxy", "tempo", "prometheus", "loki"} {
+	for _, want := range []string{
+		"claudex-next-overview", "claudex.run_id", "claudex_proxy", "tempo", "prometheus", "loki",
+		"Mid-response WebSocket failures", "transport_close_code", "stream_last_event_type",
+		"tool_call_in_progress", "downstream_committed", "connection_age",
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)
 		}

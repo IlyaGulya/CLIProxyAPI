@@ -80,6 +80,29 @@
         "datasource": {"type": "loki", "uid": "loki"},
         "targets": [{"refId": "A", "expr": "{service_name=~\"claude-code|cli-proxy-api|claudex-next\"} | claudex_run_id=\"$run_id\""}],
         "gridPos": {"x": 12, "y": 26, "w": 12, "h": 8}
+      },
+      {
+        "id": 9, "type": "table", "title": "Mid-response WebSocket failures",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "sum by (model, connection_source, transport_close_code, stream_last_event_type, tool_call_in_progress, downstream_committed) (increase(claudex_proxy_events_total{event_name=\"request_finished\",finish_reason=\"read_error\",model=~\"$model\"}[6h]))",
+          "legendFormat": "{{model}} {{connection_source}} close={{transport_close_code}} last={{stream_last_event_type}} tool_open={{tool_call_in_progress}} committed={{downstream_committed}}",
+          "format": "table",
+          "instant": true
+        }],
+        "gridPos": {"x": 0, "y": 34, "w": 16, "h": 8}
+      },
+      {
+        "id": 10, "type": "timeseries", "title": "WebSocket connection age at request finish",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, connection_source) (rate(claudex_proxy_phase_duration_milliseconds_bucket{phase=\"connection_age\",model=~\"$model\"}[5m])))",
+          "legendFormat": "p95 {{connection_source}}"
+        }],
+        "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+        "gridPos": {"x": 16, "y": 34, "w": 8, "h": 8}
       }
     ]
   },

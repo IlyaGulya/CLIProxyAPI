@@ -441,7 +441,11 @@ func RecordClaudeRun(ctx context.Context, model, terminal string, costUSD float6
 }
 
 func (t *Telemetry) recordMeasurements(ctx context.Context, name string, fields map[string]any, attrs []attribute.KeyValue) {
-	for _, key := range []string{"duration_us", "elapsed_us", "since_send_us", "wait_us", "age_us", "translation_us", "downstream_blocked_us", "first_event_us", "first_reasoning_delta_us", "first_output_text_delta_us"} {
+	latencyFields := []string{"duration_us", "elapsed_us", "since_send_us", "wait_us", "age_us", "translation_us", "downstream_blocked_us", "first_event_us", "first_reasoning_delta_us", "first_output_text_delta_us"}
+	if name == "request_finished" {
+		latencyFields = append(latencyFields, "connection_age_us")
+	}
+	for _, key := range latencyFields {
 		if value, ok := numeric(fields[key]); ok {
 			phaseAttrs := appendCopy(attrs, attribute.String("phase", strings.TrimSuffix(key, "_us")))
 			t.latency.Record(ctx, value/1000, metric.WithAttributes(phaseAttrs...))
@@ -483,6 +487,7 @@ func metricAttributes(fields map[string]any) []attribute.KeyValue {
 		"connection_source":  "connection.source",
 		"source_format":      "source.format",
 		"reason":             "finish.reason",
+		"last_event_type":    "stream.last_event_type",
 		"status":             "status.code",
 		"boundary":           "retry.boundary",
 		"suppression_reason": "retry.suppression_reason",
@@ -491,10 +496,17 @@ func metricAttributes(fields map[string]any) []attribute.KeyValue {
 			out = append(out, attribute.String(target, value))
 		}
 	}
-	for _, key := range []string{"success", "reused", "busy", "overflow", "incremental", "rate_limited", "downstream_committed"} {
-		if value, ok := fields[key].(bool); ok {
-			out = append(out, attribute.Bool(strings.ReplaceAll(key, "_", "."), value))
+	for source, target := range map[string]string{
+		"success": "success", "reused": "reused", "busy": "busy", "overflow": "overflow",
+		"incremental": "incremental", "rate_limited": "rate.limited", "downstream_committed": "downstream.committed",
+		"tool_call_started": "tool_call.started", "tool_call_completed": "tool_call.completed", "tool_call_in_progress": "tool_call.in_progress",
+	} {
+		if value, ok := fields[source].(bool); ok {
+			out = append(out, attribute.Bool(target, value))
 		}
+	}
+	if value, ok := numeric(fields["close_code"]); ok && value > 0 {
+		out = append(out, attribute.Int64("transport.close_code", int64(value)))
 	}
 	return out
 }
@@ -510,10 +522,12 @@ func spanAttributes(rootCorrelation, executionCorrelation string, fields map[str
 	allowedNumbers := map[string]string{
 		"duration_us": "duration.us", "elapsed_us": "elapsed.us", "since_send_us": "since_send.us",
 		"wait_us": "wait.us", "age_us": "age.us", "translation_us": "translation.us",
+		"connection_age_us": "connection.age.us", "connection_request_count": "connection.request_count",
 		"downstream_blocked_us": "downstream_blocked.us", "input_tokens": "gen_ai.usage.input_tokens",
 		"output_tokens": "gen_ai.usage.output_tokens", "cache_read_tokens": "gen_ai.usage.cache_read_tokens",
 		"bytes": "message.bytes", "upstream_bytes": "upstream.bytes", "pool_idle": "pool.idle", "pool_dialing": "pool.dialing",
 		"attempt": "retry.attempt", "transport_retries": "retry.count",
+		"tool_calls_started": "tool_calls.started", "tool_calls_completed": "tool_calls.completed", "tool_calls_incomplete": "tool_calls.incomplete",
 	}
 	for source, target := range allowedNumbers {
 		if value, ok := numeric(fields[source]); ok {

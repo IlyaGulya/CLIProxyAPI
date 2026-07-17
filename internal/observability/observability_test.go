@@ -83,6 +83,57 @@ func TestRetryAttributesExposeBoundedDecisionWithoutSessionIdentity(t *testing.T
 	}
 }
 
+func TestMidResponseFailureAttributesExposeSemanticBoundary(t *testing.T) {
+	t.Parallel()
+	fields := map[string]any{
+		"reason":                   "read_error",
+		"close_code":               1006,
+		"last_event_type":          "response.function_call_arguments.delta",
+		"tool_call_started":        true,
+		"tool_call_completed":      false,
+		"tool_call_in_progress":    true,
+		"downstream_committed":     true,
+		"connection_age_us":        8_678_058,
+		"connection_request_count": 7,
+		"tool_calls_started":       1,
+		"tool_calls_completed":     0,
+		"tool_calls_incomplete":    1,
+		"tool_name":                "private-plugin-tool-must-not-leak",
+	}
+
+	metricText := attributesString(metricAttributes(fields))
+	spanText := attributesString(spanAttributes("root", "execution", fields))
+	for _, want := range []string{
+		"finish.reason=read_error",
+		"transport.close_code=1006",
+		"stream.last_event_type=response.function_call_arguments.delta",
+		"tool_call.started=true",
+		"tool_call.completed=false",
+		"tool_call.in_progress=true",
+		"downstream.committed=true",
+	} {
+		if !strings.Contains(metricText, want) {
+			t.Errorf("metric attributes missing %q: %s", want, metricText)
+		}
+	}
+	for _, want := range []string{
+		"connection.age.us=8678058",
+		"connection.request_count=7",
+		"tool_calls.started=1",
+		"tool_calls.completed=0",
+		"tool_calls.incomplete=1",
+	} {
+		if !strings.Contains(spanText, want) {
+			t.Errorf("span attributes missing %q: %s", want, spanText)
+		}
+	}
+	for _, text := range []string{metricText, spanText} {
+		if strings.Contains(text, "private-plugin-tool") {
+			t.Errorf("attributes leaked tool name: %s", text)
+		}
+	}
+}
+
 func TestSpanAttributesHashCorrelationAndRejectPayloads(t *testing.T) {
 	t.Parallel()
 	got := spanAttributes("root-secret", "exec-secret", map[string]any{
