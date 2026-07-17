@@ -57,7 +57,8 @@ func codexWebsocketIdleTimeout(cfg *config.Config) time.Duration {
 // not available over WebSocket (e.g. /responses/compact) and for websocket upgrade failures.
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
-	circuit *codexWebsocketCircuit
+	circuit            *codexWebsocketCircuit
+	adaptivePreconnect *codexAdaptivePreconnectController
 
 	sessions      *codexWebsocketSessionManager
 	draining      bool
@@ -154,6 +155,12 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 		runtimeCancel: runtimeCancel,
 	}
 	executor.sessions = newCodexWebsocketSessionManager(runtimeCtx, executor.closeCodexConnection)
+	if cfg != nil && cfg.CodexWebsocketAdaptivePreconnect {
+		runtimeCfg := cfg.NormalizedCodexWebsocketConfig()
+		executor.adaptivePreconnect = newCodexAdaptivePreconnectController(codexAdaptivePreconnectConfig{
+			MaxTarget: runtimeCfg.PreconnectMaxIdle, MinTTL: 5 * time.Second, MaxTTL: runtimeCfg.PreconnectTTL,
+		})
+	}
 	return executor
 }
 
@@ -296,6 +303,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errPrepare
 	}
 	baseModel, to := prepared.baseModel, prepared.to
+	ctx = withCodexAdaptiveModel(ctx, baseModel)
 	responseFormat := prepared.responseFormat
 	originalPayloadSource, originalPayload := prepared.originalPayloadSource, prepared.originalPayload
 	body, wsURL, wsHeaders := prepared.body, prepared.wsURL, prepared.headers
@@ -486,6 +494,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errPrepare
 	}
 	baseModel, from, to := prepared.baseModel, prepared.from, prepared.to
+	ctx = withCodexAdaptiveModel(ctx, baseModel)
 	responseFormat := prepared.responseFormat
 	originalPayloadSource, originalPayload := prepared.originalPayloadSource, prepared.originalPayload
 	body, wsURL, wsHeaders := prepared.body, prepared.wsURL, prepared.headers

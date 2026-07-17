@@ -91,6 +91,9 @@ type WebsocketAttributes struct {
 	CompactionRetainedImages   Optional[int64]
 	CompactionDroppedItems     Optional[int64]
 	CompactionRetainedTokens   Optional[int64]
+	AdaptiveTarget             Optional[int64]
+	AdaptiveHitRateBasisPoints Optional[int64]
+	CounterfactualWaitUS       Optional[int64]
 }
 
 func (a WebsocketAttributes) fields() map[string]any {
@@ -170,6 +173,9 @@ func (a WebsocketAttributes) fields() map[string]any {
 	addOptional(fields, "compaction_retained_images", a.CompactionRetainedImages)
 	addOptional(fields, "compaction_dropped_items", a.CompactionDroppedItems)
 	addOptional(fields, "compaction_retained_tokens", a.CompactionRetainedTokens)
+	addOptional(fields, "adaptive_target", a.AdaptiveTarget)
+	addOptional(fields, "adaptive_hit_rate_basis_points", a.AdaptiveHitRateBasisPoints)
+	addOptional(fields, "counterfactual_wait_us", a.CounterfactualWaitUS)
 	return fields
 }
 

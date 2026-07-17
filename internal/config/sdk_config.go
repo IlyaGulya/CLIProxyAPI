@@ -77,6 +77,10 @@ type SDKConfig struct {
 	// websocket may remain idle. Values <= 0 use the default (30 seconds).
 	CodexWebsocketPreconnectTTLSeconds int `yaml:"codex-websocket-preconnect-ttl-seconds,omitempty" json:"codex-websocket-preconnect-ttl-seconds,omitempty"`
 
+	// CodexWebsocketAdaptivePreconnect lets a bounded per-route EWMA controller
+	// choose a target below the configured global idle/TTL caps. Opt-in.
+	CodexWebsocketAdaptivePreconnect bool `yaml:"codex-websocket-adaptive-preconnect" json:"codex-websocket-adaptive-preconnect"`
+
 	// CodexWebsocketCircuitBreaker enables route-scoped suppression of repeatedly
 	// failing upstream websocket attempts. Disabled by default during rollout.
 	CodexWebsocketCircuitBreaker bool `yaml:"codex-websocket-circuit-breaker" json:"codex-websocket-circuit-breaker"`

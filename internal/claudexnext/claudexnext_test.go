@@ -75,6 +75,7 @@ codex-websocket-generate-false-warmup: true
 		"codex-websocket-preconnect-replenish: true",
 		"codex-websocket-preconnect-max-idle: 2",
 		"codex-websocket-preconnect-ttl-seconds: 30",
+		"codex-websocket-adaptive-preconnect: true",
 		"codex-websocket-generate-false-warmup: false",
 		"secret-value",
 	} {
@@ -441,6 +442,7 @@ func TestProvisionGrafanaDashboardUsesStableUIDAndNoSecrets(t *testing.T) {
 		"tool_call_in_progress", "downstream_committed", "connection_age",
 		"WebSocket circuit decisions", "circuit_(failure|success|suppressed|probe)",
 		"Compaction V2 replay shaping", "compaction_applied",
+		"Adaptive preconnect decisions", "speculative_preconnect_adaptive_decision",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard missing %q", want)

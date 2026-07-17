@@ -171,3 +171,13 @@ func (c *codexWebsocketCircuit) routeCount() int {
 	defer c.mu.Unlock()
 	return len(c.routes)
 }
+
+func (c *codexWebsocketCircuit) suppressBackground(route codexWebsocketRoute) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.routes[route.normalized()]
+	return entry != nil && entry.state != circuitClosed
+}

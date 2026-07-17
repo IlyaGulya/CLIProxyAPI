@@ -57,6 +57,17 @@ type codexWebsocketPreconnectKey struct {
 	wsURL  string
 }
 
+type codexAdaptiveModelContextKey struct{}
+
+func withCodexAdaptiveModel(ctx context.Context, model string) context.Context {
+	return context.WithValue(ctx, codexAdaptiveModelContextKey{}, strings.TrimSpace(model))
+}
+
+func codexAdaptiveModel(ctx context.Context) string {
+	value, _ := ctx.Value(codexAdaptiveModelContextKey{}).(string)
+	return strings.TrimSpace(value)
+}
+
 type codexWebsocketPreconnectEntry struct {
 	id        uint64
 	conn      *websocket.Conn
@@ -146,6 +157,27 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 	if !enabled || auth == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(wsURL) == "" {
 		return
 	}
+	model := codexAdaptiveModel(ctx)
+	if model == "" {
+		model = gjson.GetBytes(warmupTemplate, "model").String()
+	}
+	route := codexAdaptivePreconnectRoute{AuthID: authID, Model: model}
+	if e.circuit != nil && e.circuit.suppressBackground(codexCircuitRoute(auth, model)) {
+		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_suppressed", observability.WebsocketAttributes{
+			SessionID: sessionID, Model: model, Reason: "route_circuit_open", Trigger: trigger,
+		}, nil)
+		return
+	}
+	if e.adaptivePreconnect != nil {
+		decision := e.adaptivePreconnect.decision(route)
+		maxIdle = min(maxIdle, decision.Target)
+		ttl = min(ttl, decision.TTL)
+		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_adaptive_decision", observability.WebsocketAttributes{
+			SessionID: sessionID, Model: model, Reason: decision.Reason,
+			AdaptiveTarget: observability.Some(int64(decision.Target)), AdaptiveHitRateBasisPoints: observability.Some(int64(decision.HitRateEWMA * 10_000)),
+			CounterfactualWaitUS: observability.Some(decision.DialLatencyEWMA.Microseconds()),
+		}, nil)
+	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
 	reserved, reason, generation := e.sessions.pool.reserve(key, maxIdle, time.Now())
 	poolIdle, poolDialing := e.sessions.pool.snapshot()
@@ -175,6 +207,9 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 		closeHTTPResponseBody(resp, "codex websocket speculative preconnect: close handshake response body error")
 		if errDial != nil || conn == nil {
 			duration := time.Since(startedAt)
+			if e.adaptivePreconnect != nil {
+				e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Miss: true, DialLatency: duration})
+			}
 			e.sessions.pool.failReservation(key, generation, status == http.StatusTooManyRequests, time.Now())
 			idle, dialing := e.sessions.pool.snapshot()
 			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_failed", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
@@ -225,6 +260,9 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 			}).Debug("codex websockets: generate=false warmup ready")
 		}
 		if !e.sessions.pool.completeReservationObserved(key, generation, conn, maxIdle, ttl, time.Now(), func() {
+			if e.adaptivePreconnect != nil {
+				e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Expired: true})
+			}
 			idle, dialing := e.sessions.pool.snapshot()
 			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_expired", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
 				SessionID: sessionID, PoolIdle: observability.Some(int64(idle)), PoolDialing: observability.Some(int64(dialing)),
@@ -238,6 +276,9 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 			return
 		}
 		duration := time.Since(startedAt)
+		if e.adaptivePreconnect != nil {
+			e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{DialLatency: duration})
+		}
 		idle, dialing := e.sessions.pool.snapshot()
 		helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_ready", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
 			SessionID: sessionID, DurationUS: observability.Some(duration.Microseconds()), GenerateFalseWarmup: observability.Some(e.cfg.CodexWebsocketGenerateFalseWarmup),
@@ -257,13 +298,20 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 		return nil
 	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
+	route := codexAdaptivePreconnectRoute{AuthID: authID, Model: codexAdaptiveModel(ctx)}
 	conn, age, observation, ok := e.sessions.pool.takeOrWaitObserved(ctx, key, ttl)
 	if !ok {
+		if e.adaptivePreconnect != nil {
+			e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Miss: true})
+		}
 		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_missed", observability.WebsocketAttributes{
 			SessionID: sessionID, WaitUS: observability.Some(observation.wait.Microseconds()), Reason: observation.reason,
 			PoolIdle: observability.Some(int64(observation.idle)), PoolDialing: observability.Some(int64(observation.dialing)),
 		}, nil)
 		return nil
+	}
+	if e.adaptivePreconnect != nil {
+		e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Hit: true, Lifetime: age})
 	}
 	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_leased", observability.WebsocketAttributes{
 		SessionID: sessionID, AgeUS: observability.Some(age.Microseconds()), WaitUS: observability.Some(observation.wait.Microseconds()),

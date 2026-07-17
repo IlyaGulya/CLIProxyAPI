@@ -133,6 +133,16 @@
           "legendFormat": "{{model}} compacted"
         }],
         "gridPos": {"x": 0, "y": 58, "w": 24, "h": 8}
+      },
+      {
+        "id": 14, "type": "timeseries", "title": "Adaptive preconnect decisions",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "sum by (model, finish_reason) (increase(claudex_proxy_events_total{event_name=\"speculative_preconnect_adaptive_decision\",model=~\"$model\"}[6h]))",
+          "legendFormat": "{{model}} {{finish_reason}}"
+        }],
+        "gridPos": {"x": 0, "y": 66, "w": 24, "h": 8}
       }
     ]
   },

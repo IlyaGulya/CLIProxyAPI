@@ -619,6 +619,8 @@ func spanAttributes(rootCorrelation, executionCorrelation string, fields map[str
 		"tool_calls_started": "tool_calls.started", "tool_calls_completed": "tool_calls.completed", "tool_calls_incomplete": "tool_calls.incomplete",
 		"compaction_retained_messages": "compaction.retained_messages", "compaction_retained_images": "compaction.retained_images",
 		"compaction_dropped_items": "compaction.dropped_items", "compaction_retained_tokens": "compaction.retained_tokens",
+		"adaptive_target": "preconnect.adaptive_target", "adaptive_hit_rate_basis_points": "preconnect.hit_rate_basis_points",
+		"counterfactual_wait_us": "preconnect.counterfactual_wait_us",
 	}
 	for source, target := range allowedNumbers {
 		if value, ok := numeric(fields[source]); ok {

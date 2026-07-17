@@ -9,6 +9,7 @@ codex-websocket-generate-false-warmup: true
 codex-websocket-preconnect-replenish: true
 codex-websocket-preconnect-max-idle: 4
 codex-websocket-preconnect-ttl-seconds: 9
+codex-websocket-adaptive-preconnect: true
 `))
 	if errParse != nil {
 		t.Fatalf("ParseConfigBytes() error = %v", errParse)
@@ -27,5 +28,8 @@ codex-websocket-preconnect-ttl-seconds: 9
 	}
 	if cfg.CodexWebsocketPreconnectTTLSeconds != 9 {
 		t.Fatalf("codex-websocket-preconnect-ttl-seconds = %d, want 9", cfg.CodexWebsocketPreconnectTTLSeconds)
+	}
+	if !cfg.CodexWebsocketAdaptivePreconnect {
+		t.Fatal("codex-websocket-adaptive-preconnect was not parsed")
 	}
 }
