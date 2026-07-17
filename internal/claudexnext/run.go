@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -63,6 +64,20 @@ type Manifest struct {
 	ClaudeRuntimeMS int64             `json:"claude_runtime_ms"`
 	OTELFlushOK     bool              `json:"otel_flush_ok"`
 	Telemetry       map[string]string `json:"telemetry_privacy"`
+}
+
+type processOwner struct {
+	cmd      *exec.Cmd
+	once     sync.Once
+	graceful bool
+}
+
+func (p *processOwner) Stop() bool {
+	if p == nil {
+		return true
+	}
+	p.once.Do(func() { p.graceful = stopProcess(p.cmd) })
+	return p.graceful
 }
 
 // Run launches an isolated instrumented proxy and one Claude session.
@@ -143,10 +158,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	if stack.Available {
 		launcherEnv := cloneEnv(values)
 		launcherEnv["OTEL_SERVICE_NAME"] = "claudex-next"
-		for key, value := range launcherEnv {
-			_ = os.Setenv(key, value)
-		}
-		launcherTelemetry, _ = observability.StartService(ctx, "claudex-next")
+		launcherTelemetry, _ = observability.StartServiceWithEnvironment(ctx, "claudex-next", launcherEnv)
 		ctx, launcherSpan = otel.Tracer("claudex-next").Start(ctx, "claudex-next.run",
 			trace.WithTimestamp(startedAt),
 			trace.WithAttributes(attribute.String("claudex.run_id", runID), attribute.Bool("lgtm.started", stack.Started), attribute.Bool("grafana.dashboard.provisioned", stack.Dashboard)),
@@ -177,7 +189,8 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	if errStart := proxyCmd.Start(); errStart != nil {
 		return runDir, 1, fmt.Errorf("start proxy %s: %w", opts.ProxyBin, errStart)
 	}
-	defer stopProcess(proxyCmd)
+	proxyOwner := &processOwner{cmd: proxyCmd}
+	defer proxyOwner.Stop()
 	proxyReadyStartedAt := time.Now()
 	if errReady := waitForProxy(ctx, port, 15*time.Second); errReady != nil {
 		return runDir, 1, fmt.Errorf("proxy did not become ready (see %s): %w", proxyLog.Name(), errReady)
@@ -205,8 +218,16 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	claudeCmd.Stderr = opts.Stderr
 	var claudeStdout, claudeStderr *os.File
 	if !opts.Interactive {
-		claudeStdout, _ = os.OpenFile(filepath.Join(runDir, "claude", "stdout.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		claudeStderr, _ = os.OpenFile(filepath.Join(runDir, "claude", "stderr.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		var errClaudeStdout, errClaudeStderr error
+		claudeStdout, errClaudeStdout = os.OpenFile(filepath.Join(runDir, "claude", "stdout.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if errClaudeStdout != nil {
+			return runDir, 1, fmt.Errorf("create Claude stdout log: %w", errClaudeStdout)
+		}
+		claudeStderr, errClaudeStderr = os.OpenFile(filepath.Join(runDir, "claude", "stderr.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if errClaudeStderr != nil {
+			_ = claudeStdout.Close()
+			return runDir, 1, fmt.Errorf("create Claude stderr log: %w", errClaudeStderr)
+		}
 		if claudeStdout != nil {
 			defer func() { _ = claudeStdout.Close() }()
 			claudeCmd.Stdout = io.MultiWriter(opts.Stdout, claudeStdout)
@@ -232,7 +253,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 			launcherSpan.SetStatus(codes.Error, "Claude exited unsuccessfully")
 		}
 	}
-	proxyStopped := stopProcess(proxyCmd)
+	proxyStopped := proxyOwner.Stop()
 	if launcherSpan != nil {
 		launcherSpan.AddEvent("proxy.stopped", trace.WithAttributes(attribute.Bool("graceful", proxyStopped)))
 	}

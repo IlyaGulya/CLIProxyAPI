@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -199,5 +200,25 @@ func TestInSessionModelSwitchingAndDetachedPreconnectLinks(t *testing.T) {
 	}
 	if detached.Links[0].SpanContext.SpanID() != childContext.SpanID() {
 		t.Fatalf("preconnect linked to wrong model execution: got %s want %s", detached.Links[0].SpanContext.SpanID(), childContext.SpanID())
+	}
+}
+
+func TestStartServiceWithEnvironmentRestoresProcessEnvironment(t *testing.T) {
+	t.Setenv("OTEL_SDK_DISABLED", "original")
+	telemetry, errStart := StartServiceWithEnvironment(context.Background(), "test", map[string]string{
+		"OTEL_SDK_DISABLED":   "true",
+		"CLAUDEX_NEXT_RUN_ID": "isolated-run",
+	})
+	if errStart != nil {
+		t.Fatalf("StartServiceWithEnvironment() error = %v", errStart)
+	}
+	if telemetry == nil {
+		t.Fatal("StartServiceWithEnvironment() returned nil telemetry")
+	}
+	if got := os.Getenv("OTEL_SDK_DISABLED"); got != "original" {
+		t.Fatalf("OTEL_SDK_DISABLED = %q, want restored original", got)
+	}
+	if _, exists := os.LookupEnv("CLAUDEX_NEXT_RUN_ID"); exists {
+		t.Fatal("CLAUDEX_NEXT_RUN_ID leaked into process environment")
 	}
 }

@@ -67,6 +67,12 @@ type Telemetry struct {
 }
 
 var current atomic.Pointer[Telemetry]
+var environmentMu sync.Mutex
+
+type environmentValue struct {
+	value string
+	set   bool
+}
 
 func Current() *Telemetry {
 	if value := current.Load(); value != nil {
@@ -158,6 +164,34 @@ func StartService(ctx context.Context, serviceName string) (*Telemetry, error) {
 	telemetry.Enabled = telemetry.tracerProvider != nil || telemetry.meterProvider != nil || telemetry.loggerProvider != nil
 	current.Store(telemetry)
 	return telemetry, nil
+}
+
+// StartServiceWithEnvironment applies an isolated environment snapshot while
+// constructing the env-configured OTEL SDK and restores the process environment.
+func StartServiceWithEnvironment(ctx context.Context, serviceName string, values map[string]string) (*Telemetry, error) {
+	environmentMu.Lock()
+	defer environmentMu.Unlock()
+	previous := make(map[string]environmentValue, len(values))
+	for key, value := range values {
+		old, set := os.LookupEnv(key)
+		previous[key] = environmentValue{value: old, set: set}
+		if errSet := os.Setenv(key, value); errSet != nil {
+			restoreEnvironment(previous)
+			return nil, fmt.Errorf("set OTEL environment %s: %w", key, errSet)
+		}
+	}
+	defer restoreEnvironment(previous)
+	return StartService(ctx, serviceName)
+}
+
+func restoreEnvironment(previous map[string]environmentValue) {
+	for key, old := range previous {
+		if old.set {
+			_ = os.Setenv(key, old.value)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	}
 }
 
 func exporterEnabled(key string) bool {

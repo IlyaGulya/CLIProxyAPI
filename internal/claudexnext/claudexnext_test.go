@@ -6,12 +6,31 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
+
+func TestProcessOwnerStopIsIdempotent(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	if errStart := cmd.Start(); errStart != nil {
+		t.Fatalf("start fixture: %v", errStart)
+	}
+	owner := &processOwner{cmd: cmd}
+	started := time.Now()
+	first := owner.Stop()
+	second := owner.Stop()
+	if first != second {
+		t.Fatalf("Stop results differ: first=%v second=%v", first, second)
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Fatal("idempotent stop exceeded termination bound")
+	}
+}
 
 type fakeCommandRunner struct {
 	outputs map[string]struct {
