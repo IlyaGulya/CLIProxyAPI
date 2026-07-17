@@ -12,6 +12,7 @@ import (
 
 const clearedToolResultText = "[Tool result cleared to preserve context]"
 const claudeContextEditGinKey = "claude_context_edit_result"
+const claudeCompactionV2RetainedTokenBudget = 64_000
 
 type claudeContextEditResult struct {
 	Applied              bool                       `json:"applied"`
@@ -36,6 +37,110 @@ type claudeContextPressureResult struct {
 	EffectiveWindow int
 	Overflow        bool
 	Method          string
+}
+
+type claudeCompactionReplayObservation struct {
+	Applied              bool
+	RetainedUserMessages int
+	RetainedImages       int
+	DroppedMessages      int
+	RetainedTokens       int
+}
+
+// applyClaudeCompactionReplay emulates Claude's stateless compaction replay
+// contract for providers that do not understand Claude compaction blocks.
+// It keeps a bounded newest-first tail of real user/image messages, the latest
+// compaction block, and all messages following that block. Tool-only history is
+// deliberately excluded so replay cannot create orphan tool pairs.
+func applyClaudeCompactionReplay(input []byte, retainedTokenBudget int) ([]byte, claudeCompactionReplayObservation) {
+	var root map[string]any
+	if json.Unmarshal(input, &root) != nil {
+		return input, claudeCompactionReplayObservation{}
+	}
+	messages, _ := root["messages"].([]any)
+	compactionMessage, compactionPart := -1, -1
+	for messageIndex, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		parts, _ := message["content"].([]any)
+		for partIndex, rawPart := range parts {
+			part, _ := rawPart.(map[string]any)
+			if stringValue(part["type"]) == "compaction" && stringValue(part["content"]) != "" {
+				compactionMessage, compactionPart = messageIndex, partIndex
+			}
+		}
+	}
+	if compactionMessage < 0 {
+		return input, claudeCompactionReplayObservation{}
+	}
+	if retainedTokenBudget <= 0 {
+		retainedTokenBudget = claudeCompactionV2RetainedTokenBudget
+	}
+	observation := claudeCompactionReplayObservation{Applied: true}
+	remaining := retainedTokenBudget
+	retainedReversed := make([]any, 0, compactionMessage)
+	for index := compactionMessage - 1; index >= 0; index-- {
+		message, _ := messages[index].(map[string]any)
+		images, realUser := claudeRealUserMessageImages(message)
+		if !realUser || remaining == 0 {
+			observation.DroppedMessages++
+			continue
+		}
+		encoded, _ := json.Marshal(message)
+		tokens, _ := estimateClaudeGPTInputTokens(encoded)
+		if tokens < 1 {
+			tokens = 1
+		}
+		if tokens > remaining {
+			observation.DroppedMessages++
+			continue
+		}
+		retainedReversed = append(retainedReversed, message)
+		remaining -= tokens
+		observation.RetainedTokens += tokens
+		observation.RetainedImages += images
+		observation.RetainedUserMessages++
+	}
+	retained := make([]any, len(retainedReversed))
+	for index := range retainedReversed {
+		retained[len(retainedReversed)-1-index] = retainedReversed[index]
+	}
+	compaction, _ := messages[compactionMessage].(map[string]any)
+	parts, _ := compaction["content"].([]any)
+	compaction["content"] = parts[compactionPart:]
+	retained = append(retained, compaction)
+	retained = append(retained, messages[compactionMessage+1:]...)
+	root["messages"] = retained
+	output, err := json.Marshal(root)
+	if err != nil {
+		return input, claudeCompactionReplayObservation{}
+	}
+	return output, observation
+}
+
+func claudeRealUserMessageImages(message map[string]any) (int, bool) {
+	if stringValue(message["role"]) != "user" {
+		return 0, false
+	}
+	switch content := message["content"].(type) {
+	case string:
+		return 0, strings.TrimSpace(content) != ""
+	case []any:
+		images := 0
+		real := false
+		for _, rawPart := range content {
+			part, _ := rawPart.(map[string]any)
+			switch stringValue(part["type"]) {
+			case "text", "image":
+				real = true
+				if stringValue(part["type"]) == "image" {
+					images++
+				}
+			}
+		}
+		return images, real
+	default:
+		return 0, false
+	}
 }
 
 var (

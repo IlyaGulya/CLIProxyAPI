@@ -45,6 +45,7 @@ type WebsocketAttributes struct {
 	HasPreviousResponse Optional[bool]
 	ResponseIDPresent   Optional[bool]
 	PromptCacheEnabled  Optional[bool]
+	CompactionApplied   Optional[bool]
 
 	DurationUS                 Optional[int64]
 	ElapsedUS                  Optional[int64]
@@ -86,6 +87,10 @@ type WebsocketAttributes struct {
 	ToolCallsIncomplete        Optional[int64]
 	RepairedToolUses           Optional[int64]
 	SeparatedAssistantMessages Optional[int64]
+	CompactionRetainedMessages Optional[int64]
+	CompactionRetainedImages   Optional[int64]
+	CompactionDroppedItems     Optional[int64]
+	CompactionRetainedTokens   Optional[int64]
 }
 
 func (a WebsocketAttributes) fields() map[string]any {
@@ -118,6 +123,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 	addOptional(fields, "has_previous_response", a.HasPreviousResponse)
 	addOptional(fields, "response_id_present", a.ResponseIDPresent)
 	addOptional(fields, "prompt_cache_enabled", a.PromptCacheEnabled)
+	addOptional(fields, "compaction_applied", a.CompactionApplied)
 	addOptional(fields, "duration_us", a.DurationUS)
 	addOptional(fields, "elapsed_us", a.ElapsedUS)
 	addOptional(fields, "since_send_us", a.SinceSendUS)
@@ -160,6 +166,10 @@ func (a WebsocketAttributes) fields() map[string]any {
 	addOptional(fields, "tool_calls_incomplete", a.ToolCallsIncomplete)
 	addOptional(fields, "repaired_tool_uses", a.RepairedToolUses)
 	addOptional(fields, "separated_assistant_messages", a.SeparatedAssistantMessages)
+	addOptional(fields, "compaction_retained_messages", a.CompactionRetainedMessages)
+	addOptional(fields, "compaction_retained_images", a.CompactionRetainedImages)
+	addOptional(fields, "compaction_dropped_items", a.CompactionDroppedItems)
+	addOptional(fields, "compaction_retained_tokens", a.CompactionRetainedTokens)
 	return fields
 }
 

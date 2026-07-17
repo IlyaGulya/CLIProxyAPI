@@ -619,3 +619,11 @@ func validCodexReasoningSignature() string {
 	raw[8] = 1
 	return base64.URLEncoding.EncodeToString(raw)
 }
+
+func TestConvertClaudeCompactionBlockToCodexAssistantContext(t *testing.T) {
+	input := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"assistant","content":[{"type":"compaction","content":"summary state"}]},{"role":"user","content":"continue"}]}`)
+	result := ConvertClaudeRequestToCodex("gpt-5.6-sol", input, true)
+	if !strings.Contains(string(result), "summary state") || !strings.Contains(string(result), "continue") {
+		t.Fatalf("compaction context was lost: %s", result)
+	}
+}

@@ -142,3 +142,28 @@ func TestAttachClaudeContextEditResultToResponses(t *testing.T) {
 		t.Fatalf("stream applied edits missing/malformed: %s", stream)
 	}
 }
+
+func TestApplyClaudeCompactionReplayRetainsRecentRealUserAndDropsToolHistory(t *testing.T) {
+	input := []byte(`{"system":"initial","messages":[
+		{"role":"user","content":[{"type":"text","text":"recent requirement"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"discard output"}]},
+		{"role":"assistant","content":[{"type":"compaction","content":"opaque summary"}]},
+		{"role":"user","content":[{"type":"text","text":"continue"}]}
+	]}`)
+	output, observation := applyClaudeCompactionReplay(input, 64_000)
+	if !observation.Applied || observation.RetainedUserMessages != 1 || observation.RetainedImages != 1 || observation.DroppedMessages != 2 {
+		t.Fatalf("observation = %+v", observation)
+	}
+	serialized := string(output)
+	for _, want := range []string{"initial", "recent requirement", "opaque summary", "continue"} {
+		if !strings.Contains(serialized, want) {
+			t.Fatalf("replay lost %q: %s", want, serialized)
+		}
+	}
+	for _, forbidden := range []string{"tool-1", "discard output"} {
+		if strings.Contains(serialized, forbidden) {
+			t.Fatalf("replay retained %q: %s", forbidden, serialized)
+		}
+	}
+}

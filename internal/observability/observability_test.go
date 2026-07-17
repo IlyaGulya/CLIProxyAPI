@@ -34,12 +34,17 @@ func TestMetricAttributesAreBoundedAndPrivacySafe(t *testing.T) {
 		"prompt_prefix_fingerprint":       "fingerprint",
 		"prompt":                          "do not export",
 		"session_id":                      "session-secret",
+		"compaction_applied":              true,
+		"compaction_retained_tokens":      1234,
 	})
 	text := attributesString(got)
-	for _, want := range []string{"model=gpt-5.6-luna", "connection.source=speculative", "finish.reason=completed", "success=true", "chain.source=full_replay", "incremental.reset_reason=no_previous_response"} {
+	for _, want := range []string{"model=gpt-5.6-luna", "connection.source=speculative", "finish.reason=completed", "success=true", "chain.source=full_replay", "incremental.reset_reason=no_previous_response", "compaction.applied=true"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("attributes missing %q: %s", want, text)
 		}
+	}
+	if span := attributesString(spanAttributes("root", "exec", map[string]any{"compaction_retained_tokens": 1234})); !strings.Contains(span, "compaction.retained_tokens=1234") {
+		t.Errorf("compaction span measurements missing: %s", span)
 	}
 	for _, forbidden := range []string{"root-secret", "exec-secret", "fingerprint", "do not export", "session-secret"} {
 		if strings.Contains(text, forbidden) {

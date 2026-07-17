@@ -553,6 +553,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		PromptCacheScope: cacheMetricFields.scope, PromptPrefixFingerprint: cacheMetricFields.prefixFingerprint,
 		PromptCacheEnabled: observability.Some(cacheEnabled), PromptCacheTTL: cacheTTL, PromptCacheDecision: cacheDecision,
 		InstructionsBytes: observability.Some(cacheMetricFields.instructionsBytes), ToolsCount: observability.Some(cacheMetricFields.toolsCount),
+		CompactionApplied:          observability.Some(incrementalObservation.compaction.Applied),
+		CompactionRetainedMessages: observability.Some(int64(incrementalObservation.compaction.RetainedMessages)),
+		CompactionRetainedImages:   observability.Some(int64(incrementalObservation.compaction.RetainedImages)),
+		CompactionDroppedItems:     observability.Some(int64(incrementalObservation.compaction.DroppedItems)),
+		CompactionRetainedTokens:   observability.Some(int64(incrementalObservation.compaction.RetainedTokens)),
 	}, nil)
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, requestBody)
@@ -2056,6 +2061,7 @@ func (s *codexWebsocketSession) resetCodexIncrementalStateLocked() {
 type codexIncrementalObservation struct {
 	incremental bool
 	resetReason string
+	compaction  codexCompactionV2Observation
 }
 
 func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullRequest []byte) ([]byte, codexIncrementalObservation) {
@@ -2064,27 +2070,32 @@ func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullReque
 	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
+	compactionObservation := codexCompactionV2Observation{}
+	if shaped, observation, errShape := shapeCodexCompactionV2Replay(fullRequest, codexCompactionV2RetainedTokenBudget); errShape == nil && observation.Applied {
+		fullRequest = shaped
+		compactionObservation = observation
+	}
 	if len(fullRequest) > codexWebsocketMaxIncrementalStateBytes {
 		s.resetCodexIncrementalStateLocked()
-		return fullRequest, codexIncrementalObservation{resetReason: "state_too_large"}
+		return fullRequest, codexIncrementalObservation{resetReason: "state_too_large", compaction: compactionObservation}
 	}
 	s.pendingRequest = bytes.Clone(fullRequest)
 	if s.lastResponseID == "" || len(s.lastRequest) == 0 {
-		return fullRequest, codexIncrementalObservation{resetReason: "no_previous_response"}
+		return fullRequest, codexIncrementalObservation{resetReason: "no_previous_response", compaction: compactionObservation}
 	}
 	delta, ok := codexIncrementalInput(s.lastRequest, s.lastResponseOutput, fullRequest)
 	if !ok {
-		return fullRequest, codexIncrementalObservation{resetReason: "request_mismatch"}
+		return fullRequest, codexIncrementalObservation{resetReason: "request_mismatch", compaction: compactionObservation}
 	}
 	incremental, errSet := sjson.SetRawBytes(fullRequest, "input", delta)
 	if errSet != nil {
-		return fullRequest, codexIncrementalObservation{resetReason: "delta_encode_failed"}
+		return fullRequest, codexIncrementalObservation{resetReason: "delta_encode_failed", compaction: compactionObservation}
 	}
 	incremental, errSet = sjson.SetBytes(incremental, "previous_response_id", s.lastResponseID)
 	if errSet != nil {
-		return fullRequest, codexIncrementalObservation{resetReason: "previous_response_encode_failed"}
+		return fullRequest, codexIncrementalObservation{resetReason: "previous_response_encode_failed", compaction: compactionObservation}
 	}
-	return incremental, codexIncrementalObservation{incremental: true}
+	return incremental, codexIncrementalObservation{incremental: true, compaction: compactionObservation}
 }
 
 func (s *codexWebsocketSession) completeCodexIncrementalRequest(completedPayload []byte) {

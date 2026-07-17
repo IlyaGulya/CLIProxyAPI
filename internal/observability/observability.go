@@ -588,6 +588,7 @@ func metricAttributes(fields map[string]any) []attribute.KeyValue {
 		"success": "success", "reused": "reused", "busy": "busy", "overflow": "overflow",
 		"incremental": "incremental", "rate_limited": "rate.limited", "downstream_committed": "downstream.committed",
 		"tool_call_started": "tool_call.started", "tool_call_completed": "tool_call.completed", "tool_call_in_progress": "tool_call.in_progress",
+		"compaction_applied": "compaction.applied",
 	} {
 		if value, ok := fields[source].(bool); ok {
 			out = append(out, attribute.Bool(target, value))
@@ -616,6 +617,8 @@ func spanAttributes(rootCorrelation, executionCorrelation string, fields map[str
 		"bytes": "message.bytes", "upstream_bytes": "upstream.bytes", "pool_idle": "pool.idle", "pool_dialing": "pool.dialing",
 		"attempt": "retry.attempt", "transport_retries": "retry.count",
 		"tool_calls_started": "tool_calls.started", "tool_calls_completed": "tool_calls.completed", "tool_calls_incomplete": "tool_calls.incomplete",
+		"compaction_retained_messages": "compaction.retained_messages", "compaction_retained_images": "compaction.retained_images",
+		"compaction_dropped_items": "compaction.dropped_items", "compaction_retained_tokens": "compaction.retained_tokens",
 	}
 	for source, target := range allowedNumbers {
 		if value, ok := numeric(fields[source]); ok {

@@ -107,6 +107,19 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 			},
 		})
 	}
+	rawJSON, compactionReplay := applyClaudeCompactionReplay(rawJSON, claudeCompactionV2RetainedTokenBudget)
+	if compactionReplay.Applied {
+		observability.RecordWebsocketEvent(c.Request.Context(), observability.WebsocketEvent{
+			Name: "compaction_replay_shaped",
+			Attributes: observability.WebsocketAttributes{
+				Model: gjson.GetBytes(rawJSON, "model").String(), CompactionApplied: observability.Some(true),
+				CompactionRetainedMessages: observability.Some(int64(compactionReplay.RetainedUserMessages)),
+				CompactionRetainedImages:   observability.Some(int64(compactionReplay.RetainedImages)),
+				CompactionDroppedItems:     observability.Some(int64(compactionReplay.DroppedMessages)),
+				CompactionRetainedTokens:   observability.Some(int64(compactionReplay.RetainedTokens)),
+			},
+		})
+	}
 	var editResult claudeContextEditResult
 	rawJSON, editResult = applyClaudeContextEditing(rawJSON)
 	if editResult.Applied {
@@ -222,6 +235,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 		return
 	}
 	rawJSON = repairedJSON
+	rawJSON, _ = applyClaudeCompactionReplay(rawJSON, claudeCompactionV2RetainedTokenBudget)
 	rawJSON, _ = applyClaudeContextEditing(rawJSON)
 
 	c.Header("Content-Type", "application/json")

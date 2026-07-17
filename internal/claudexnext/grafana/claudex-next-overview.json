@@ -123,6 +123,16 @@
           "legendFormat": "{{model}} {{event_name}} {{finish_reason}} {{suppression_reason}}"
         }],
         "gridPos": {"x": 0, "y": 50, "w": 24, "h": 8}
+      },
+      {
+        "id": 13, "type": "timeseries", "title": "Compaction V2 replay shaping",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "sum by (model, compaction_applied) (increase(claudex_proxy_events_total{event_name=\"request_prepared\",compaction_applied=\"true\",model=~\"$model\"}[6h]))",
+          "legendFormat": "{{model}} compacted"
+        }],
+        "gridPos": {"x": 0, "y": 58, "w": 24, "h": 8}
       }
     ]
   },

@@ -169,6 +169,11 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					switch contentType {
 					case "text":
 						appendTextContent(messageContentResult.Get("text").String())
+					case "compaction":
+						// Claude compaction summaries are plaintext context blocks. Codex
+						// compaction items require provider-encrypted content, so preserve
+						// the summary as assistant context instead of fabricating one.
+						appendTextContent(messageContentResult.Get("content").String())
 					case "thinking":
 						appendReasoningContent(messageContentResult)
 					case "image":
