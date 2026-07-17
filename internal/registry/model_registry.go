@@ -1220,6 +1220,7 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		result["max_input_tokens"] = maxInput
 		result["max_tokens"] = maxOutput
+		result["capabilities"] = claudeModelCapabilities(model)
 		return result
 
 	case "gemini":
@@ -1271,6 +1272,49 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 			result["created"] = model.Created
 		}
 		return result
+	}
+}
+
+func claudeModelCapabilities(model *ModelInfo) map[string]any {
+	support := func(value bool) map[string]any { return map[string]any{"supported": value} }
+	parameters := make(map[string]bool, len(model.SupportedParameters))
+	for _, parameter := range model.SupportedParameters {
+		parameters[strings.ToLower(strings.TrimSpace(parameter))] = true
+	}
+	modalities := make(map[string]bool, len(model.SupportedInputModalities))
+	for _, modality := range model.SupportedInputModalities {
+		modalities[strings.ToLower(strings.TrimSpace(modality))] = true
+	}
+	levels := map[string]bool{}
+	thinking := model.Thinking != nil
+	if thinking {
+		for _, level := range model.Thinking.Levels {
+			levels[strings.ToLower(strings.TrimSpace(level))] = true
+		}
+	}
+	effort := map[string]any{"supported": thinking}
+	for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+		effort[level] = support(levels[level])
+	}
+	return map[string]any{
+		"batch":              support(false),
+		"citations":          support(false),
+		"code_execution":     support(false),
+		"image_input":        support(modalities["image"]),
+		"pdf_input":          support(modalities["pdf"] || modalities["document"]),
+		"structured_outputs": support(parameters["structured_outputs"] || parameters["response_format"]),
+		"thinking": map[string]any{
+			"supported": thinking,
+			"types":     map[string]any{"adaptive": support(thinking), "enabled": support(thinking)},
+		},
+		"effort": effort,
+		// These operations are implemented by the proxy for every routed model.
+		"context_management": map[string]any{
+			"supported":                true,
+			"clear_thinking_20251015":  support(true),
+			"clear_tool_uses_20250919": support(true),
+			"compact_20260112":         support(false),
+		},
 	}
 }
 

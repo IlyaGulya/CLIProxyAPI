@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -269,6 +270,12 @@ func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
 		}
 	}
 	sortClaudeModelsByDisplayName(models)
+	start, end, ok := claudeModelPage(c, models)
+	if !ok {
+		return
+	}
+	hasMore := end < len(models)
+	models = models[start:end]
 	firstID := ""
 	lastID := ""
 	if len(models) > 0 {
@@ -282,10 +289,62 @@ func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"data":     models,
-		"has_more": false,
+		"has_more": hasMore,
 		"first_id": firstID,
 		"last_id":  lastID,
 	})
+}
+
+// ClaudeModel retrieves one available model or returns an Anthropic-shaped 404.
+func (h *ClaudeCodeAPIHandler) ClaudeModel(c *gin.Context) {
+	requested := util.ResolveClaudeModelIDPrefix(c.Param("model_id"))
+	for _, model := range h.Models() {
+		id, _ := model["id"].(string)
+		if id != requested && util.EnsureClaudeModelIDPrefix(id) != c.Param("model_id") {
+			continue
+		}
+		model["id"] = util.EnsureClaudeModelIDPrefix(id)
+		c.JSON(http.StatusOK, model)
+		return
+	}
+	c.JSON(http.StatusNotFound, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Type: "not_found_error", Message: "Model not found: " + c.Param("model_id")}})
+}
+
+func claudeModelPage(c *gin.Context, models []map[string]any) (int, int, bool) {
+	limit := 20
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Type: "invalid_request_error", Message: "limit must be between 1 and 1000"}})
+			return 0, 0, false
+		}
+		limit = parsed
+	}
+	start := 0
+	if cursor := c.Query("after_id"); cursor != "" {
+		for index, model := range models {
+			if model["id"] == cursor {
+				start = index + 1
+				break
+			}
+		}
+	}
+	end := len(models)
+	if cursor := c.Query("before_id"); cursor != "" {
+		for index, model := range models {
+			if model["id"] == cursor {
+				end = index
+				break
+			}
+		}
+	}
+	if start > end {
+		start = end
+	}
+	if start+limit < end {
+		end = start + limit
+	}
+	return start, end, true
 }
 
 // sortClaudeModelsByDisplayName sorts models by display_name ascending.
