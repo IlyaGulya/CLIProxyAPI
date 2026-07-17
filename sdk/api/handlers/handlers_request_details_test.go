@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -12,6 +13,47 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+func TestGetRequestDetails_UnknownModelReturnsActionableClientError(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	const clientID = "secret-auth-client-id-must-not-leak"
+	models := []*registry.ModelInfo{
+		{ID: "gpt-5.6-terra"},
+		{ID: "gpt-5.6-sol"},
+		{ID: "gpt-5.6-luna"},
+	}
+	for i := 0; i < 25; i++ {
+		models = append(models, &registry.ModelInfo{ID: fmt.Sprintf("test-overflow-model-%02d", i)})
+	}
+	modelRegistry.RegisterClient(clientID, "codex", models)
+	t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	_, _, errMsg := handler.getRequestDetails("claude-sonnet-5")
+	if errMsg == nil {
+		t.Fatal("expected unknown-model error, got nil")
+	}
+	if errMsg.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusBadRequest)
+	}
+
+	message := errMsg.Error.Error()
+	for _, want := range []string{"claude-sonnet-5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "and 8 more"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message does not contain %q: %q", want, message)
+		}
+	}
+	if strings.Index(message, "gpt-5.6-luna") > strings.Index(message, "gpt-5.6-sol") ||
+		strings.Index(message, "gpt-5.6-sol") > strings.Index(message, "gpt-5.6-terra") {
+		t.Errorf("available models are not sorted: %q", message)
+	}
+	if strings.Contains(message, clientID) {
+		t.Errorf("message leaked auth client ID: %q", message)
+	}
+	if strings.Contains(message, "test-overflow-model-19") {
+		t.Errorf("message did not bound the available-model list: %q", message)
+	}
+}
 
 func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()

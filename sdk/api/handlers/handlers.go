@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -52,6 +54,8 @@ type ErrorDetail struct {
 }
 
 const idempotencyKeyMetadataKey = "idempotency_key"
+
+const unknownModelAvailableListLimit = 20
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
@@ -1640,12 +1644,55 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	if len(providers) == 0 {
-		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		return nil, "", &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      unknownModelError(modelName),
+		}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+func unknownModelError(modelName string) error {
+	available := availableModelIDsForError()
+	if len(available) == 0 {
+		return fmt.Errorf("model %q is not configured; no models are currently available", modelName)
+	}
+
+	visible := available
+	remaining := 0
+	if len(visible) > unknownModelAvailableListLimit {
+		remaining = len(visible) - unknownModelAvailableListLimit
+		visible = visible[:unknownModelAvailableListLimit]
+	}
+
+	message := fmt.Sprintf("model %q is not configured; available models: %s", modelName, strings.Join(visible, ", "))
+	if remaining > 0 {
+		message += fmt.Sprintf(" (and %d more)", remaining)
+	}
+	return errors.New(message)
+}
+
+func availableModelIDsForError() []string {
+	models := registry.GetGlobalRegistry().GetAvailableModels("")
+	ids := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		id, ok := model["id"].(string)
+		id = strings.TrimSpace(id)
+		if !ok || id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (h *BaseAPIHandler) validateImageOnlyModel(modelName string, allowImageModel bool) *interfaces.ErrorMessage {

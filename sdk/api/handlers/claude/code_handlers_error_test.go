@@ -2,6 +2,7 @@ package claude
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -83,6 +88,49 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+}
+
+func TestClaudeMessagesUnknownModelReturnsAvailableModelsWithoutUpstreamAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const clientID = "claude-unknown-model-catalog-test"
+	registryRef := registry.GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "codex", []*registry.ModelInfo{
+		{ID: "gpt-5.6-terra"},
+		{ID: "gpt-5.6-sol"},
+		{ID: "gpt-5.6-luna"},
+	})
+	t.Cleanup(func() { registryRef.UnregisterClient(clientID) })
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	handler := NewClaudeCodeAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, manager))
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-streaming", true: "streaming"}[stream], func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			payload := fmt.Sprintf(`{
+				"model":"claude-sonnet-5",
+				"max_tokens":1024,
+				"stream":%t,
+				"messages":[{"role":"user","content":"hello"}]
+			}`, stream)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(payload))
+
+			handler.ClaudeMessages(c)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if got := gjson.GetBytes(recorder.Body.Bytes(), "error.type").String(); got != "invalid_request_error" {
+				t.Fatalf("error.type = %q, want invalid_request_error; body=%s", got, recorder.Body.String())
+			}
+			message := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String()
+			for _, want := range []string{"claude-sonnet-5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"} {
+				if !strings.Contains(message, want) {
+					t.Errorf("error.message does not contain %q: %q", want, message)
+				}
+			}
+		})
 	}
 }
 
