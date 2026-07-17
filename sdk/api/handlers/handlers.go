@@ -1284,6 +1284,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	}
 	readInitialStreamChunks()
+	// http.Header is a map and cannot be mutated safely after it is returned to
+	// the caller. Header-init interception is complete at this boundary.
+	streamHeadersCommitted = true
 
 	go func() {
 		defer close(dataChan)
@@ -1361,7 +1364,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 								baseStreamHeaders = cloneHeader(retryResult.Headers)
 								replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
 								streamHeaderInitialized = false
-								streamHeadersCommitted = false
 								pendingChunks = nil
 								streamClosedBeforeRead = false
 								chunks = retryResult.Chunks
@@ -1422,7 +1424,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 						}
 					}
 					sentPayload = true
-					streamHeadersCommitted = true
 					if okSendData := sendData(payload); !okSendData {
 						return
 					}
