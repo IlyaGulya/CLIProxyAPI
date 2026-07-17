@@ -77,6 +77,7 @@ codex-websocket-generate-false-warmup: true
 		"codex-websocket-preconnect-ttl-seconds: 30",
 		"codex-websocket-adaptive-preconnect: true",
 		"codex-cache-aware-compaction: true",
+		"codex-websocket-circuit-breaker: true",
 		"codex-websocket-generate-false-warmup: false",
 		"secret-value",
 	} {

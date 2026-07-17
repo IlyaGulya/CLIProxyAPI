@@ -38,6 +38,7 @@ func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
 	values["codex-websocket-preconnect-ttl-seconds"] = 30
 	values["codex-websocket-adaptive-preconnect"] = true
 	values["codex-cache-aware-compaction"] = true
+	values["codex-websocket-circuit-breaker"] = true
 	if _, configured := values["claude-code-auto-mode-classifier-model"]; !configured {
 		values["claude-code-auto-mode-classifier-model"] = "gpt-5.6-luna"
 	}
