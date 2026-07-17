@@ -471,3 +471,17 @@ func TestEvidenceChecksumsDetectMutation(t *testing.T) {
 		t.Fatal("mutated evidence passed checksum verification")
 	}
 }
+
+func TestIntersectsAllRequiresOneTraceSharedByEveryService(t *testing.T) {
+	t.Parallel()
+	launcher := map[string]struct{}{"shared": {}, "launcher-only": {}}
+	claude := map[string]struct{}{"shared": {}, "claude-only": {}}
+	proxy := map[string]struct{}{"shared": {}, "proxy-only": {}}
+	if !intersectsAll(launcher, claude, proxy) {
+		t.Fatal("shared trace was not detected")
+	}
+	delete(proxy, "shared")
+	if intersectsAll(launcher, claude, proxy) {
+		t.Fatal("pairwise-only trace was accepted as three-service correlation")
+	}
+}

@@ -190,10 +190,19 @@ func TestInSessionModelSwitchingAndDetachedPreconnectLinks(t *testing.T) {
 
 	spans := exporter.GetSpans()
 	var detached tracetest.SpanStub
+	models := make(map[string]string)
 	for _, span := range spans {
 		if span.Name == "proxy.websocket.speculative_preconnect_ready" {
 			detached = span
 		}
+		for _, attr := range span.Attributes {
+			if string(attr.Key) == "model" {
+				models[span.Name] = attr.Value.AsString()
+			}
+		}
+	}
+	if models["root-sol"] != "gpt-5.6-sol" || models["child-luna"] != "gpt-5.6-luna" {
+		t.Fatalf("active span model attributes = %+v", models)
 	}
 	if detached.Name == "" || len(detached.Links) != 1 {
 		t.Fatalf("detached span links = %+v in spans %+v", detached.Links, spans)

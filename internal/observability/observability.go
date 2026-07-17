@@ -481,6 +481,9 @@ func RecordWebsocketEvent(ctx context.Context, event WebsocketEvent) {
 		return
 	}
 	span := trace.SpanFromContext(ctx)
+	if model := normalizeModel(text(fields["model"])); model != "" {
+		span.SetAttributes(attribute.String("model", model))
+	}
 	if span.SpanContext().IsValid() && key != ":" {
 		t.links.Store(key, span.SpanContext())
 	}

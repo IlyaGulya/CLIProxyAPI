@@ -60,9 +60,18 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 		"grafana_dashboard_present": "/api/dashboards/uid/claudex-next-overview",
 		"proxy_metrics_present":     "/api/datasources/proxy/uid/prometheus/api/v1/query?query=" + url.QueryEscape("sum(claudex_proxy_events_total)"),
 		"claude_metrics_present":    "/api/datasources/proxy/uid/prometheus/api/v1/query?query=" + url.QueryEscape(`sum({__name__=~"claude_code_.*|claudex_claude_.*"})`),
-		"correlated_traces_present": "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && resource.service.name = "claudex-next" } && { resource.service.name = "claude-code" } && { resource.service.name = "cli-proxy-api" }`, manifest.RunID)),
 		"correlated_logs_present":   "/api/datasources/proxy/uid/loki/loki/api/v1/query_range?query=" + url.QueryEscape(fmt.Sprintf(`{service_name=~"claude-code|cli-proxy-api|claudex-next"} | claudex_run_id="%s"`, manifest.RunID)) + "&limit=20",
 	}
+	serviceTraces := make([]map[string]struct{}, 0, 3)
+	for _, service := range []string{"claudex-next", "claude-code", "cli-proxy-api"} {
+		query := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && resource.service.name = "%s" }`, manifest.RunID, service))
+		traces, errTraces := grafanaTempoTraceIDs(ctx, client, query)
+		if errTraces != nil {
+			report.BackendErrors["correlated_traces_present"] = errTraces.Error()
+		}
+		serviceTraces = append(serviceTraces, traces)
+	}
+	report.Checks["correlated_traces_present"] = intersectsAll(serviceTraces...)
 	solTraceQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.model = "gpt-5.6-sol" }`, manifest.RunID))
 	lunaTraceQuery := grafanaURL + "/api/datasources/proxy/uid/tempo/api/search?q=" + url.QueryEscape(fmt.Sprintf(`{ resource.claudex.run_id = "%s" && span.model = "gpt-5.6-luna" }`, manifest.RunID))
 	solTraces, errSolTraces := grafanaTempoTraceIDs(ctx, client, solTraceQuery)
@@ -136,6 +145,25 @@ func grafanaTempoTraceIDs(ctx context.Context, client *http.Client, endpoint str
 func intersects(left, right map[string]struct{}) bool {
 	for value := range left {
 		if _, ok := right[value]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func intersectsAll(sets ...map[string]struct{}) bool {
+	if len(sets) == 0 {
+		return false
+	}
+	for candidate := range sets[0] {
+		present := true
+		for _, set := range sets[1:] {
+			if _, ok := set[candidate]; !ok {
+				present = false
+				break
+			}
+		}
+		if present {
 			return true
 		}
 	}
