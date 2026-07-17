@@ -1,0 +1,1 @@
+{"events":[{"type":"system","subtype":"init","session_id":"session_fixture","model":"model-placeholder"},{"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg_fixture","stop_reason":"end_turn"}},{"type":"result","subtype":"success","is_error":false,"session_id":"session_fixture","terminal_reason":"completed"}]}

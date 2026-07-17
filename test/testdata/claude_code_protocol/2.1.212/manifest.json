@@ -1,0 +1,67 @@
+{
+  "version": "2.1.212",
+  "fixtures": ["messages_request.json", "sse_stream.json", "error.json", "models.json", "harness_stream.json"],
+  "classifications": {
+    "messages_request.json": {
+      "anthropic_version": "passthrough",
+      "cache_control.type": "translated",
+      "context_management.edits[].type": "emulated",
+      "max_tokens": "translated",
+      "messages[].content[].text": "translated",
+      "messages[].content[].type": "translated",
+      "messages[].role": "translated",
+      "model": "translated",
+      "stream": "translated",
+      "system[].cache_control.ttl": "translated",
+      "system[].cache_control.type": "translated",
+      "system[].text": "translated",
+      "system[].type": "translated",
+      "tools[].max_uses": "translated",
+      "tools[].name": "translated",
+      "tools[].type": "translated"
+    },
+    "sse_stream.json": {
+      "events[].content_block.text": "translated",
+      "events[].content_block.type": "translated",
+      "events[].delta.stop_reason": "translated",
+      "events[].delta.stop_sequence": "translated",
+      "events[].delta.text": "translated",
+      "events[].delta.type": "translated",
+      "events[].index": "translated",
+      "events[].message.id": "translated",
+      "events[].message.model": "translated",
+      "events[].message.role": "translated",
+      "events[].message.stop_reason": "translated",
+      "events[].message.usage.input_tokens": "translated",
+      "events[].message.usage.output_tokens": "translated",
+      "events[].type": "translated",
+      "events[].usage.output_tokens": "translated"
+    },
+    "error.json": {
+      "error.message": "translated",
+      "error.type": "translated",
+      "request_id": "passthrough",
+      "type": "translated"
+    },
+    "models.json": {
+      "data[].created_at": "emulated",
+      "data[].display_name": "emulated",
+      "data[].id": "translated",
+      "data[].type": "emulated",
+      "first_id": "emulated",
+      "has_more": "emulated",
+      "last_id": "emulated"
+    },
+    "harness_stream.json": {
+      "events[].is_error": "passthrough",
+      "events[].message.id": "passthrough",
+      "events[].message.stop_reason": "passthrough",
+      "events[].model": "passthrough",
+      "events[].parent_tool_use_id": "passthrough",
+      "events[].session_id": "passthrough",
+      "events[].subtype": "passthrough",
+      "events[].terminal_reason": "passthrough",
+      "events[].type": "passthrough"
+    }
+  }
+}

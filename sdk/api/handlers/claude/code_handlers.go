@@ -11,6 +11,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,6 +87,25 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	repairedJSON, repairResult, errRepair := repairInterruptedClaudeToolHistory(rawJSON)
+	if errRepair != nil {
+		message := "Invalid tool history"
+		if !errors.Is(errRepair, errAmbiguousClaudeToolHistory) {
+			message = "Unable to validate tool history"
+		}
+		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Message: message, Type: "invalid_request_error"}})
+		return
+	}
+	rawJSON = repairedJSON
+	if repairResult.Applied {
+		observability.RecordWebsocketEvent(c.Request.Context(), observability.WebsocketEvent{
+			Name: "tool_history_repaired",
+			Attributes: observability.WebsocketAttributes{
+				RepairedToolUses:           observability.Some(int64(repairResult.RepairedToolUses)),
+				SeparatedAssistantMessages: observability.Some(int64(repairResult.SeparatedAssistantMessages)),
+			},
+		})
+	}
 	var editResult claudeContextEditResult
 	rawJSON, editResult = applyClaudeContextEditing(rawJSON)
 	if editResult.Applied {
