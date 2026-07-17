@@ -12,12 +12,8 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-func TestCodexWebsocketsExecutor_SessionStoreSurvivesExecutorReplacement(t *testing.T) {
+func TestCodexWebsocketsExecutor_SessionStoreIsInstanceOwnedAndDrained(t *testing.T) {
 	sessionID := "test-session-store-survives-replace"
-
-	globalCodexWebsocketSessionStore.mu.Lock()
-	delete(globalCodexWebsocketSessionStore.sessions, sessionID)
-	globalCodexWebsocketSessionStore.mu.Unlock()
 
 	exec1 := NewCodexWebsocketsExecutor(nil)
 	sess1 := exec1.getOrCreateSession(sessionID)
@@ -30,26 +26,66 @@ func TestCodexWebsocketsExecutor_SessionStoreSurvivesExecutorReplacement(t *test
 	if sess2 == nil {
 		t.Fatalf("expected session to be available across executors")
 	}
-	if sess1 != sess2 {
-		t.Fatalf("expected the same session instance across executors")
+	if sess1 == sess2 {
+		t.Fatalf("independent executors unexpectedly shared a session")
 	}
 
 	exec1.CloseExecutionSession(cliproxyauth.CloseAllExecutionSessionsID)
-
-	globalCodexWebsocketSessionStore.mu.Lock()
-	_, stillPresent := globalCodexWebsocketSessionStore.sessions[sessionID]
-	globalCodexWebsocketSessionStore.mu.Unlock()
-	if !stillPresent {
-		t.Fatalf("expected session to remain after executor replacement close marker")
+	if got := exec1.getOrCreateSession("new-after-drain"); got != nil {
+		t.Fatalf("drained executor created a new session: %#v", got)
+	}
+	exec1.store.mu.Lock()
+	_, presentAfterDrain := exec1.store.sessions[sessionID]
+	exec1.store.mu.Unlock()
+	if presentAfterDrain {
+		t.Fatalf("expected owned session to be removed by drain")
 	}
 
+	exec2.store.mu.Lock()
+	_, secondPresent := exec2.store.sessions[sessionID]
+	exec2.store.mu.Unlock()
+	if !secondPresent {
+		t.Fatalf("draining first executor affected second executor")
+	}
 	exec2.CloseExecutionSession(sessionID)
+}
 
-	globalCodexWebsocketSessionStore.mu.Lock()
-	_, presentAfterClose := globalCodexWebsocketSessionStore.sessions[sessionID]
-	globalCodexWebsocketSessionStore.mu.Unlock()
-	if presentAfterClose {
-		t.Fatalf("expected session to be removed after explicit close")
+func TestCodexWebsocketsExecutor_DrainWaitsForInFlightSession(t *testing.T) {
+	exec := NewCodexWebsocketsExecutor(nil)
+	sess := exec.getOrCreateSession("in-flight")
+	if sess == nil {
+		t.Fatal("expected session")
+	}
+	sess.reqMu.Lock()
+
+	drained := make(chan struct{})
+	go func() {
+		exec.CloseExecutionSession(cliproxyauth.CloseAllExecutionSessionsID)
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("drain blocked executor replacement")
+	}
+
+	exec.store.mu.Lock()
+	_, present := exec.store.sessions["in-flight"]
+	exec.store.mu.Unlock()
+	if present {
+		t.Fatal("draining runtime still exposed in-flight session")
+	}
+	sess.reqMu.Unlock()
+
+	completed := make(chan struct{})
+	go func() {
+		exec.drainWG.Wait()
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("session drain did not finish after request released it")
 	}
 }
 

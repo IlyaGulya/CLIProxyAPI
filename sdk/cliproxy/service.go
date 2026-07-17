@@ -749,9 +749,7 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	}
 	GlobalModelRegistry().UnregisterClient(id)
 	s.coreManager.Remove(ctx, id)
-	if strings.EqualFold(provider, "codex") {
-		executor.CloseCodexWebsocketSessionsForAuthID(id, "auth_removed")
-	}
+	s.coreManager.CloseAuthExecutionSessions(id, "auth_removed")
 	if strings.EqualFold(provider, "xai") {
 		executor.CloseXAIWebsocketSessionsForAuthID(id, "auth_removed")
 	}

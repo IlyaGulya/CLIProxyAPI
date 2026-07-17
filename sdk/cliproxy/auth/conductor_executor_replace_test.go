@@ -14,6 +14,8 @@ type replaceAwareExecutor struct {
 
 	mu               sync.Mutex
 	closedSessionIDs []string
+	closedAuthIDs    []string
+	closeReasons     []string
 }
 
 func (e *replaceAwareExecutor) Identifier() string {
@@ -54,6 +56,13 @@ func (e *replaceAwareExecutor) ClosedSessionIDs() []string {
 	out := make([]string, len(e.closedSessionIDs))
 	copy(out, e.closedSessionIDs)
 	return out
+}
+
+func (e *replaceAwareExecutor) CloseAuthExecutionSessions(authID, reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closedAuthIDs = append(e.closedAuthIDs, authID)
+	e.closeReasons = append(e.closeReasons, reason)
 }
 
 func TestManagerRegisterExecutorClosesReplacedExecutionSessions(t *testing.T) {
@@ -100,5 +109,23 @@ func TestManagerExecutorReturnsRegisteredExecutor(t *testing.T) {
 	_, okMissing := manager.Executor("unknown")
 	if okMissing {
 		t.Fatal("expected unknown provider lookup to fail")
+	}
+}
+
+func TestManagerCloseAuthExecutionSessionsUsesRegisteredExecutorOwnership(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	exec := &replaceAwareExecutor{id: "codex"}
+	manager.RegisterExecutor(exec)
+	manager.CloseAuthExecutionSessions(" auth-a ", "auth_removed")
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.closedAuthIDs) != 1 || exec.closedAuthIDs[0] != "auth-a" {
+		t.Fatalf("closed auth IDs = %#v, want [auth-a]", exec.closedAuthIDs)
+	}
+	if len(exec.closeReasons) != 1 || exec.closeReasons[0] != "auth_removed" {
+		t.Fatalf("close reasons = %#v, want [auth_removed]", exec.closeReasons)
 	}
 }

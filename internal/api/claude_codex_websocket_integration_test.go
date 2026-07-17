@@ -218,7 +218,6 @@ func TestClaudeMessagesAgentToolSpeculativelyPreconnectsChildWebsocket(t *testin
 	if _, errRegister := server.handlers.AuthManager.Register(context.Background(), credential); errRegister != nil {
 		t.Fatalf("register Codex credential: %v", errRegister)
 	}
-	t.Cleanup(func() { runtimeexecutor.CloseCodexWebsocketSessionsForAuthID(credential.ID, "test_cleanup") })
 
 	rootPayload := `{"model":"gpt-5.6-sol","tools":[{"name":"Agent","description":"spawn child","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"spawn one child"}],"max_tokens":128,"stream":true}`
 	rootReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(rootPayload))
@@ -431,7 +430,6 @@ func TestClaudeMessagesConcurrentSameSessionUsesOverflowWebsocket(t *testing.T) 
 	}
 	registry.GetGlobalRegistry().RegisterClient(credential.ID, credential.Provider, []*registry.ModelInfo{{ID: "gpt-5.6-sol"}})
 	t.Cleanup(func() {
-		runtimeexecutor.CloseCodexWebsocketSessionsForAuthID(credential.ID, "test_cleanup")
 		registry.GetGlobalRegistry().UnregisterClient(credential.ID)
 	})
 	if _, errRegister := server.handlers.AuthManager.Register(context.Background(), credential); errRegister != nil {

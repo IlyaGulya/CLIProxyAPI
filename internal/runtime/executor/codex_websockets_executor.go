@@ -54,16 +54,16 @@ const (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	store *codexWebsocketSessionStore
+	store    *codexWebsocketSessionStore
+	pool     *codexWebsocketPreconnectPool
+	draining bool
+	drainMu  sync.RWMutex
+	drainWG  sync.WaitGroup
 }
 
 type codexWebsocketSessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]*codexWebsocketSession
-}
-
-var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
-	sessions: make(map[string]*codexWebsocketSession),
 }
 
 type codexWebsocketSession struct {
@@ -140,8 +140,13 @@ func (s *codexWebsocketSession) connectionObservation(conn *websocket.Conn) (tim
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	return &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
-		store:         globalCodexWebsocketSessionStore,
+		store:         newCodexWebsocketSessionStore(),
+		pool:          newCodexWebsocketPreconnectPool(),
 	}
+}
+
+func newCodexWebsocketSessionStore() *codexWebsocketSessionStore {
+	return &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 }
 
 type codexWebsocketRead struct {
@@ -2039,9 +2044,15 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if e == nil {
 		return nil
 	}
+	e.drainMu.RLock()
+	draining := e.draining
+	e.drainMu.RUnlock()
+	if draining {
+		return nil
+	}
 	store := e.store
 	if store == nil {
-		store = globalCodexWebsocketSessionStore
+		return nil
 	}
 	now := time.Now()
 	ttl := codexWebsocketDefaultSessionTTL
@@ -2516,15 +2527,19 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	if sessionID == cliproxyauth.CloseAllExecutionSessionsID {
-		// Executor replacement can happen during hot reload (config/credential changes).
-		// Do not force-close upstream websocket sessions here, otherwise in-flight
-		// downstream websocket requests get interrupted.
+		e.drainMu.Lock()
+		e.draining = true
+		e.drainMu.Unlock()
+		if e.pool != nil {
+			e.pool.closeAll()
+		}
+		e.drainExecutionSessions("executor_drained")
 		return
 	}
 
 	store := e.store
 	if store == nil {
-		store = globalCodexWebsocketSessionStore
+		return
 	}
 	store.mu.Lock()
 	sess := store.sessions[sessionID]
@@ -2541,7 +2556,7 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 
 	store := e.store
 	if store == nil {
-		store = globalCodexWebsocketSessionStore
+		return
 	}
 	store.mu.Lock()
 	sessions := make([]*codexWebsocketSession, 0, len(store.sessions))
@@ -2555,6 +2570,31 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 
 	for i := range sessions {
 		e.closeExecutionSession(sessions[i], reason)
+	}
+}
+
+func (e *CodexWebsocketsExecutor) drainExecutionSessions(reason string) {
+	if e == nil || e.store == nil {
+		return
+	}
+	e.store.mu.Lock()
+	sessions := make([]*codexWebsocketSession, 0, len(e.store.sessions))
+	for sessionID, sess := range e.store.sessions {
+		delete(e.store.sessions, sessionID)
+		if sess != nil {
+			sessions = append(sessions, sess)
+		}
+	}
+	e.store.mu.Unlock()
+
+	for _, sess := range sessions {
+		e.drainWG.Add(1)
+		go func(session *codexWebsocketSession) {
+			defer e.drainWG.Done()
+			session.reqMu.Lock()
+			defer session.reqMu.Unlock()
+			e.closeExecutionSession(session, reason)
+		}(sess)
 	}
 }
 
@@ -2616,20 +2656,21 @@ func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string
 	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
 }
 
-// CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
-// associated with the supplied auth ID.
-func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
+// CloseAuthExecutionSessions closes this executor's Codex resources for an auth ID.
+func (e *CodexWebsocketsExecutor) CloseAuthExecutionSessions(authID string, reason string) {
 	authID = strings.TrimSpace(authID)
-	if authID == "" {
+	if e == nil || authID == "" {
 		return
 	}
-	globalCodexWebsocketPreconnectPool.closeAuth(authID)
+	if e.pool != nil {
+		e.pool.closeAuth(authID)
+	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "auth_removed"
 	}
 
-	store := globalCodexWebsocketSessionStore
+	store := e.store
 	if store == nil {
 		return
 	}
@@ -2752,6 +2793,13 @@ func (e *CodexAutoExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	e.wsExec.CloseExecutionSession(sessionID)
+}
+
+func (e *CodexAutoExecutor) CloseAuthExecutionSessions(authID, reason string) {
+	if e == nil || e.wsExec == nil {
+		return
+	}
+	e.wsExec.CloseAuthExecutionSessions(authID, reason)
 }
 
 func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {

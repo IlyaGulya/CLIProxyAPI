@@ -184,8 +184,6 @@ func TestScheduleSpeculativePreconnectRecordsReadyMetric(t *testing.T) {
 	})
 
 	authID := "preconnect-ready-metric"
-	globalCodexWebsocketPreconnectPool.closeAuth(authID)
-	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		RequestLog:                          true,
 		CodexWebsocketSpeculativePreconnect: true,
@@ -235,8 +233,6 @@ func TestScheduleSpeculativePreconnectRecordsRateLimitedFailureMetric(t *testing
 	defer server.Close()
 
 	authID := "preconnect-failed-metric"
-	globalCodexWebsocketPreconnectPool.closeAuth(authID)
-	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		RequestLog:                          true,
 		CodexWebsocketSpeculativePreconnect: true,
@@ -285,8 +281,6 @@ func TestSuccessfulLeaseReplenishesWithinCap(t *testing.T) {
 	})
 
 	authID := "preconnect-replenish"
-	globalCodexWebsocketPreconnectPool.closeAuth(authID)
-	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		RequestLog:                          true,
 		CodexWebsocketSpeculativePreconnect: true,
@@ -314,7 +308,7 @@ func TestSuccessfulLeaseReplenishesWithinCap(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
+		idle, dialing := exec.pool.snapshot()
 		if idle == 1 && dialing == 0 {
 			return
 		}
@@ -350,8 +344,6 @@ func TestReplenishment429EntersCooldownWithoutRetryLoop(t *testing.T) {
 	})
 
 	authID := "preconnect-replenish-429"
-	globalCodexWebsocketPreconnectPool.closeAuth(authID)
-	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		CodexWebsocketSpeculativePreconnect: true,
 		CodexWebsocketPreconnectReplenish:   true,
@@ -383,7 +375,7 @@ func TestReplenishment429EntersCooldownWithoutRetryLoop(t *testing.T) {
 	if attempts.Load() != 2 {
 		t.Fatalf("429 replenishment retried in a loop: attempts=%d", attempts.Load())
 	}
-	if idle, dialing := globalCodexWebsocketPreconnectPool.snapshot(); idle != 0 || dialing != 0 {
+	if idle, dialing := exec.pool.snapshot(); idle != 0 || dialing != 0 {
 		t.Fatalf("pool after 429 = idle %d dialing %d, want empty", idle, dialing)
 	}
 }
@@ -407,8 +399,6 @@ func TestParallelLeasesReplenishWithoutExceedingCap(t *testing.T) {
 	})
 
 	authID := "preconnect-parallel-replenish"
-	globalCodexWebsocketPreconnectPool.closeAuth(authID)
-	t.Cleanup(func() { globalCodexWebsocketPreconnectPool.closeAuth(authID) })
 	cfg := &config.Config{SDKConfig: config.SDKConfig{
 		CodexWebsocketSpeculativePreconnect: true,
 		CodexWebsocketPreconnectReplenish:   true,
@@ -450,7 +440,7 @@ func TestParallelLeasesReplenishWithoutExceedingCap(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		idle, dialing := globalCodexWebsocketPreconnectPool.snapshot()
+		idle, dialing := exec.pool.snapshot()
 		if idle+dialing > 2 {
 			t.Fatalf("parallel replenishment exceeded cap: idle=%d dialing=%d", idle, dialing)
 		}

@@ -63,6 +63,11 @@ type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
 }
 
+// AuthExecutionSessionCloser releases runtime resources owned by one credential.
+type AuthExecutionSessionCloser interface {
+	CloseAuthExecutionSessions(authID, reason string)
+}
+
 const (
 	homeAuthCountMetadataKey = "__cliproxy_home_auth_count"
 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
@@ -4550,6 +4555,26 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 	for i := range executors {
 		if closer, ok := executors[i].(ExecutionSessionCloser); ok && closer != nil {
 			closer.CloseExecutionSession(sessionID)
+		}
+	}
+}
+
+// CloseAuthExecutionSessions asks all registered executors to release resources
+// associated with one credential without relying on process-global registries.
+func (m *Manager) CloseAuthExecutionSessions(authID, reason string) {
+	authID = strings.TrimSpace(authID)
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	executors := make([]ProviderExecutor, 0, len(m.executors))
+	for _, exec := range m.executors {
+		executors = append(executors, exec)
+	}
+	m.mu.RUnlock()
+	for _, exec := range executors {
+		if closer, ok := exec.(AuthExecutionSessionCloser); ok && closer != nil {
+			closer.CloseAuthExecutionSessions(authID, reason)
 		}
 	}
 }
