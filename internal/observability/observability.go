@@ -484,13 +484,15 @@ func metricAttributes(fields map[string]any) []attribute.KeyValue {
 		out = append(out, attribute.String("model", value))
 	}
 	for source, target := range map[string]string{
-		"connection_source":  "connection.source",
-		"source_format":      "source.format",
-		"reason":             "finish.reason",
-		"last_event_type":    "stream.last_event_type",
-		"status":             "status.code",
-		"boundary":           "retry.boundary",
-		"suppression_reason": "retry.suppression_reason",
+		"connection_source":        "connection.source",
+		"source_format":            "source.format",
+		"reason":                   "finish.reason",
+		"last_event_type":          "stream.last_event_type",
+		"status":                   "status.code",
+		"boundary":                 "retry.boundary",
+		"suppression_reason":       "retry.suppression_reason",
+		"chain_source":             "chain.source",
+		"incremental_reset_reason": "incremental.reset_reason",
 	} {
 		if value := boundedEnum(text(fields[source])); value != "" {
 			out = append(out, attribute.String(target, value))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,22 @@ func TestExtractClaudeCodeSessionIDFromPayloadJSON(t *testing.T) {
 	got := ExtractClaudeCodeSessionID(context.Background(), payload, nil)
 	if got != "cache-session-1" {
 		t.Fatalf("ExtractClaudeCodeSessionID() = %q, want cache-session-1", got)
+	}
+}
+
+func TestClaudeCodePromptCacheIDDeterministicWithoutStore(t *testing.T) {
+	first := ClaudeCodePromptCacheID(" gpt-5.6-luna ", " auth-a ", "session-a")
+	second := ClaudeCodePromptCacheID("gpt-5.6-luna", "auth-a", "session-a")
+	if first == "" || first != second {
+		t.Fatalf("deterministic cache ID mismatch: first=%q second=%q", first, second)
+	}
+	if strings.Contains(first, "auth-a") || strings.Contains(first, "session-a") || strings.Contains(first, "gpt-5.6-luna") {
+		t.Fatalf("cache ID leaked raw identity: %q", first)
+	}
+	if first == ClaudeCodePromptCacheID("gpt-5.6-luna", "auth-b", "session-a") ||
+		first == ClaudeCodePromptCacheID("gpt-5.6-sol", "auth-a", "session-a") ||
+		first == ClaudeCodePromptCacheID("gpt-5.6-luna", "auth-a", "session-b") {
+		t.Fatalf("cache ID did not isolate model/auth/session: %q", first)
 	}
 }
 

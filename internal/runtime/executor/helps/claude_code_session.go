@@ -119,12 +119,16 @@ func ClaudeCodePromptCacheForAuth(ctx context.Context, modelName string, authID 
 	if cache, ok, errCache := GetCodexCacheRequired(ctx, key); errCache != nil || ok {
 		return cache, ok, errCache
 	}
-	cache := CodexCache{
-		ID:     uuid.New().String(),
-		Expire: time.Now().Add(1 * time.Hour),
-	}
+	cache := CodexCache{ID: ClaudeCodePromptCacheID(modelName, authID, sessionID), Expire: time.Now().Add(time.Hour)}
 	if errSet := SetCodexCacheRequired(ctx, key, cache); errSet != nil {
 		return CodexCache{}, false, errSet
 	}
 	return cache, true, nil
+}
+
+// ClaudeCodePromptCacheID is stable across proxy processes while remaining
+// opaque and isolated by upstream model, credential, and Claude session.
+func ClaudeCodePromptCacheID(modelName, authID, sessionID string) string {
+	identity := strings.TrimSpace(modelName) + "\x00" + strings.TrimSpace(authID) + "\x00" + strings.TrimSpace(sessionID)
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:claude-prompt-cache\x00"+identity)).String()
 }

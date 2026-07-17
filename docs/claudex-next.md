@@ -54,6 +54,15 @@ latencies, speculative hit rate, pool state, cache/token activity, failures,
 model switching, mid-response WebSocket failure semantics, connection age,
 process health, and correlated logs.
 
+On a resumed Claude session after either process restarts, the first request
+starts a fresh upstream response chain and safely replays the complete prompt.
+Its prompt-cache identity and canonical cacheable prefix remain stable across
+processes; subsequent turns use `previous_response_id` only within the new
+process-local chain. The dashboard's **Restart replay and incremental chains**
+panel and each run's `summary.json` expose the chain source, reset reason,
+request sizes, cache-read tokens, and prefix fingerprint without raw prompts or
+session identifiers.
+
 Claude Code exports its native metrics, events, and beta traces. CLIProxyAPI
 exports HTTP request spans, DNS/TCP/TLS/WebSocket phases, upstream first-event
 and first-text timings, translation/downstream flush timings, retry/failure

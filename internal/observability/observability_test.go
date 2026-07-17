@@ -26,6 +26,8 @@ func TestMetricAttributesAreBoundedAndPrivacySafe(t *testing.T) {
 		"connection_source":               "speculative",
 		"reason":                          "completed",
 		"success":                         true,
+		"chain_source":                    "full_replay",
+		"incremental_reset_reason":        "no_previous_response",
 		"claude_root_correlation_id":      "root-secret",
 		"claude_execution_correlation_id": "exec-secret",
 		"prompt_prefix_fingerprint":       "fingerprint",
@@ -33,7 +35,7 @@ func TestMetricAttributesAreBoundedAndPrivacySafe(t *testing.T) {
 		"session_id":                      "session-secret",
 	})
 	text := attributesString(got)
-	for _, want := range []string{"model=gpt-5.6-luna", "connection.source=speculative", "finish.reason=completed", "success=true"} {
+	for _, want := range []string{"model=gpt-5.6-luna", "connection.source=speculative", "finish.reason=completed", "success=true", "chain.source=full_replay", "incremental.reset_reason=no_previous_response"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("attributes missing %q: %s", want, text)
 		}

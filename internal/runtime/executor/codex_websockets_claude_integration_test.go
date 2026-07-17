@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +20,102 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestClaudeCodexWebsocketTwoProcessRestartReplay(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	captured := make(chan []byte, 4)
+	var responseNumber atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		for turn := 0; turn < 2; turn++ {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+			captured <- bytes.Clone(payload)
+			n := responseNumber.Add(1)
+			id := fmt.Sprintf("resp-%d", n)
+			output := `[]`
+			if turn == 0 {
+				output = `[{"id":"msg-1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer one","annotations":[]}]}]`
+			}
+			completed := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"model":"gpt-5.6-sol","output":%s,"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":8},"output_tokens":1,"total_tokens":11}}}`, id, output))
+			if err := conn.WriteMessage(websocket.TextMessage, completed); err != nil {
+				t.Errorf("write: %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	for process := 0; process < 2; process++ {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestClaudeCodexWebsocketRestartHelper$", "-test.v")
+		cmd.Env = append(os.Environ(), "CLIPROXY_RESTART_HELPER=1", "CLIPROXY_RESTART_URL="+server.URL)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("process %d: %v\n%s", process+1, err, output)
+		}
+	}
+	requests := make([][]byte, 4)
+	for i := range requests {
+		select {
+		case requests[i] = <-captured:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("request %d missing", i)
+		}
+	}
+	firstKey := gjson.GetBytes(requests[0], "prompt_cache_key").String()
+	if firstKey == "" {
+		t.Fatalf("first prompt cache key missing: %s", requests[0])
+	}
+	for i, request := range requests {
+		if got := gjson.GetBytes(request, "prompt_cache_key").String(); got != firstKey {
+			t.Fatalf("request %d cache key=%q want %q", i, got, firstKey)
+		}
+	}
+	if got := gjson.GetBytes(requests[0], "previous_response_id").String(); got != "" {
+		t.Fatalf("process A first previous=%q", got)
+	}
+	if got := gjson.GetBytes(requests[1], "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("process A delta previous=%q", got)
+	}
+	if got := gjson.GetBytes(requests[2], "previous_response_id").String(); got != "" {
+		t.Fatalf("process B inherited stale previous=%q", got)
+	}
+	if got := gjson.GetBytes(requests[3], "previous_response_id").String(); got != "resp-3" {
+		t.Fatalf("process B delta previous=%q", got)
+	}
+}
+
+func TestClaudeCodexWebsocketRestartHelper(t *testing.T) {
+	if os.Getenv("CLIPROXY_RESTART_HELPER") != "1" {
+		t.Skip("subprocess helper")
+	}
+	executor := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-restart", Attributes: map[string]string{"api_key": "sk-test", "base_url": os.Getenv("CLIPROXY_RESTART_URL")}}
+	sessionID := "claude-code:restart-e2e"
+	payloads := [][]byte{
+		[]byte(`{"model":"gpt-5.6-sol","metadata":{"user_id":"{\"session_id\":\"restart-cache-session\"}"},"messages":[{"role":"user","content":"question one"}],"stream":true}`),
+		[]byte(`{"model":"gpt-5.6-sol","metadata":{"user_id":"{\"session_id\":\"restart-cache-session\"}"},"messages":[{"role":"user","content":"question one"},{"role":"assistant","content":"answer one"},{"role":"user","content":"question two"}],"stream":true}`),
+	}
+	for _, payload := range payloads {
+		result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload, Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+		}
+	}
+	executor.CloseExecutionSession(sessionID)
+}
 
 func TestClaudeCodexWebsocketSameModelTurnUsesPreviousResponseDelta(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}

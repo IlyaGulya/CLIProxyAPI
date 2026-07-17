@@ -191,7 +191,7 @@ URL: /v1/messages
 Timestamp: 2026-07-16T17:23:04Z
 X-Claude-Code-Agent-Id: child-1
 === API WEBSOCKET TIMELINE ===
-{"event":"api.websocket.metric","name":"request_prepared","model":"gpt-5.6-luna","claude_root_correlation_id":"root-1","claude_execution_correlation_id":"exec-1","prompt_cache_scope":"cache-1","prompt_prefix_fingerprint":"prefix-1"}
+{"event":"api.websocket.metric","name":"request_prepared","model":"gpt-5.6-luna","claude_root_correlation_id":"root-1","claude_execution_correlation_id":"exec-1","prompt_cache_scope":"cache-1","prompt_prefix_fingerprint":"prefix-1","chain_source":"full_replay","incremental":false,"incremental_reset_reason":"no_previous_response","client_body_bytes":1200,"upstream_body_bytes":1200}
 {"event":"api.websocket.metric","name":"speculative_preconnect_leased","wait_us":23}
 {"event":"api.websocket.metric","name":"connection_ready","connection_source":"speculative","duration_us":46,"success":true}
 {"event":"api.websocket.metric","name":"request_sent","elapsed_us":100,"duration_us":4,"success":true}
@@ -231,6 +231,9 @@ X-Claude-Code-Agent-Id: child-1
 	}
 	if summary.SpeculativeHitRate != 1 || summary.CacheReadRatio < 0.95 || summary.Requests[0].FirstEventMS != 500 {
 		t.Fatalf("metrics summary = %+v", summary)
+	}
+	if summary.Requests[0].ChainSource != "full_replay" || summary.Requests[0].IncrementalReset != "no_previous_response" || summary.Requests[0].ClientBodyBytes != 1200 {
+		t.Fatalf("restart observability summary = %+v", summary.Requests[0])
 	}
 	if summary.MetricEvents["speculative_preconnect_ready"] != 1 || summary.AgentTranscripts != 1 || len(summary.TranscriptModels) != 1 {
 		t.Fatalf("detached/transcript summary = %+v", summary)

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -281,6 +282,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if errPromptCache != nil {
 		return resp, errPromptCache
 	}
+	body = canonicalizeCodexCacheableRequest(body)
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
@@ -514,6 +516,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
+	body = canonicalizeCodexCacheableRequest(body)
 	clientBody := body
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
@@ -565,6 +568,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		requestBody, incrementalObservation = sess.prepareCodexIncrementalRequestObserved(clientBody)
 	}
 	cacheMetricFields := codexPromptCacheMetricFields(requestBody)
+	chainSource := "full_replay"
+	if incrementalObservation.incremental {
+		chainSource = "incremental"
+	}
 	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_prepared", map[string]any{
 		"session_id":                executionSessionID,
 		"model":                     baseModel,
@@ -575,6 +582,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		"input_items":               gjson.GetBytes(requestBody, "input.#").Int(),
 		"incremental":               incrementalObservation.incremental,
 		"incremental_reset_reason":  incrementalObservation.resetReason,
+		"chain_source":              chainSource,
+		"fresh_response_chain":      !incrementalObservation.incremental,
 		"overflow":                  sessionOverflow,
 		"has_previous_response":     strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
 		"prompt_cache_scope":        cacheMetricFields["prompt_cache_scope"],
@@ -1239,13 +1248,13 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 
 func codexPromptCacheMetricFields(body []byte) map[string]any {
 	instructionsBytes := len(gjson.GetBytes(body, "instructions").String())
-	stableInputPrefix := make([]string, 0, 2)
+	stableInputPrefix := make([]json.RawMessage, 0, 2)
 	gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
 		role := strings.TrimSpace(item.Get("role").String())
 		if role != "developer" && role != "system" {
 			return false
 		}
-		stableInputPrefix = append(stableInputPrefix, item.Raw)
+		stableInputPrefix = append(stableInputPrefix, json.RawMessage(item.Raw))
 		item.Get("content").ForEach(func(_, content gjson.Result) bool {
 			instructionsBytes += len(content.Get("text").String())
 			return true
@@ -1268,17 +1277,66 @@ func codexPromptCacheMetricFields(body []byte) map[string]any {
 		value := gjson.GetBytes(body, path)
 		prefix.WriteString(path)
 		prefix.WriteByte(0)
-		prefix.WriteString(value.Raw)
+		prefix.Write(canonicalCodexPrefixJSON(path, json.RawMessage(value.Raw)))
 		prefix.WriteByte(0)
 	}
 	for _, item := range stableInputPrefix {
 		prefix.WriteString("input_prefix")
 		prefix.WriteByte(0)
-		prefix.WriteString(item)
+		prefix.Write(canonicalCodexPrefixJSON("input_prefix", item))
 		prefix.WriteByte(0)
 	}
 	fields["prompt_prefix_fingerprint"] = "codex-prefix:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(prefix.String())).String()
 	return fields
+}
+
+func canonicalCodexPrefixJSON(path string, raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return raw
+	}
+	if path == "tools" {
+		if tools, ok := value.([]any); ok {
+			sort.SliceStable(tools, func(i, j int) bool {
+				left, _ := tools[i].(map[string]any)
+				right, _ := tools[j].(map[string]any)
+				return fmt.Sprint(left["type"], "\x00", left["name"]) < fmt.Sprint(right["type"], "\x00", right["name"])
+			})
+		}
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return canonical
+}
+
+// canonicalizeCodexCacheableRequest makes semantically equivalent translated
+// requests byte-stable so a deterministic prompt_cache_key can reuse the same
+// upstream prefix after a client or proxy process restart.
+func canonicalizeCodexCacheableRequest(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var request map[string]any
+	if err := json.Unmarshal(body, &request); err != nil {
+		return body
+	}
+	if tools, ok := request["tools"].([]any); ok {
+		sort.SliceStable(tools, func(i, j int) bool {
+			left, _ := tools[i].(map[string]any)
+			right, _ := tools[j].(map[string]any)
+			return fmt.Sprint(left["type"], "\x00", left["name"]) < fmt.Sprint(right["type"], "\x00", right["name"])
+		})
+	}
+	canonical, err := json.Marshal(request)
+	if err != nil {
+		return body
+	}
+	return canonical
 }
 
 type codexGenerateFalseWarmupResult struct {

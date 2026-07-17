@@ -103,6 +103,16 @@
         }],
         "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
         "gridPos": {"x": 16, "y": 34, "w": 8, "h": 8}
+      },
+      {
+        "id": 11, "type": "timeseries", "title": "Restart replay and incremental chains",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "targets": [{
+          "refId": "A",
+          "expr": "sum by (model, chain_source, incremental_reset_reason) (increase(claudex_proxy_events_total{event_name=\"request_prepared\",model=~\"$model\"}[6h]))",
+          "legendFormat": "{{model}} {{chain_source}} {{incremental_reset_reason}}"
+        }],
+        "gridPos": {"x": 0, "y": 42, "w": 24, "h": 8}
       }
     ]
   },

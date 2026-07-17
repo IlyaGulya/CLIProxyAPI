@@ -26,6 +26,11 @@ type RequestSummary struct {
 	CacheReadTokens      int64   `json:"cache_read_tokens"`
 	PromptCacheScope     string  `json:"prompt_cache_scope,omitempty"`
 	PromptFingerprint    string  `json:"prompt_prefix_fingerprint,omitempty"`
+	ChainSource          string  `json:"chain_source,omitempty"`
+	Incremental          bool    `json:"incremental"`
+	IncrementalReset     string  `json:"incremental_reset_reason,omitempty"`
+	ClientBodyBytes      int64   `json:"client_body_bytes,omitempty"`
+	UpstreamBodyBytes    int64   `json:"upstream_body_bytes,omitempty"`
 	FinishReason         string  `json:"finish_reason"`
 }
 
@@ -258,6 +263,11 @@ func parseRequestLog(path string) (RequestSummary, []string, error) {
 			request.Model, _ = metric["model"].(string)
 			request.PromptCacheScope, _ = metric["prompt_cache_scope"].(string)
 			request.PromptFingerprint, _ = metric["prompt_prefix_fingerprint"].(string)
+			request.ChainSource, _ = metric["chain_source"].(string)
+			request.Incremental, _ = metric["incremental"].(bool)
+			request.IncrementalReset, _ = metric["incremental_reset_reason"].(string)
+			request.ClientBodyBytes = int64(number(metric["client_body_bytes"]))
+			request.UpstreamBodyBytes = int64(number(metric["upstream_body_bytes"]))
 		case "connection_ready":
 			request.ConnectionSource, _ = metric["connection_source"].(string)
 			request.ConnectionReadyMS = number(metric["duration_us"]) / 1000
