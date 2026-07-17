@@ -43,6 +43,49 @@ func TestApplyClaudeContextEditingHonorsTriggerAndExcludedTools(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeContextEditingClearsOldThinkingBeforeToolResults(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{
+  "messages":[
+    {"role":"assistant","content":[{"type":"thinking","thinking":"old secret reasoning","signature":"sig-old"},{"type":"tool_use","id":"old","name":"Read","input":{}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"` + strings.Repeat("x", 200) + `"}]},
+    {"role":"assistant","content":[{"type":"thinking","thinking":"recent reasoning","signature":"sig-recent"},{"type":"text","text":"answer"}]}
+  ],
+  "context_management":{"edits":[
+    {"type":"clear_thinking_20251015","keep":{"type":"thinking_turns","value":1}},
+    {"type":"clear_tool_uses_20250919","keep":{"type":"tool_uses","value":0},"clear_at_least":{"type":"input_tokens","value":1}}
+  ]}
+}`)
+	output, result := applyClaudeContextEditing(input)
+	if !result.Applied || result.ClearedThinkingTurns != 1 || result.ClearedToolResults != 1 || len(result.AppliedEdits) != 2 {
+		t.Fatalf("result = %+v", result)
+	}
+	if gjson.GetBytes(output, "messages.0.content.0.type").String() == "thinking" || gjson.GetBytes(output, "messages.2.content.0.signature").String() != "sig-recent" {
+		t.Fatalf("thinking keep semantics failed: %s", output)
+	}
+	if result.AppliedEdits[0].Type != "clear_thinking_20251015" || result.AppliedEdits[1].Type != "clear_tool_uses_20250919" {
+		t.Fatalf("edit order changed: %+v", result.AppliedEdits)
+	}
+}
+
+func TestApplyClaudeContextEditingKeepAllThinkingIsNoOp(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"keep","signature":"sig"}]}],"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}}`)
+	output, result := applyClaudeContextEditing(input)
+	if result.Applied || string(output) != string(input) {
+		t.Fatalf("keep all changed input: result=%+v output=%s", result, output)
+	}
+}
+
+func TestApplyClaudeContextEditingRejectsClearThinkingAfterAnotherEdit(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"old","signature":"sig"}]}],"context_management":{"edits":[{"type":"clear_tool_uses_20250919"},{"type":"clear_thinking_20251015","keep":{"type":"thinking_turns","value":1}}]}}`)
+	output, result := applyClaudeContextEditing(input)
+	if result.Applied || string(output) != string(input) {
+		t.Fatalf("malformed edit ordering was accepted: result=%+v output=%s", result, output)
+	}
+}
+
 func TestClaudeContextPreflightReservesOutputHeadroom(t *testing.T) {
 	t.Parallel()
 	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + strings.Repeat(" antidisestablishmentarianism", 50000) + `"}]}`)
@@ -90,8 +133,12 @@ func TestAttachClaudeContextEditResultToResponses(t *testing.T) {
 	if got := gjson.GetBytes(nonstream, "context_management.applied_edits.0.cleared_tool_uses").Int(); got != 2 {
 		t.Fatalf("non-stream applied edits missing: %s", nonstream)
 	}
-	stream := attachClaudeContextEditResult([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n"), result)
-	if !strings.Contains(string(stream), `"cleared_tool_uses":2`) || !strings.HasPrefix(string(stream), "event: message_start\n") {
+	start := []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n")
+	if streamStart := attachClaudeContextEditResult(start, result); string(streamStart) != string(start) {
+		t.Fatalf("applied edits must not be attached before the final delta: %s", streamStart)
+	}
+	stream := attachClaudeContextEditResult([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"), result)
+	if !strings.Contains(string(stream), `"cleared_tool_uses":2`) || !strings.HasPrefix(string(stream), "event: message_delta\n") {
 		t.Fatalf("stream applied edits missing/malformed: %s", stream)
 	}
 }

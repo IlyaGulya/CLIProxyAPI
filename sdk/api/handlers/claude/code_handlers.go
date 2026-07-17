@@ -215,6 +215,12 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	repairedJSON, _, errRepair := repairInterruptedClaudeToolHistory(rawJSON)
+	if errRepair != nil {
+		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Message: "Invalid tool history", Type: "invalid_request_error"}})
+		return
+	}
+	rawJSON = repairedJSON
 	rawJSON, _ = applyClaudeContextEditing(rawJSON)
 
 	c.Header("Content-Type", "application/json")
@@ -483,6 +489,11 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return
+			}
+			if value, exists := c.Get(claudeContextEditGinKey); exists {
+				if result, ok := value.(claudeContextEditResult); ok {
+					chunk = attachClaudeContextEditResult(chunk, result)
+				}
 			}
 			_, _ = c.Writer.Write(chunk)
 		},

@@ -14,10 +14,20 @@ const clearedToolResultText = "[Tool result cleared to preserve context]"
 const claudeContextEditGinKey = "claude_context_edit_result"
 
 type claudeContextEditResult struct {
-	Applied            bool `json:"applied"`
-	ClearedToolUses    int  `json:"cleared_tool_uses"`
-	ClearedToolResults int  `json:"cleared_tool_results"`
-	ClearedInputTokens int  `json:"cleared_input_tokens"`
+	Applied              bool                       `json:"applied"`
+	ClearedThinkingTurns int                        `json:"cleared_thinking_turns"`
+	ClearedToolUses      int                        `json:"cleared_tool_uses"`
+	ClearedToolResults   int                        `json:"cleared_tool_results"`
+	ClearedInputTokens   int                        `json:"cleared_input_tokens"`
+	AppliedEdits         []claudeAppliedContextEdit `json:"applied_edits"`
+}
+
+type claudeAppliedContextEdit struct {
+	Type                 string `json:"type"`
+	ClearedThinkingTurns int    `json:"cleared_thinking_turns,omitempty"`
+	ClearedToolUses      int    `json:"cleared_tool_uses,omitempty"`
+	ClearedToolResults   int    `json:"cleared_tool_results,omitempty"`
+	ClearedInputTokens   int    `json:"cleared_input_tokens"`
 }
 
 type claudeContextPressureResult struct {
@@ -123,54 +133,135 @@ func applyClaudeContextEditing(input []byte) ([]byte, claudeContextEditResult) {
 	}
 	management, _ := root["context_management"].(map[string]any)
 	edits, _ := management["edits"].([]any)
-	for _, rawEdit := range edits {
+	messages, _ := root["messages"].([]any)
+	result := claudeContextEditResult{}
+	for editIndex, rawEdit := range edits {
 		edit, _ := rawEdit.(map[string]any)
-		if stringValue(edit["type"]) != "clear_tool_uses_20250919" {
-			continue
-		}
-		trigger := nestedNumber(edit, "trigger", "value")
-		if trigger > 0 && approximateTokens(input) < trigger {
-			continue
-		}
-		messages, _ := root["messages"].([]any)
-		uses := collectToolUses(messages)
-		keep := nestedNumber(edit, "keep", "value")
-		if keep < 0 {
-			keep = 0
-		}
-		excluded := stringSet(edit["exclude_tools"])
-		clearBefore := len(uses) - keep
-		if clearBefore < 0 {
-			clearBefore = 0
-		}
-		minimum := nestedNumber(edit, "clear_at_least", "value")
-		clearInputs, _ := edit["clear_tool_inputs"].(bool)
-		result := claudeContextEditResult{}
-		for index, use := range uses {
-			if index >= clearBefore || excluded[use.name] {
-				continue
+		switch stringValue(edit["type"]) {
+		case "clear_thinking_20251015":
+			// Anthropic requires clear_thinking to precede every other edit. Treat
+			// malformed policies as a no-op rather than silently reordering them.
+			if editIndex != 0 {
+				return input, claudeContextEditResult{}
 			}
-			freed := clearToolPair(messages, use, clearInputs)
-			if freed == 0 {
+			clearedTurns, clearedTokens := clearClaudeThinkingTurns(messages, edit["keep"])
+			if clearedTurns == 0 {
 				continue
 			}
 			result.Applied = true
-			result.ClearedToolUses++
-			result.ClearedToolResults++
-			result.ClearedInputTokens += freed
-			if minimum > 0 && result.ClearedInputTokens >= minimum {
-				break
+			result.ClearedThinkingTurns += clearedTurns
+			result.ClearedInputTokens += clearedTokens
+			result.AppliedEdits = append(result.AppliedEdits, claudeAppliedContextEdit{
+				Type: "clear_thinking_20251015", ClearedThinkingTurns: clearedTurns, ClearedInputTokens: clearedTokens,
+			})
+		case "clear_tool_uses_20250919":
+			trigger := nestedNumber(edit, "trigger", "value")
+			encoded, _ := json.Marshal(root)
+			if trigger > 0 && approximateTokens(encoded) < trigger {
+				continue
 			}
-		}
-		if result.Applied {
-			root["messages"] = messages
-			out, err := json.Marshal(root)
-			if err == nil {
-				return out, result
+			uses := collectToolUses(messages)
+			keep := nestedNumber(edit, "keep", "value")
+			if keep < 0 {
+				keep = 0
+			}
+			excluded := stringSet(edit["exclude_tools"])
+			clearBefore := len(uses) - keep
+			if clearBefore < 0 {
+				clearBefore = 0
+			}
+			minimum := nestedNumber(edit, "clear_at_least", "value")
+			clearInputs, _ := edit["clear_tool_inputs"].(bool)
+			applied := claudeAppliedContextEdit{Type: "clear_tool_uses_20250919"}
+			for index, use := range uses {
+				if index >= clearBefore || excluded[use.name] {
+					continue
+				}
+				freed := clearToolPair(messages, use, clearInputs)
+				if freed == 0 {
+					continue
+				}
+				applied.ClearedToolUses++
+				applied.ClearedToolResults++
+				applied.ClearedInputTokens += freed
+				if minimum > 0 && applied.ClearedInputTokens >= minimum {
+					break
+				}
+			}
+			if applied.ClearedToolUses > 0 {
+				result.Applied = true
+				result.ClearedToolUses += applied.ClearedToolUses
+				result.ClearedToolResults += applied.ClearedToolResults
+				result.ClearedInputTokens += applied.ClearedInputTokens
+				result.AppliedEdits = append(result.AppliedEdits, applied)
 			}
 		}
 	}
+	if result.Applied {
+		root["messages"] = messages
+		out, err := json.Marshal(root)
+		if err == nil {
+			return out, result
+		}
+	}
 	return input, claudeContextEditResult{}
+}
+
+func clearClaudeThinkingTurns(messages []any, keepValue any) (int, int) {
+	if text, ok := keepValue.(string); ok && strings.EqualFold(strings.TrimSpace(text), "all") {
+		return 0, 0
+	}
+	keep := 1
+	if keepObject, ok := keepValue.(map[string]any); ok {
+		if stringValue(keepObject["type"]) == "all" {
+			return 0, 0
+		}
+		if stringValue(keepObject["type"]) == "thinking_turns" {
+			value, ok := keepObject["value"].(float64)
+			if !ok || value <= 0 {
+				return 0, 0
+			}
+			keep = int(value)
+		}
+	}
+	thinkingMessages := make([]int, 0)
+	for messageIndex, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		if stringValue(message["role"]) != "assistant" {
+			continue
+		}
+		parts, _ := message["content"].([]any)
+		for _, rawPart := range parts {
+			part, _ := rawPart.(map[string]any)
+			partType := stringValue(part["type"])
+			if partType == "thinking" || partType == "redacted_thinking" {
+				thinkingMessages = append(thinkingMessages, messageIndex)
+				break
+			}
+		}
+	}
+	clearCount := len(thinkingMessages) - keep
+	if clearCount <= 0 {
+		return 0, 0
+	}
+	clearedTokens := 0
+	for _, messageIndex := range thinkingMessages[:clearCount] {
+		message, _ := messages[messageIndex].(map[string]any)
+		parts, _ := message["content"].([]any)
+		kept := make([]any, 0, len(parts))
+		for _, rawPart := range parts {
+			part, _ := rawPart.(map[string]any)
+			partType := stringValue(part["type"])
+			if partType == "thinking" || partType == "redacted_thinking" {
+				encoded, _ := json.Marshal(part)
+				clearedTokens += approximateTokens(encoded)
+				continue
+			}
+			kept = append(kept, rawPart)
+		}
+		message["content"] = kept
+	}
+	return clearCount, clearedTokens
 }
 
 func collectToolUses(messages []any) []toolUseLocation {
@@ -252,11 +343,12 @@ func attachClaudeContextEditResult(payload []byte, result claudeContextEditResul
 	if !result.Applied || len(payload) == 0 {
 		return payload
 	}
-	edit := map[string]any{
-		"type":                 "clear_tool_uses_20250919",
-		"cleared_tool_uses":    result.ClearedToolUses,
-		"cleared_tool_results": result.ClearedToolResults,
-		"cleared_input_tokens": result.ClearedInputTokens,
+	edits := result.AppliedEdits
+	if len(edits) == 0 {
+		edits = []claudeAppliedContextEdit{{
+			Type: "clear_tool_uses_20250919", ClearedToolUses: result.ClearedToolUses,
+			ClearedToolResults: result.ClearedToolResults, ClearedInputTokens: result.ClearedInputTokens,
+		}}
 	}
 	attach := func(raw []byte, path string) []byte {
 		var object map[string]any
@@ -271,7 +363,7 @@ func attachClaudeContextEditResult(payload []byte, result claudeContextEditResul
 			}
 			target = message
 		}
-		target["context_management"] = map[string]any{"applied_edits": []any{edit}}
+		target["context_management"] = map[string]any{"applied_edits": edits}
 		out, err := json.Marshal(object)
 		if err != nil {
 			return raw
@@ -292,10 +384,11 @@ func attachClaudeContextEditResult(payload []byte, result claudeContextEditResul
 		end = len(payload) - jsonStart
 	}
 	raw := payload[jsonStart : jsonStart+end]
-	if gjson.GetBytes(raw, "type").String() != "message_start" {
+	eventType := gjson.GetBytes(raw, "type").String()
+	if eventType != "message_delta" {
 		return payload
 	}
-	updated := attach(raw, "message")
+	updated := attach(raw, "")
 	out := make([]byte, 0, len(payload)+len(updated)-len(raw))
 	out = append(out, payload[:jsonStart]...)
 	out = append(out, updated...)
