@@ -1359,6 +1359,7 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 
 	root := gjson.ParseBytes(body)
 	var segments []string
+	var modalityTokens int64
 
 	if inst := strings.TrimSpace(root.Get("instructions").String()); inst != "" {
 		segments = append(segments, inst)
@@ -1369,6 +1370,9 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		arr := inputItems.Array()
 		for i := range arr {
 			item := arr[i]
+			if reasoning := strings.TrimSpace(item.Get("reasoning_content").String()); reasoning != "" {
+				segments = append(segments, reasoning)
+			}
 			switch item.Get("type").String() {
 			case "message":
 				content := item.Get("content")
@@ -1378,6 +1382,12 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 						part := parts[j]
 						if text := strings.TrimSpace(part.Get("text").String()); text != "" {
 							segments = append(segments, text)
+						}
+						if strings.Contains(part.Get("type").String(), "image") {
+							// Responses image accounting has a fixed low-detail base cost.
+							// Without decoded dimensions, use that cost rather than
+							// tokenizing base64 bytes as text.
+							modalityTokens += 85
 						}
 					}
 				}
@@ -1441,14 +1451,14 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 
 	text := strings.Join(segments, "\n")
 	if text == "" {
-		return 0, nil
+		return modalityTokens, nil
 	}
 
 	count, err := enc.Count(text)
 	if err != nil {
 		return 0, err
 	}
-	return int64(count), nil
+	return int64(count) + modalityTokens, nil
 }
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

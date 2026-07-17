@@ -64,8 +64,9 @@ func ensureWorkflowModelAliases(values map[string]any) {
 		configured[strings.ToLower(strings.TrimSpace(alias))] = true
 	}
 	for alias, model := range map[string]string{
-		"sol":  "gpt-5.6-sol",
-		"luna": "gpt-5.6-luna",
+		"sol":   "gpt-5.6-sol",
+		"luna":  "gpt-5.6-luna",
+		"terra": "gpt-5.6-terra",
 	} {
 		if !configured[alias] {
 			entries = append(entries, map[string]any{"name": model, "alias": alias, "fork": true})
@@ -131,7 +132,7 @@ func configString(value any) string {
 
 // BuildClaudeArgs adds observable defaults while respecting explicit user flags.
 func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
-	out := make([]string, 0, len(args)+6)
+	out := make([]string, 0, len(args)+8)
 	if !hasFlag(args, "--model") {
 		out = append(out, "--model", "gpt-5.6-sol")
 	}
@@ -140,6 +141,11 @@ func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
 	}
 	if !hasAnyFlag(args, "--debug-file") {
 		out = append(out, "--debug-file", debugPath)
+	}
+	if !hasAnyFlag(args, "--settings") {
+		// Keep the large bundled API reference manually invocable while
+		// preventing broad model-triggered loads into the active context.
+		out = append(out, "--settings", `{"skillOverrides":{"claude-api":"user-invocable-only"}}`)
 	}
 	return append(out, args...)
 }
@@ -219,6 +225,24 @@ func flattenEnv(values map[string]string) []string {
 		out = append(out, buffer.String())
 	}
 	return out
+}
+
+// ConfigureClaudeContextSafety reserves enough headroom for a large tool result
+// to arrive before Claude Code has a chance to compact. The absolute default is
+// derived from Codex's 272k advertised window, 95% effective window, and 90%
+// auto-compaction threshold. Claude Code's percentage override is deliberately
+// more conservative because tool results can be substantially larger than the
+// preceding turn. Explicit user settings always win.
+func ConfigureClaudeContextSafety(values map[string]string) {
+	defaults := map[string]string{
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "232560",
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "85",
+	}
+	for key, value := range defaults {
+		if _, configured := values[key]; !configured {
+			values[key] = value
+		}
+	}
 }
 
 // ConfigureClaudeOTEL enables Claude Code's native metrics, events, and beta

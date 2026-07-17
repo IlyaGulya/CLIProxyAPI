@@ -74,8 +74,8 @@ codex-websocket-generate-false-warmup: true
 		t.Fatalf("classifier model = %q, want gpt-5.6-luna", parsed.ClaudeCodeAutoModeClassifierModel)
 	}
 	aliases := aliasesByName(parsed.OAuthModelAlias["codex"])
-	if aliases["sol"] != "gpt-5.6-sol" || aliases["luna"] != "gpt-5.6-luna" {
-		t.Fatalf("workflow aliases = %#v, want sol/luna defaults", aliases)
+	if aliases["sol"] != "gpt-5.6-sol" || aliases["luna"] != "gpt-5.6-luna" || aliases["terra"] != "gpt-5.6-terra" {
+		t.Fatalf("workflow aliases = %#v, want sol/luna/terra defaults", aliases)
 	}
 }
 
@@ -134,7 +134,7 @@ func aliasesByName(entries []config.OAuthModelAlias) map[string]string {
 func TestBuildClaudeArgsDefaultsRootToSolWithoutOverridingUserFlags(t *testing.T) {
 	t.Parallel()
 	got := BuildClaudeArgs([]string{"--effort", "xhigh"}, "session-1", "/run/debug.log")
-	want := []string{"--model", "gpt-5.6-sol", "--session-id", "session-1", "--debug-file", "/run/debug.log", "--effort", "xhigh"}
+	want := []string{"--model", "gpt-5.6-sol", "--session-id", "session-1", "--debug-file", "/run/debug.log", "--settings", `{"skillOverrides":{"claude-api":"user-invocable-only"}}`, "--effort", "xhigh"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -143,6 +143,39 @@ func TestBuildClaudeArgsDefaultsRootToSolWithoutOverridingUserFlags(t *testing.T
 	joined := strings.Join(got, " ")
 	if strings.Count(joined, "--model") != 1 || strings.Contains(joined, "session-2") || strings.Count(joined, "--debug-file") != 1 {
 		t.Fatalf("user flags were overridden: %#v", got)
+	}
+}
+
+func TestBuildClaudeArgsPreservesExplicitSkillSettings(t *testing.T) {
+	t.Parallel()
+	got := BuildClaudeArgs([]string{"--settings", "/tmp/custom.json"}, "session", "/tmp/debug")
+	joined := strings.Join(got, "\x00")
+	if strings.Count(joined, "--settings") != 1 || !strings.Contains(joined, "/tmp/custom.json") || strings.Contains(joined, "skillOverrides") {
+		t.Fatalf("explicit settings changed: %#v", got)
+	}
+}
+
+func TestConfigureClaudeContextSafetyUsesCodexCompatibleHeadroom(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{}
+	ConfigureClaudeContextSafety(values)
+	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "232560" {
+		t.Fatalf("auto compact window = %q, want 232560", got)
+	}
+	if got := values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]; got != "85" {
+		t.Fatalf("auto compact percent = %q, want 85", got)
+	}
+}
+
+func TestConfigureClaudeContextSafetyPreservesExplicitOverrides(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456",
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "77",
+	}
+	ConfigureClaudeContextSafety(values)
+	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" || values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
+		t.Fatalf("explicit context settings changed: %#v", values)
 	}
 }
 

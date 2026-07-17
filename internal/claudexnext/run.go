@@ -115,6 +115,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		return runDir, 1, errEnv
 	}
 	values := envMap(baseEnv)
+	ConfigureClaudeContextSafety(values)
 	values["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + strconv.Itoa(port)
 	values["CLAUDEX_NEXT_RUN_ID"] = runID
 	stack := StackStatus{Image: LGTMImage, Grafana: GrafanaURL, Endpoint: LGTMEndpoint}

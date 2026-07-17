@@ -121,3 +121,22 @@ func TestCodexExecutorCountTokensTreatsNullInstructionsAsEmpty(t *testing.T) {
 		t.Fatalf("token count payload mismatch:\nnull=%s\nempty=%s", string(nullResp.Payload), string(emptyResp.Payload))
 	}
 }
+
+func TestCountCodexInputTokensIncludesReasoningAndImages(t *testing.T) {
+	t.Parallel()
+	enc, err := tokenizerForCodexModel("gpt-5.6-sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := countCodexInputTokens(enc, []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rich, err := countCodexInputTokens(enc, []byte(`{"input":[{"type":"message","role":"assistant","reasoning_content":"private reasoning","content":[{"type":"input_text","text":"hello"},{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rich <= plain {
+		t.Fatalf("rich token count = %d, plain = %d; reasoning/images were ignored", rich, plain)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -85,6 +86,29 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	var editResult claudeContextEditResult
+	rawJSON, editResult = applyClaudeContextEditing(rawJSON)
+	if editResult.Applied {
+		c.Set(claudeContextEditGinKey, editResult)
+		observability.RecordWebsocketMetric(c.Request.Context(), "context_edit_applied", "", "", map[string]any{
+			"cleared_tool_uses":    editResult.ClearedToolUses,
+			"cleared_tool_results": editResult.ClearedToolResults,
+			"cleared_input_tokens": editResult.ClearedInputTokens,
+		}, false)
+	}
+	if pressure := claudeContextPressure(rawJSON); pressure.Overflow {
+		observability.RecordWebsocketMetric(c.Request.Context(), "context_preflight_rejected", "", "", map[string]any{
+			"model":                    gjson.GetBytes(rawJSON, "model").String(),
+			"input_tokens":             pressure.EstimatedInput,
+			"reserved_output_tokens":   pressure.ReservedOutput,
+			"effective_context_window": pressure.EffectiveWindow,
+		}, false)
+		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{
+			Message: "Prompt is too long: input plus requested output exceeds this model's context window",
+			Type:    "invalid_request_error",
+		}})
+		return
+	}
 	classifierModel := ""
 	if h != nil && h.Cfg != nil {
 		classifierModel = h.Cfg.ClaudeCodeAutoModeClassifierModel
@@ -170,6 +194,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	rawJSON, _ = applyClaudeContextEditing(rawJSON)
 
 	c.Header("Content-Type", "application/json")
 
@@ -298,6 +323,11 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	}
 
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	if value, exists := c.Get(claudeContextEditGinKey); exists {
+		if result, ok := value.(claudeContextEditResult); ok {
+			resp = attachClaudeContextEditResult(resp, result)
+		}
+	}
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
 }
@@ -383,6 +413,11 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 			// Write the first chunk
 			if len(chunk) > 0 {
+				if value, exists := c.Get(claudeContextEditGinKey); exists {
+					if result, okResult := value.(claudeContextEditResult); okResult {
+						chunk = attachClaudeContextEditResult(chunk, result)
+					}
+				}
 				_, _ = c.Writer.Write(chunk)
 				flusher.Flush()
 			}
