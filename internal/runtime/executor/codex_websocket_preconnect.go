@@ -48,9 +48,7 @@ func buildCodexGenerateFalseWarmupRequest(template []byte) ([]byte, error) {
 }
 
 const (
-	codexWebsocketPreconnectDefaultMaxIdle = 2
-	codexWebsocketPreconnectDefaultTTL     = 30 * time.Second
-	codexWebsocketPreconnect429Cooldown    = 30 * time.Second
+	codexWebsocketPreconnect429Cooldown = 30 * time.Second
 )
 
 type codexWebsocketPreconnectKey struct {
@@ -103,15 +101,8 @@ func (e *CodexWebsocketsExecutor) speculativePreconnectSettings() (bool, int, ti
 	if e == nil || e.cfg == nil || !e.cfg.CodexWebsocketSpeculativePreconnect {
 		return false, 0, 0
 	}
-	maxIdle := e.cfg.CodexWebsocketPreconnectMaxIdle
-	if maxIdle <= 0 {
-		maxIdle = codexWebsocketPreconnectDefaultMaxIdle
-	}
-	ttl := codexWebsocketPreconnectDefaultTTL
-	if e.cfg.CodexWebsocketPreconnectTTLSeconds > 0 {
-		ttl = time.Duration(e.cfg.CodexWebsocketPreconnectTTLSeconds) * time.Second
-	}
-	return true, maxIdle, ttl
+	runtimeCfg := e.cfg.NormalizedCodexWebsocketConfig()
+	return true, runtimeCfg.PreconnectMaxIdle, runtimeCfg.PreconnectTTL
 }
 
 func codexAgentToolCallKey(payload []byte) (string, bool) {

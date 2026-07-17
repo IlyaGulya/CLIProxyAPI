@@ -145,8 +145,8 @@ func TestCodexWebsocketSpeculativePreconnectSettings(t *testing.T) {
 	t.Run("safe defaults", func(t *testing.T) {
 		exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketSpeculativePreconnect: true}})
 		enabled, maxIdle, ttl := exec.speculativePreconnectSettings()
-		if !enabled || maxIdle != codexWebsocketPreconnectDefaultMaxIdle || ttl != codexWebsocketPreconnectDefaultTTL {
-			t.Fatalf("settings = (%v, %d, %s), want (true, %d, %s)", enabled, maxIdle, ttl, codexWebsocketPreconnectDefaultMaxIdle, codexWebsocketPreconnectDefaultTTL)
+		if !enabled || maxIdle != 2 || ttl != 30*time.Second {
+			t.Fatalf("settings = (%v, %d, %s), want (true, 2, 30s)", enabled, maxIdle, ttl)
 		}
 	})
 

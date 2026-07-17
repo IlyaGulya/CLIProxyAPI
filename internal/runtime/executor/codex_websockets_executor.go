@@ -42,8 +42,6 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
-	codexWebsocketDefaultSessionTTL        = 10 * time.Minute
-	codexWebsocketDefaultMaxSessions       = 128
 	codexWebsocketMaxIncrementalStateBytes = 8 << 20
 )
 
@@ -2061,16 +2059,9 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 		return nil
 	}
 	now := time.Now()
-	ttl := codexWebsocketDefaultSessionTTL
-	maxSessions := codexWebsocketDefaultMaxSessions
-	if e.cfg != nil {
-		if e.cfg.CodexWebsocketSessionTTLSeconds > 0 {
-			ttl = time.Duration(e.cfg.CodexWebsocketSessionTTLSeconds) * time.Second
-		}
-		if e.cfg.CodexWebsocketMaxSessions > 0 {
-			maxSessions = e.cfg.CodexWebsocketMaxSessions
-		}
-	}
+	runtimeCfg := e.cfg.NormalizedCodexWebsocketConfig()
+	ttl := runtimeCfg.SessionTTL
+	maxSessions := runtimeCfg.MaxSessions
 
 	store.mu.Lock()
 	if store.sessions == nil {

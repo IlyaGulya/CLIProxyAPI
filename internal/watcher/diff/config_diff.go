@@ -96,6 +96,24 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.CodexWebsocketMaxSessions != newCfg.CodexWebsocketMaxSessions {
 		changes = append(changes, fmt.Sprintf("codex-websocket-max-sessions: %d -> %d", oldCfg.CodexWebsocketMaxSessions, newCfg.CodexWebsocketMaxSessions))
 	}
+	if oldCfg.CodexWebsocketSpeculativePreconnect != newCfg.CodexWebsocketSpeculativePreconnect {
+		changes = append(changes, fmt.Sprintf("codex-websocket-speculative-preconnect: %t -> %t", oldCfg.CodexWebsocketSpeculativePreconnect, newCfg.CodexWebsocketSpeculativePreconnect))
+	}
+	if oldCfg.CodexWebsocketGenerateFalseWarmup != newCfg.CodexWebsocketGenerateFalseWarmup {
+		changes = append(changes, fmt.Sprintf("codex-websocket-generate-false-warmup: %t -> %t", oldCfg.CodexWebsocketGenerateFalseWarmup, newCfg.CodexWebsocketGenerateFalseWarmup))
+	}
+	if oldCfg.CodexWebsocketPreconnectReplenish != newCfg.CodexWebsocketPreconnectReplenish {
+		changes = append(changes, fmt.Sprintf("codex-websocket-preconnect-replenish: %t -> %t", oldCfg.CodexWebsocketPreconnectReplenish, newCfg.CodexWebsocketPreconnectReplenish))
+	}
+	if oldCfg.CodexWebsocketPreconnectMaxIdle != newCfg.CodexWebsocketPreconnectMaxIdle {
+		changes = append(changes, fmt.Sprintf("codex-websocket-preconnect-max-idle: %d -> %d", oldCfg.CodexWebsocketPreconnectMaxIdle, newCfg.CodexWebsocketPreconnectMaxIdle))
+	}
+	if oldCfg.CodexWebsocketPreconnectTTLSeconds != newCfg.CodexWebsocketPreconnectTTLSeconds {
+		changes = append(changes, fmt.Sprintf("codex-websocket-preconnect-ttl-seconds: %d -> %d", oldCfg.CodexWebsocketPreconnectTTLSeconds, newCfg.CodexWebsocketPreconnectTTLSeconds))
+	}
+	if strings.TrimSpace(oldCfg.ClaudeCodeAutoModeClassifierModel) != strings.TrimSpace(newCfg.ClaudeCodeAutoModeClassifierModel) {
+		changes = append(changes, fmt.Sprintf("claude-code-auto-mode-classifier-model: %s -> %s", strings.TrimSpace(oldCfg.ClaudeCodeAutoModeClassifierModel), strings.TrimSpace(newCfg.ClaudeCodeAutoModeClassifierModel)))
+	}
 	if oldCfg.NonStreamKeepAliveInterval != newCfg.NonStreamKeepAliveInterval {
 		changes = append(changes, fmt.Sprintf("nonstream-keepalive-interval: %d -> %d", oldCfg.NonStreamKeepAliveInterval, newCfg.NonStreamKeepAliveInterval))
 	}

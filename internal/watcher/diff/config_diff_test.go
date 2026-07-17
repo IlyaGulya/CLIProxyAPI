@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -90,6 +91,31 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 	if details := BuildConfigChangeDetails(cfg, cfg); len(details) != 0 {
 		t.Fatalf("expected no change entries, got %v", details)
+	}
+}
+
+func TestBuildConfigChangeDetails_CodexWebsocketRuntime(t *testing.T) {
+	oldCfg := &config.Config{}
+	newCfg := &config.Config{SDKConfig: config.SDKConfig{
+		CodexWebsocketSpeculativePreconnect: true,
+		CodexWebsocketGenerateFalseWarmup:   true,
+		CodexWebsocketPreconnectReplenish:   true,
+		CodexWebsocketPreconnectMaxIdle:     4,
+		CodexWebsocketPreconnectTTLSeconds:  9,
+		ClaudeCodeAutoModeClassifierModel:   "gpt-5.6-luna",
+	}}
+	details := strings.Join(BuildConfigChangeDetails(oldCfg, newCfg), "\n")
+	for _, field := range []string{
+		"codex-websocket-speculative-preconnect",
+		"codex-websocket-generate-false-warmup",
+		"codex-websocket-preconnect-replenish",
+		"codex-websocket-preconnect-max-idle",
+		"codex-websocket-preconnect-ttl-seconds",
+		"claude-code-auto-mode-classifier-model",
+	} {
+		if !strings.Contains(details, field) {
+			t.Fatalf("missing %s diff in:\n%s", field, details)
+		}
 	}
 }
 
