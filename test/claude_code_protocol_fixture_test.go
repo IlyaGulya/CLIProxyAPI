@@ -11,22 +11,36 @@ import (
 
 type claudeProtocolManifest struct {
 	Version         string                       `json:"version"`
+	Inherits        string                       `json:"inherits,omitempty"`
 	Fixtures        []string                     `json:"fixtures"`
 	Classifications map[string]map[string]string `json:"classifications"`
 }
 
 func TestClaudeCodeProtocolFixturesClassifyEveryField(t *testing.T) {
 	t.Parallel()
-	root := filepath.Join("testdata", "claude_code_protocol", "2.1.212")
-	var manifest claudeProtocolManifest
-	decodeJSONFile(t, filepath.Join(root, "manifest.json"), &manifest)
-	if manifest.Version != "2.1.212" || len(manifest.Fixtures) == 0 {
-		t.Fatalf("invalid manifest: %+v", manifest)
+	base := filepath.Join("testdata", "claude_code_protocol")
+	for _, version := range []string{"2.1.210", "2.1.211", "2.1.212"} {
+		t.Run(version, func(t *testing.T) {
+			root := filepath.Join(base, version)
+			manifest := loadProtocolManifest(t, base, version, make(map[string]bool))
+			if manifest.Version != version || len(manifest.Fixtures) == 0 {
+				t.Fatalf("invalid manifest: %+v", manifest)
+			}
+			validateProtocolManifest(t, root, base, manifest)
+		})
 	}
+}
+
+func validateProtocolManifest(t *testing.T, root, base string, manifest claudeProtocolManifest) {
+	t.Helper()
 	allowed := map[string]bool{"passthrough": true, "translated": true, "emulated": true, "rejected": true, "ignored": true}
 	for _, name := range manifest.Fixtures {
+		fixtureRoot := root
+		if _, err := os.Stat(filepath.Join(fixtureRoot, name)); err != nil && manifest.Inherits != "" {
+			fixtureRoot = filepath.Join(base, manifest.Inherits)
+		}
 		var value any
-		decodeJSONFile(t, filepath.Join(root, name), &value)
+		decodeJSONFile(t, filepath.Join(fixtureRoot, name), &value)
 		paths := make(map[string]struct{})
 		collectJSONLeafPaths(value, "", paths)
 		classified := manifest.Classifications[name]
@@ -45,6 +59,27 @@ func TestClaudeCodeProtocolFixturesClassifyEveryField(t *testing.T) {
 			}
 		}
 	}
+}
+
+func loadProtocolManifest(t *testing.T, base, version string, visiting map[string]bool) claudeProtocolManifest {
+	t.Helper()
+	if visiting[version] {
+		t.Fatalf("protocol fixture inheritance cycle at %s", version)
+	}
+	visiting[version] = true
+	var manifest claudeProtocolManifest
+	decodeJSONFile(t, filepath.Join(base, version, "manifest.json"), &manifest)
+	if manifest.Inherits != "" {
+		parent := loadProtocolManifest(t, base, manifest.Inherits, visiting)
+		if len(manifest.Fixtures) == 0 {
+			manifest.Fixtures = parent.Fixtures
+		}
+		if len(manifest.Classifications) == 0 {
+			manifest.Classifications = parent.Classifications
+		}
+	}
+	delete(visiting, version)
+	return manifest
 }
 
 func TestClaudeCodeProtocolFixturesContainNoPromptContent(t *testing.T) {
