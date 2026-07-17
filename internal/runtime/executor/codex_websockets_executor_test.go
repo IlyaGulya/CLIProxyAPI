@@ -1435,19 +1435,19 @@ func TestCodexPromptCacheMetricFieldsTrackStablePrefixWithoutRawKey(t *testing.T
 	changedFields := codexPromptCacheMetricFields(changed)
 	developerFields := codexPromptCacheMetricFields(developerPrefix)
 	changedDeveloperFields := codexPromptCacheMetricFields(changedDeveloperPrefix)
-	if firstFields["prompt_cache_scope"] == "" || firstFields["prompt_prefix_fingerprint"] == "" {
+	if firstFields.scope == "" || firstFields.prefixFingerprint == "" {
 		t.Fatalf("missing cache metric fields: %#v", firstFields)
 	}
-	if firstFields["prompt_cache_scope"] != secondFields["prompt_cache_scope"] || firstFields["prompt_prefix_fingerprint"] != secondFields["prompt_prefix_fingerprint"] {
+	if firstFields.scope != secondFields.scope || firstFields.prefixFingerprint != secondFields.prefixFingerprint {
 		t.Fatalf("input-only change destabilized cache fields: first=%#v second=%#v", firstFields, secondFields)
 	}
-	if firstFields["prompt_prefix_fingerprint"] == changedFields["prompt_prefix_fingerprint"] {
+	if firstFields.prefixFingerprint == changedFields.prefixFingerprint {
 		t.Fatalf("tool change did not alter prefix fingerprint: %#v", changedFields)
 	}
-	if developerFields["prompt_prefix_fingerprint"] == changedDeveloperFields["prompt_prefix_fingerprint"] || developerFields["instructions_bytes"].(int) == 0 {
+	if developerFields.prefixFingerprint == changedDeveloperFields.prefixFingerprint || developerFields.instructionsBytes == 0 {
 		t.Fatalf("developer prefix was not fingerprinted: first=%#v changed=%#v", developerFields, changedDeveloperFields)
 	}
-	for _, fields := range []map[string]any{firstFields, secondFields, changedFields} {
+	for _, fields := range []codexPromptCacheObservation{firstFields, secondFields, changedFields} {
 		if strings.Contains(fmt.Sprint(fields), "private-key") || strings.Contains(fmt.Sprint(fields), "stable") {
 			t.Fatalf("cache metric fields leaked raw content: %#v", fields)
 		}
@@ -1459,7 +1459,7 @@ func TestCodexPromptCacheMetricFieldsCanonicalizeEquivalentJSON(t *testing.T) {
 	second := []byte(`{"reasoning":{"effort":"high","summary":"auto"},"tools":[{"parameters":{"properties":{"a":{"type":"number"},"z":{"type":"string"}},"type":"object"},"type":"function","name":"B"},{"parameters":{"type":"object","required":["x"]},"name":"A","type":"function"}],"prompt_cache_key":"key","model":"gpt-5.6-luna","input":[]}`)
 	firstFields := codexPromptCacheMetricFields(first)
 	secondFields := codexPromptCacheMetricFields(second)
-	if firstFields["prompt_prefix_fingerprint"] != secondFields["prompt_prefix_fingerprint"] {
+	if firstFields.prefixFingerprint != secondFields.prefixFingerprint {
 		t.Fatalf("equivalent JSON produced different fingerprints: first=%#v second=%#v", firstFields, secondFields)
 	}
 }
@@ -1467,7 +1467,7 @@ func TestCodexPromptCacheMetricFieldsCanonicalizeEquivalentJSON(t *testing.T) {
 func TestCodexPromptCacheMetricFieldsPreserveToolOrder(t *testing.T) {
 	first := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"key","tools":[{"name":"A","type":"function"},{"name":"B","type":"function"}],"input":[]}`)
 	second := []byte(`{"model":"gpt-5.6-luna","prompt_cache_key":"key","tools":[{"name":"B","type":"function"},{"name":"A","type":"function"}],"input":[]}`)
-	if got, want := codexPromptCacheMetricFields(first)["prompt_prefix_fingerprint"], codexPromptCacheMetricFields(second)["prompt_prefix_fingerprint"]; got == want {
+	if got, want := codexPromptCacheMetricFields(first).prefixFingerprint, codexPromptCacheMetricFields(second).prefixFingerprint; got == want {
 		t.Fatalf("tool order was erased from fingerprint: %q", got)
 	}
 }

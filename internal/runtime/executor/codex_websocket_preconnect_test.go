@@ -340,7 +340,7 @@ func TestSuccessfulLeaseReplenishesWithinCap(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		idle, dialing := exec.pool.snapshot()
+		idle, dialing := exec.sessions.pool.snapshot()
 		if idle == 1 && dialing == 0 {
 			return
 		}
@@ -407,7 +407,7 @@ func TestReplenishment429EntersCooldownWithoutRetryLoop(t *testing.T) {
 	if attempts.Load() != 2 {
 		t.Fatalf("429 replenishment retried in a loop: attempts=%d", attempts.Load())
 	}
-	if idle, dialing := exec.pool.snapshot(); idle != 0 || dialing != 0 {
+	if idle, dialing := exec.sessions.pool.snapshot(); idle != 0 || dialing != 0 {
 		t.Fatalf("pool after 429 = idle %d dialing %d, want empty", idle, dialing)
 	}
 }
@@ -472,7 +472,7 @@ func TestParallelLeasesReplenishWithoutExceedingCap(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		idle, dialing := exec.pool.snapshot()
+		idle, dialing := exec.sessions.pool.snapshot()
 		if idle+dialing > 2 {
 			t.Fatalf("parallel replenishment exceeded cap: idle=%d dialing=%d", idle, dialing)
 		}

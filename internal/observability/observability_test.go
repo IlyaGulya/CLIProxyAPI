@@ -168,6 +168,20 @@ func TestNormalizeModelBoundsCardinality(t *testing.T) {
 	}
 }
 
+func TestWebsocketAttributesPreserveExplicitFalseAndZero(t *testing.T) {
+	t.Parallel()
+	attributes := WebsocketAttributes{
+		Model:                  "gpt-5.6-sol",
+		Success:                Some(false),
+		DurationUS:             Some(int64(0)),
+		ConnectionRequestCount: Some(int64(0)),
+	}
+	fields := attributes.fields()
+	if fields["success"] != false || fields["duration_us"] != int64(0) || fields["connection_request_count"] != int64(0) {
+		t.Fatalf("typed fields lost explicit zero values: %#v", fields)
+	}
+}
+
 func TestInSessionModelSwitchingAndDetachedPreconnectLinks(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -146,17 +147,12 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 		return
 	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
-	reserved, reason, generation := e.pool.reserve(key, maxIdle, time.Now())
-	poolIdle, poolDialing := e.pool.snapshot()
-	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_triggered", map[string]any{
-		"session_id":            sessionID,
-		"reserved":              reserved,
-		"reason":                reason,
-		"trigger":               trigger,
-		"generate_false_warmup": e.cfg.CodexWebsocketGenerateFalseWarmup,
-		"pool_idle":             poolIdle,
-		"pool_dialing":          poolDialing,
-	})
+	reserved, reason, generation := e.sessions.pool.reserve(key, maxIdle, time.Now())
+	poolIdle, poolDialing := e.sessions.pool.snapshot()
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_triggered", observability.WebsocketAttributes{
+		SessionID: sessionID, Reserved: observability.Some(reserved), Reason: reason, Trigger: trigger,
+		GenerateFalseWarmup: observability.Some(e.cfg.CodexWebsocketGenerateFalseWarmup), PoolIdle: observability.Some(int64(poolIdle)), PoolDialing: observability.Some(int64(poolDialing)),
+	}, nil)
 	if !reserved {
 		return
 	}
@@ -179,16 +175,12 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 		closeHTTPResponseBody(resp, "codex websocket speculative preconnect: close handshake response body error")
 		if errDial != nil || conn == nil {
 			duration := time.Since(startedAt)
-			e.pool.failReservation(key, generation, status == http.StatusTooManyRequests, time.Now())
-			idle, dialing := e.pool.snapshot()
-			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "speculative_preconnect_failed", rootCorrelation, executionCorrelation, map[string]any{
-				"session_id":   sessionID,
-				"duration_us":  duration.Microseconds(),
-				"status":       status,
-				"rate_limited": status == http.StatusTooManyRequests,
-				"pool_idle":    idle,
-				"pool_dialing": dialing,
-			})
+			e.sessions.pool.failReservation(key, generation, status == http.StatusTooManyRequests, time.Now())
+			idle, dialing := e.sessions.pool.snapshot()
+			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_failed", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
+				SessionID: sessionID, DurationUS: observability.Some(duration.Microseconds()), Status: observability.Some(int64(status)),
+				RateLimited: observability.Some(status == http.StatusTooManyRequests), PoolIdle: observability.Some(int64(idle)), PoolDialing: observability.Some(int64(dialing)),
+			}, nil)
 			log.WithFields(log.Fields{
 				"auth":        key.authID,
 				"url":         key.wsURL,
@@ -199,8 +191,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 		}
 		if e.cfg.CodexWebsocketGenerateFalseWarmup && len(warmupTemplate) > 0 {
 			warmupStartedAt := time.Now()
-			helpFields := map[string]any{"session_id": sessionID}
-			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "generate_false_warmup_started", rootCorrelation, executionCorrelation, helpFields)
+			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "generate_false_warmup_started", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{SessionID: sessionID}, nil)
 			warmupRequest, errWarmup := buildCodexGenerateFalseWarmupRequest(warmupTemplate)
 			var warmupResult codexGenerateFalseWarmupResult
 			if errWarmup == nil {
@@ -208,28 +199,23 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 			}
 			if errWarmup != nil {
 				failureReason := codexGenerateFalseWarmupFailureReason(errWarmup)
-				e.pool.failReservation(key, generation, false, time.Now())
-				helps.RecordDetachedAPIWebsocketMetric(e.cfg, "generate_false_warmup_failed", rootCorrelation, executionCorrelation, map[string]any{
-					"session_id":  sessionID,
-					"duration_us": time.Since(warmupStartedAt).Microseconds(),
-					"reason":      failureReason,
-				})
+				e.sessions.pool.failReservation(key, generation, false, time.Now())
+				helps.RecordDetachedAPIWebsocketEvent(e.cfg, "generate_false_warmup_failed", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
+					SessionID: sessionID, DurationUS: observability.Some(time.Since(warmupStartedAt).Microseconds()), Reason: failureReason,
+				}, nil)
 				log.WithFields(log.Fields{
 					"auth":           key.authID,
 					"url":            key.wsURL,
 					"duration_ms":    time.Since(warmupStartedAt).Milliseconds(),
 					"failure_reason": failureReason,
 				}).WithError(errWarmup).Debug("codex websockets: generate=false warmup failed")
-				_ = e.pool.close(conn)
+				_ = e.sessions.pool.close(conn)
 				return
 			}
-			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "generate_false_warmup_ready", rootCorrelation, executionCorrelation, map[string]any{
-				"session_id":          sessionID,
-				"duration_us":         time.Since(warmupStartedAt).Microseconds(),
-				"response_id_present": warmupResult.responseID != "",
-				"input_tokens":        warmupResult.inputTokens,
-				"output_tokens":       warmupResult.outputTokens,
-			})
+			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "generate_false_warmup_ready", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
+				SessionID: sessionID, DurationUS: observability.Some(time.Since(warmupStartedAt).Microseconds()), ResponseIDPresent: observability.Some(warmupResult.responseID != ""),
+				InputTokens: observability.Some(warmupResult.inputTokens), OutputTokens: observability.Some(warmupResult.outputTokens),
+			}, nil)
 			log.WithFields(log.Fields{
 				"auth":          key.authID,
 				"url":           key.wsURL,
@@ -238,33 +224,25 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 				"output_tokens": warmupResult.outputTokens,
 			}).Debug("codex websockets: generate=false warmup ready")
 		}
-		if !e.pool.completeReservationObserved(key, generation, conn, maxIdle, ttl, time.Now(), func() {
-			idle, dialing := e.pool.snapshot()
-			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "speculative_preconnect_expired", rootCorrelation, executionCorrelation, map[string]any{
-				"session_id":   sessionID,
-				"pool_idle":    idle,
-				"pool_dialing": dialing,
-			})
+		if !e.sessions.pool.completeReservationObserved(key, generation, conn, maxIdle, ttl, time.Now(), func() {
+			idle, dialing := e.sessions.pool.snapshot()
+			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_expired", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
+				SessionID: sessionID, PoolIdle: observability.Some(int64(idle)), PoolDialing: observability.Some(int64(dialing)),
+			}, nil)
 		}) {
-			idle, dialing := e.pool.snapshot()
-			helps.RecordDetachedAPIWebsocketMetric(e.cfg, "speculative_preconnect_discarded", rootCorrelation, executionCorrelation, map[string]any{
-				"session_id":   sessionID,
-				"duration_us":  time.Since(startedAt).Microseconds(),
-				"pool_idle":    idle,
-				"pool_dialing": dialing,
-			})
-			_ = e.pool.close(conn)
+			idle, dialing := e.sessions.pool.snapshot()
+			helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_discarded", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
+				SessionID: sessionID, DurationUS: observability.Some(time.Since(startedAt).Microseconds()), PoolIdle: observability.Some(int64(idle)), PoolDialing: observability.Some(int64(dialing)),
+			}, nil)
+			_ = e.sessions.pool.close(conn)
 			return
 		}
 		duration := time.Since(startedAt)
-		idle, dialing := e.pool.snapshot()
-		helps.RecordDetachedAPIWebsocketMetric(e.cfg, "speculative_preconnect_ready", rootCorrelation, executionCorrelation, map[string]any{
-			"session_id":            sessionID,
-			"duration_us":           duration.Microseconds(),
-			"generate_false_warmup": e.cfg.CodexWebsocketGenerateFalseWarmup,
-			"pool_idle":             idle,
-			"pool_dialing":          dialing,
-		})
+		idle, dialing := e.sessions.pool.snapshot()
+		helps.RecordDetachedAPIWebsocketEvent(e.cfg, "speculative_preconnect_ready", rootCorrelation, executionCorrelation, observability.WebsocketAttributes{
+			SessionID: sessionID, DurationUS: observability.Some(duration.Microseconds()), GenerateFalseWarmup: observability.Some(e.cfg.CodexWebsocketGenerateFalseWarmup),
+			PoolIdle: observability.Some(int64(idle)), PoolDialing: observability.Some(int64(dialing)),
+		}, nil)
 		log.WithFields(log.Fields{
 			"auth":        key.authID,
 			"url":         key.wsURL,
@@ -279,24 +257,18 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 		return nil
 	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
-	conn, age, observation, ok := e.pool.takeOrWaitObserved(ctx, key, ttl)
+	conn, age, observation, ok := e.sessions.pool.takeOrWaitObserved(ctx, key, ttl)
 	if !ok {
-		helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_missed", map[string]any{
-			"session_id":   sessionID,
-			"wait_us":      observation.wait.Microseconds(),
-			"reason":       observation.reason,
-			"pool_idle":    observation.idle,
-			"pool_dialing": observation.dialing,
-		})
+		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_missed", observability.WebsocketAttributes{
+			SessionID: sessionID, WaitUS: observability.Some(observation.wait.Microseconds()), Reason: observation.reason,
+			PoolIdle: observability.Some(int64(observation.idle)), PoolDialing: observability.Some(int64(observation.dialing)),
+		}, nil)
 		return nil
 	}
-	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "speculative_preconnect_leased", map[string]any{
-		"session_id":   sessionID,
-		"age_us":       age.Microseconds(),
-		"wait_us":      observation.wait.Microseconds(),
-		"pool_idle":    observation.idle,
-		"pool_dialing": observation.dialing,
-	})
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_leased", observability.WebsocketAttributes{
+		SessionID: sessionID, AgeUS: observability.Some(age.Microseconds()), WaitUS: observability.Some(observation.wait.Microseconds()),
+		PoolIdle: observability.Some(int64(observation.idle)), PoolDialing: observability.Some(int64(observation.dialing)),
+	}, nil)
 	if e.cfg != nil && e.cfg.CodexWebsocketPreconnectReplenish {
 		e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, nil, "lease_replenish")
 	}

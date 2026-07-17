@@ -51,8 +51,7 @@ const (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	store         *codexWebsocketSessionStore
-	pool          *codexWebsocketPreconnectPool
+	sessions      *codexWebsocketSessionManager
 	draining      bool
 	drainMu       sync.RWMutex
 	drainWG       sync.WaitGroup
@@ -143,11 +142,10 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	executor := &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
-		store:         newCodexWebsocketSessionStore(),
 		runtimeCtx:    runtimeCtx,
 		runtimeCancel: runtimeCancel,
 	}
-	executor.pool = newCodexWebsocketPreconnectPool(runtimeCtx, executor.closeCodexConnection)
+	executor.sessions = newCodexWebsocketSessionManager(runtimeCtx, executor.closeCodexConnection)
 	return executor
 }
 
@@ -502,10 +500,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if sess != nil {
 			if from.String() == "claude" && !sess.reqMu.TryLock() {
 				sessionOverflow = true
-				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "session_busy", map[string]any{
-					"session_id": executionSessionID,
-					"overflow":   true,
-				})
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "session_busy", observability.WebsocketAttributes{
+					SessionID: executionSessionID, Overflow: observability.Some(true),
+				}, nil)
 				if sess.codexHTTPFallback() {
 					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 				}
@@ -516,11 +513,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if from.String() != "claude" {
 					lockWait, sessionBusy = sess.lockRequest()
 				}
-				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "session_lock_acquired", map[string]any{
-					"session_id": executionSessionID,
-					"wait_us":    lockWait.Microseconds(),
-					"busy":       sessionBusy,
-				})
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "session_lock_acquired", observability.WebsocketAttributes{
+					SessionID: executionSessionID, WaitUS: observability.Some(lockWait.Microseconds()), Busy: observability.Some(sessionBusy),
+				}, nil)
 				if sess.codexHTTPFallback() {
 					sess.reqMu.Unlock()
 					return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
@@ -538,25 +533,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if incrementalObservation.incremental {
 		chainSource = "incremental"
 	}
-	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_prepared", map[string]any{
-		"session_id":                executionSessionID,
-		"model":                     baseModel,
-		"source_format":             from.String(),
-		"elapsed_us":                time.Since(traceStartedAt).Microseconds(),
-		"client_body_bytes":         len(clientBody),
-		"upstream_body_bytes":       len(requestBody),
-		"input_items":               gjson.GetBytes(requestBody, "input.#").Int(),
-		"incremental":               incrementalObservation.incremental,
-		"incremental_reset_reason":  incrementalObservation.resetReason,
-		"chain_source":              chainSource,
-		"fresh_response_chain":      !incrementalObservation.incremental,
-		"overflow":                  sessionOverflow,
-		"has_previous_response":     strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "",
-		"prompt_cache_scope":        cacheMetricFields["prompt_cache_scope"],
-		"prompt_prefix_fingerprint": cacheMetricFields["prompt_prefix_fingerprint"],
-		"instructions_bytes":        cacheMetricFields["instructions_bytes"],
-		"tools_count":               cacheMetricFields["tools_count"],
-	})
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "request_prepared", observability.WebsocketAttributes{
+		SessionID: executionSessionID, Model: baseModel, SourceFormat: from.String(), ElapsedUS: observability.Some(time.Since(traceStartedAt).Microseconds()),
+		ClientBodyBytes: observability.Some(int64(len(clientBody))), UpstreamBodyBytes: observability.Some(int64(len(requestBody))),
+		InputItems: observability.Some(gjson.GetBytes(requestBody, "input.#").Int()), Incremental: observability.Some(incrementalObservation.incremental),
+		IncrementalResetReason: incrementalObservation.resetReason, ChainSource: chainSource, FreshResponseChain: observability.Some(!incrementalObservation.incremental),
+		Overflow: observability.Some(sessionOverflow), HasPreviousResponse: observability.Some(strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != ""),
+		PromptCacheScope: cacheMetricFields.scope, PromptPrefixFingerprint: cacheMetricFields.prefixFingerprint,
+		InstructionsBytes: observability.Some(cacheMetricFields.instructionsBytes), ToolsCount: observability.Some(cacheMetricFields.toolsCount),
+	}, nil)
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, requestBody)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
@@ -591,16 +576,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if errDial == nil && conn != nil && sess != nil {
 		connectionAge, connectionRequestCount = sess.observeConnectionUse(conn)
 	}
-	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "connection_ready", map[string]any{
-		"session_id":               executionSessionID,
-		"duration_us":              time.Since(connectStartedAt).Microseconds(),
-		"connection_age_us":        connectionAge.Microseconds(),
-		"connection_request_count": connectionRequestCount,
-		"connection_source":        connectionSource,
-		"overflow_base_source":     overflowBaseSource,
-		"reused":                   connectionSource == codexWebsocketConnectionSessionReuse || connectionSource == codexWebsocketConnectionSpeculative,
-		"success":                  errDial == nil,
-	})
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "connection_ready", observability.WebsocketAttributes{
+		SessionID: executionSessionID, ConnectionSource: string(connectionSource), OverflowBaseSource: string(overflowBaseSource),
+		DurationUS: observability.Some(time.Since(connectStartedAt).Microseconds()), ConnectionAgeUS: observability.Some(connectionAge.Microseconds()),
+		ConnectionRequestCount: observability.Some(connectionRequestCount), Reused: observability.Some(connectionSource == codexWebsocketConnectionSessionReuse || connectionSource == codexWebsocketConnectionSpeculative),
+		Success: observability.Some(errDial == nil),
+	}, nil)
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
@@ -644,13 +625,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	transportRetries := 0
 	sendStartedAt := time.Now()
 	errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody)
-	helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_sent", map[string]any{
-		"session_id":  executionSessionID,
-		"duration_us": time.Since(sendStartedAt).Microseconds(),
-		"elapsed_us":  time.Since(traceStartedAt).Microseconds(),
-		"bytes":       len(wsReqBody),
-		"success":     errSend == nil,
-	})
+	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "request_sent", observability.WebsocketAttributes{
+		SessionID: executionSessionID, DurationUS: observability.Some(time.Since(sendStartedAt).Microseconds()),
+		ElapsedUS: observability.Some(time.Since(traceStartedAt).Microseconds()), Bytes: observability.Some(int64(len(wsReqBody))),
+		Success: observability.Some(errSend == nil),
+	}, nil)
 	if errSend != nil {
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
@@ -694,12 +673,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errSendRetry
 			}
-			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_retry_sent", map[string]any{
-				"session_id":        executionSessionID,
-				"connection_source": "retry",
-				"elapsed_us":        time.Since(traceStartedAt).Microseconds(),
-				"bytes":             len(wsReqBodyRetry),
-			})
+			helps.RecordAPIWebsocketEvent(ctx, e.cfg, "request_retry_sent", observability.WebsocketAttributes{
+				SessionID: executionSessionID, ConnectionSource: "retry", ElapsedUS: observability.Some(time.Since(traceStartedAt).Microseconds()),
+				Bytes: observability.Some(int64(len(wsReqBodyRetry))),
+			}, nil)
 			conn = connRetry
 			wsReqBody = wsReqBodyRetry
 		} else {
@@ -723,9 +700,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var translatedChunks int64
 		var translationDuration time.Duration
 		var downstreamBlockedDuration time.Duration
-		downstreamCommitted := false
+		streamBridge := newCodexWebsocketStreamBridge()
 		closeCode := 0
-		var semanticState codexWebsocketSemanticState
 		speculativeAgentCalls := make(map[string]struct{})
 
 		defer close(out)
@@ -733,34 +709,22 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if sess != nil {
 				connectionAge, connectionRequestCount = sess.connectionObservation(conn)
 			}
-			incompleteToolCalls := semanticState.incompleteToolCalls()
-			helps.RecordAPIWebsocketMetric(ctx, e.cfg, "request_finished", map[string]any{
-				"session_id":                 executionSessionID,
-				"model":                      baseModel,
-				"connection_source":          connectionSource,
-				"reason":                     terminateReason,
-				"close_code":                 closeCode,
-				"last_event_type":            semanticState.lastEventType,
-				"tool_call_started":          semanticState.toolCallsStarted > 0,
-				"tool_call_completed":        semanticState.toolCallsStarted > 0 && incompleteToolCalls == 0,
-				"tool_call_in_progress":      incompleteToolCalls > 0,
-				"tool_calls_started":         semanticState.toolCallsStarted,
-				"tool_calls_completed":       semanticState.toolCallsComplete,
-				"tool_calls_incomplete":      incompleteToolCalls,
-				"connection_age_us":          connectionAge.Microseconds(),
-				"connection_request_count":   connectionRequestCount,
-				"elapsed_us":                 time.Since(traceStartedAt).Microseconds(),
-				"first_event_us":             elapsedSinceOrZero(traceStartedAt, firstEventAt).Microseconds(),
-				"first_reasoning_delta_us":   elapsedSinceOrZero(traceStartedAt, firstReasoningDeltaAt).Microseconds(),
-				"first_output_text_delta_us": elapsedSinceOrZero(traceStartedAt, firstOutputTextDeltaAt).Microseconds(),
-				"upstream_frames":            upstreamFrames,
-				"upstream_bytes":             upstreamBytes,
-				"translated_chunks":          translatedChunks,
-				"downstream_committed":       downstreamCommitted,
-				"transport_retries":          transportRetries,
-				"translation_us":             translationDuration.Microseconds(),
-				"downstream_blocked_us":      downstreamBlockedDuration.Microseconds(),
-			})
+			streamSnapshot := streamBridge.snapshot()
+			incompleteToolCalls := streamSnapshot.IncompleteToolCalls
+			helps.RecordAPIWebsocketEvent(ctx, e.cfg, "request_finished", observability.WebsocketAttributes{
+				SessionID: executionSessionID, Model: baseModel, ConnectionSource: string(connectionSource), Reason: terminateReason,
+				LastEventType: streamSnapshot.LastEventType, CloseCode: observability.Some(int64(closeCode)),
+				ToolCallStarted: observability.Some(streamSnapshot.ToolCallsStarted > 0), ToolCallCompleted: observability.Some(streamSnapshot.ToolCallsStarted > 0 && incompleteToolCalls == 0),
+				ToolCallInProgress: observability.Some(incompleteToolCalls > 0), ToolCallsStarted: observability.Some(streamSnapshot.ToolCallsStarted),
+				ToolCallsCompleted: observability.Some(streamSnapshot.ToolCallsCompleted), ToolCallsIncomplete: observability.Some(incompleteToolCalls),
+				ConnectionAgeUS: observability.Some(connectionAge.Microseconds()), ConnectionRequestCount: observability.Some(connectionRequestCount),
+				ElapsedUS: observability.Some(time.Since(traceStartedAt).Microseconds()), FirstEventUS: observability.Some(elapsedSinceOrZero(traceStartedAt, firstEventAt).Microseconds()),
+				FirstReasoningDeltaUS:  observability.Some(elapsedSinceOrZero(traceStartedAt, firstReasoningDeltaAt).Microseconds()),
+				FirstOutputTextDeltaUS: observability.Some(elapsedSinceOrZero(traceStartedAt, firstOutputTextDeltaAt).Microseconds()),
+				UpstreamFrames:         observability.Some(upstreamFrames), UpstreamBytes: observability.Some(upstreamBytes), TranslatedChunks: observability.Some(translatedChunks),
+				DownstreamCommitted: observability.Some(streamSnapshot.DownstreamCommitted), TransportRetries: observability.Some(int64(transportRetries)),
+				TranslationUS: observability.Some(translationDuration.Microseconds()), DownstreamBlockedUS: observability.Some(downstreamBlockedDuration.Microseconds()),
+			}, nil)
 			if sess != nil {
 				sess.clearActive(readCh)
 				if terminateReason == "context_done" {
@@ -780,16 +744,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			defer func() { downstreamBlockedDuration += time.Since(blockedAt) }()
 			if ctx == nil {
 				out <- chunk
-				if len(chunk.Payload) > 0 {
-					downstreamCommitted = true
-				}
+				streamBridge.commit(chunk.Payload)
 				return true
 			}
 			select {
 			case out <- chunk:
-				if len(chunk.Payload) > 0 {
-					downstreamCommitted = true
-				}
+				streamBridge.commit(chunk.Payload)
 				return true
 			case <-ctx.Done():
 				return false
@@ -816,20 +776,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				closeCode = codexWebsocketCloseCode(mappedErr)
 				decision := decideCodexRetry(codexRetryInput{
 					Err:                 mappedErr,
-					DownstreamCommitted: downstreamCommitted,
+					DownstreamCommitted: streamBridge.snapshot().DownstreamCommitted,
 					Attempts:            transportRetries,
 					MaxAttempts:         1,
 				})
 				if decision.Action == codexRetryReconnect {
 					transportRetries++
-					helpFields := map[string]any{
-						"session_id":           executionSessionID,
-						"attempt":              transportRetries,
-						"boundary":             "pre_output",
-						"reason":               codexWebsocketRetryReason(mappedErr),
-						"downstream_committed": false,
+					retryAttributes := observability.WebsocketAttributes{
+						SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)), Boundary: string(decision.Boundary),
+						Reason: codexWebsocketRetryReason(mappedErr), DownstreamCommitted: observability.Some(false),
 					}
-					helps.RecordAPIWebsocketMetric(ctx, e.cfg, "transport_retry_attempted", helpFields)
+					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_attempted", retryAttributes, nil)
 
 					if sess != nil {
 						sess.clearActive(readCh)
@@ -884,11 +841,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							sendStartedAt = time.Now()
 							param = nil
 							closeCode = 0
-							semanticState = codexWebsocketSemanticState{}
+							streamBridge.resetUpstreamAttempt()
 							speculativeAgentCalls = make(map[string]struct{})
-							helpFields["duration_us"] = time.Since(retryStartedAt).Microseconds()
-							helpFields["connection_source"] = retrySource
-							helps.RecordAPIWebsocketMetric(ctx, e.cfg, "transport_retry_succeeded", helpFields)
+							retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
+							retryAttributes.ConnectionSource = string(retrySource)
+							helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_succeeded", retryAttributes, nil)
 							continue
 						}
 						errDialRetry = errSendRetry
@@ -905,18 +862,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					if errDialRetry != nil {
 						mappedErr = errDialRetry
 					}
-					helpFields["duration_us"] = time.Since(retryStartedAt).Microseconds()
-					helpFields["connection_source"] = retrySource
-					helps.RecordAPIWebsocketMetric(ctx, e.cfg, "transport_retry_exhausted", helpFields)
+					retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
+					retryAttributes.ConnectionSource = string(retrySource)
+					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_exhausted", retryAttributes, nil)
 				} else {
-					helps.RecordAPIWebsocketMetric(ctx, e.cfg, "transport_retry_suppressed", map[string]any{
-						"session_id":           executionSessionID,
-						"attempt":              transportRetries,
-						"boundary":             decision.Boundary,
-						"reason":               codexWebsocketRetryReason(mappedErr),
-						"suppression_reason":   decision.Reason,
-						"downstream_committed": downstreamCommitted,
-					})
+					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_suppressed", observability.WebsocketAttributes{
+						SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)), Boundary: string(decision.Boundary),
+						Reason: codexWebsocketRetryReason(mappedErr), SuppressionReason: string(decision.Reason),
+						DownstreamCommitted: observability.Some(streamBridge.snapshot().DownstreamCommitted),
+					}, nil)
 				}
 				terminateReason = "read_error"
 				terminateErr = mappedErr
@@ -950,16 +904,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			upstreamBytes += int64(len(payload))
 			if firstEventAt.IsZero() {
 				firstEventAt = time.Now()
-				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_upstream_event", map[string]any{
-					"session_id":    executionSessionID,
-					"elapsed_us":    firstEventAt.Sub(traceStartedAt).Microseconds(),
-					"since_send_us": firstEventAt.Sub(sendStartedAt).Microseconds(),
-					"bytes":         len(payload),
-				})
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "first_upstream_event", observability.WebsocketAttributes{
+					SessionID: executionSessionID, ElapsedUS: observability.Some(firstEventAt.Sub(traceStartedAt).Microseconds()),
+					SinceSendUS: observability.Some(firstEventAt.Sub(sendStartedAt).Microseconds()), Bytes: observability.Some(int64(len(payload))),
+				}, nil)
 			}
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
-			semanticState.observe(payload)
+			streamBridge.observe(payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
@@ -984,19 +936,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			if eventType == "response.reasoning_summary_text.delta" && firstReasoningDeltaAt.IsZero() {
 				firstReasoningDeltaAt = time.Now()
-				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_reasoning_delta", map[string]any{
-					"session_id":    executionSessionID,
-					"elapsed_us":    firstReasoningDeltaAt.Sub(traceStartedAt).Microseconds(),
-					"since_send_us": firstReasoningDeltaAt.Sub(sendStartedAt).Microseconds(),
-				})
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "first_reasoning_delta", observability.WebsocketAttributes{
+					SessionID: executionSessionID, ElapsedUS: observability.Some(firstReasoningDeltaAt.Sub(traceStartedAt).Microseconds()),
+					SinceSendUS: observability.Some(firstReasoningDeltaAt.Sub(sendStartedAt).Microseconds()),
+				}, nil)
 			}
 			if eventType == "response.output_text.delta" && firstOutputTextDeltaAt.IsZero() {
 				firstOutputTextDeltaAt = time.Now()
-				helps.RecordAPIWebsocketMetric(ctx, e.cfg, "first_output_text_delta", map[string]any{
-					"session_id":    executionSessionID,
-					"elapsed_us":    firstOutputTextDeltaAt.Sub(traceStartedAt).Microseconds(),
-					"since_send_us": firstOutputTextDeltaAt.Sub(sendStartedAt).Microseconds(),
-				})
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "first_output_text_delta", observability.WebsocketAttributes{
+					SessionID: executionSessionID, ElapsedUS: observability.Some(firstOutputTextDeltaAt.Sub(traceStartedAt).Microseconds()),
+					SinceSendUS: observability.Some(firstOutputTextDeltaAt.Sub(sendStartedAt).Microseconds()),
+				}, nil)
 			}
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
@@ -1153,41 +1103,6 @@ func codexWebsocketCloseCode(err error) int {
 	return 0
 }
 
-type codexWebsocketSemanticState struct {
-	lastEventType     string
-	toolCallsStarted  int64
-	toolCallsComplete int64
-}
-
-func (s *codexWebsocketSemanticState) observe(payload []byte) {
-	if s == nil {
-		return
-	}
-	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-	if eventType == "" {
-		return
-	}
-	s.lastEventType = eventType
-	itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
-	if itemType != "function_call" && itemType != "custom_tool_call" {
-		return
-	}
-	switch eventType {
-	case "response.output_item.added":
-		s.toolCallsStarted++
-	case "response.output_item.done":
-		s.toolCallsComplete++
-	}
-}
-
-func (s codexWebsocketSemanticState) incompleteToolCalls() int64 {
-	incomplete := s.toolCallsStarted - s.toolCallsComplete
-	if incomplete < 0 {
-		return 0
-	}
-	return incomplete
-}
-
 func buildCodexWebsocketRequestBody(body []byte) []byte {
 	if len(body) == 0 {
 		return nil
@@ -1205,7 +1120,14 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	return fallback
 }
 
-func codexPromptCacheMetricFields(body []byte) map[string]any {
+type codexPromptCacheObservation struct {
+	scope             string
+	prefixFingerprint string
+	instructionsBytes int64
+	toolsCount        int64
+}
+
+func codexPromptCacheMetricFields(body []byte) codexPromptCacheObservation {
 	instructionsBytes := len(gjson.GetBytes(body, "instructions").String())
 	stableInputPrefix := make([]json.RawMessage, 0, 2)
 	gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
@@ -1220,17 +1142,15 @@ func codexPromptCacheMetricFields(body []byte) map[string]any {
 		})
 		return true
 	})
-	fields := map[string]any{
-		"prompt_cache_scope":        "",
-		"prompt_prefix_fingerprint": "",
-		"instructions_bytes":        instructionsBytes,
-		"tools_count":               gjson.GetBytes(body, "tools.#").Int(),
+	observation := codexPromptCacheObservation{
+		instructionsBytes: int64(instructionsBytes),
+		toolsCount:        gjson.GetBytes(body, "tools.#").Int(),
 	}
 	cacheKey := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
 	if cacheKey == "" {
-		return fields
+		return observation
 	}
-	fields["prompt_cache_scope"] = "codex-cache:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("cache-scope\x00"+cacheKey)).String()
+	observation.scope = "codex-cache:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("cache-scope\x00"+cacheKey)).String()
 	var prefix strings.Builder
 	for _, path := range []string{"model", "instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "include", "text", "service_tier"} {
 		value := gjson.GetBytes(body, path)
@@ -1245,8 +1165,8 @@ func codexPromptCacheMetricFields(body []byte) map[string]any {
 		prefix.Write(canonicalCodexPrefixJSON("input_prefix", item))
 		prefix.WriteByte(0)
 	}
-	fields["prompt_prefix_fingerprint"] = "codex-prefix:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(prefix.String())).String()
-	return fields
+	observation.prefixFingerprint = "codex-prefix:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(prefix.String())).String()
+	return observation
 }
 
 func canonicalCodexPrefixJSON(path string, raw json.RawMessage) []byte {
@@ -1983,7 +1903,7 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if draining {
 		return nil
 	}
-	store := e.store
+	store := e.sessions.store
 	if store == nil {
 		return nil
 	}
@@ -2459,38 +2379,22 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		if e.runtimeCancel != nil {
 			e.runtimeCancel()
 		}
-		if e.pool != nil {
-			e.pool.closeAll()
+		if e.sessions != nil && e.sessions.pool != nil {
+			e.sessions.pool.closeAll()
 		}
 		e.drainExecutionSessions("executor_drained")
 		return
 	}
 
-	store := e.store
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	sess := store.sessions[sessionID]
-	delete(store.sessions, sessionID)
-	store.mu.Unlock()
-
+	sess := e.sessions.remove(sessionID)
 	e.closeExecutionSession(sess, "session_closed")
 }
 
 func (e *CodexWebsocketsExecutor) drainExecutionSessions(reason string) {
-	if e == nil || e.store == nil {
+	if e == nil || e.sessions == nil {
 		return
 	}
-	e.store.mu.Lock()
-	sessions := make([]*codexWebsocketSession, 0, len(e.store.sessions))
-	for sessionID, sess := range e.store.sessions {
-		delete(e.store.sessions, sessionID)
-		if sess != nil {
-			sessions = append(sessions, sess)
-		}
-	}
-	e.store.mu.Unlock()
+	sessions := e.sessions.removeAll()
 
 	for _, sess := range sessions {
 		e.drainWG.Add(1)
@@ -2551,9 +2455,12 @@ func elapsedSinceOrZero(start time.Time, end time.Time) time.Duration {
 }
 
 func recordCodexWebsocketUsageMetric(ctx context.Context, cfg *config.Config, sessionID string, detail cliproxyusage.Detail) {
-	fields := helps.CodexUsageMetricFields(detail)
-	fields["session_id"] = sessionID
-	helps.RecordAPIWebsocketMetric(ctx, cfg, "usage", fields)
+	helps.RecordAPIWebsocketEvent(ctx, cfg, "usage", observability.WebsocketAttributes{
+		SessionID: sessionID, InputTokens: observability.Some(detail.InputTokens), OutputTokens: observability.Some(detail.OutputTokens),
+		ReasoningTokens: observability.Some(detail.ReasoningTokens), CachedTokens: observability.Some(detail.CachedTokens),
+		CacheReadTokens: observability.Some(detail.CacheReadTokens), CacheCreationTokens: observability.Some(detail.CacheCreationTokens),
+		TotalTokens: observability.Some(detail.TotalTokens), ResponseServiceTier: detail.ResponseServiceTier,
+	}, nil)
 }
 
 func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string, reason string, err error) {
@@ -2570,15 +2477,15 @@ func (e *CodexWebsocketsExecutor) CloseAuthExecutionSessions(authID string, reas
 	if e == nil || authID == "" {
 		return
 	}
-	if e.pool != nil {
-		e.pool.closeAuth(authID)
+	if e.sessions != nil && e.sessions.pool != nil {
+		e.sessions.pool.closeAuth(authID)
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "auth_removed"
 	}
 
-	store := e.store
+	store := e.sessions.store
 	if store == nil {
 		return
 	}

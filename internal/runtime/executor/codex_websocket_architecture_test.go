@@ -87,6 +87,26 @@ func TestCodexRetryPolicyMatrix(t *testing.T) {
 	}
 }
 
+func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
+	t.Parallel()
+	bridge := newCodexWebsocketStreamBridge()
+	bridge.observe([]byte(`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1"}}`))
+	if got := bridge.snapshot(); got.DownstreamCommitted || got.IncompleteToolCalls != 1 {
+		t.Fatalf("before commit snapshot = %+v", got)
+	}
+	bridge.commit([]byte("data: chunk\n\n"))
+	bridge.observe([]byte(`{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1"}}`))
+	got := bridge.snapshot()
+	if !got.DownstreamCommitted || got.IncompleteToolCalls != 0 || got.ToolCallsCompleted != 1 {
+		t.Fatalf("completed snapshot = %+v", got)
+	}
+	bridge.resetUpstreamAttempt()
+	got = bridge.snapshot()
+	if !got.DownstreamCommitted || got.ToolCallsStarted != 0 {
+		t.Fatalf("reset erased commit boundary or retained attempt semantics: %+v", got)
+	}
+}
+
 type temporaryTestError struct{}
 
 func (*temporaryTestError) Error() string   { return "temporary" }

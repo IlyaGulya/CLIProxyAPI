@@ -34,16 +34,16 @@ func TestCodexWebsocketsExecutor_SessionStoreIsInstanceOwnedAndDrained(t *testin
 	if got := exec1.getOrCreateSession("new-after-drain"); got != nil {
 		t.Fatalf("drained executor created a new session: %#v", got)
 	}
-	exec1.store.mu.Lock()
-	_, presentAfterDrain := exec1.store.sessions[sessionID]
-	exec1.store.mu.Unlock()
+	exec1.sessions.store.mu.Lock()
+	_, presentAfterDrain := exec1.sessions.store.sessions[sessionID]
+	exec1.sessions.store.mu.Unlock()
 	if presentAfterDrain {
 		t.Fatalf("expected owned session to be removed by drain")
 	}
 
-	exec2.store.mu.Lock()
-	_, secondPresent := exec2.store.sessions[sessionID]
-	exec2.store.mu.Unlock()
+	exec2.sessions.store.mu.Lock()
+	_, secondPresent := exec2.sessions.store.sessions[sessionID]
+	exec2.sessions.store.mu.Unlock()
 	if !secondPresent {
 		t.Fatalf("draining first executor affected second executor")
 	}
@@ -69,9 +69,9 @@ func TestCodexWebsocketsExecutor_DrainWaitsForInFlightSession(t *testing.T) {
 		t.Fatal("drain blocked executor replacement")
 	}
 
-	exec.store.mu.Lock()
-	_, present := exec.store.sessions["in-flight"]
-	exec.store.mu.Unlock()
+	exec.sessions.store.mu.Lock()
+	_, present := exec.sessions.store.sessions["in-flight"]
+	exec.sessions.store.mu.Unlock()
 	if present {
 		t.Fatal("draining runtime still exposed in-flight session")
 	}
@@ -92,7 +92,7 @@ func TestCodexWebsocketsExecutor_DrainWaitsForInFlightSession(t *testing.T) {
 func TestCodexWebsocketsExecutor_EvictsExpiredIdleSessions(t *testing.T) {
 	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketSessionTTLSeconds: 1}})
-	exec.store = store
+	exec.sessions.store = store
 
 	expired := exec.getOrCreateSession("claude-code:expired")
 	if expired == nil {
@@ -117,7 +117,7 @@ func TestCodexWebsocketsExecutor_EvictsExpiredIdleSessions(t *testing.T) {
 func TestCodexWebsocketsExecutor_BoundsIdleSessionStore(t *testing.T) {
 	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: 1}})
-	exec.store = store
+	exec.sessions.store = store
 
 	first := exec.getOrCreateSession("claude-code:first")
 	if first == nil {
@@ -143,7 +143,7 @@ func TestCodexWebsocketsExecutor_BoundsIdleSessionStore(t *testing.T) {
 func TestCodexWebsocketsExecutor_DoesNotEvictActiveSessionAtCapacity(t *testing.T) {
 	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: 1}})
-	exec.store = store
+	exec.sessions.store = store
 
 	active := exec.getOrCreateSession("claude-code:active")
 	if active == nil {
@@ -167,7 +167,7 @@ func TestCodexWebsocketsExecutor_DoesNotEvictActiveSessionAtCapacity(t *testing.
 func TestCodexWebsocketsExecutor_DoesNotApplyClaudeCapacityToNativeSessions(t *testing.T) {
 	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: 1}})
-	exec.store = store
+	exec.sessions.store = store
 
 	if first := exec.getOrCreateSession("native-first"); first == nil {
 		t.Fatal("expected first native session")
@@ -245,7 +245,7 @@ func TestCodexWebsocketsExecutor_RejectsOverflowAcrossFourHundredAgentSessions(t
 	)
 	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{CodexWebsocketMaxSessions: maxSessions}})
-	exec.store = store
+	exec.sessions.store = store
 
 	active := make([]*codexWebsocketSession, 0, maxSessions)
 	for index := 0; index < maxSessions; index++ {

@@ -434,11 +434,25 @@ func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage stri
 // request-log lifecycle so a single per-request artifact contains both the raw
 // protocol transcript and enough phase metrics to explain end-to-end latency.
 func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name string, fields map[string]any) {
+	RecordAPIWebsocketEvent(ctx, cfg, name, observability.WebsocketAttributes{}, fields)
+}
+
+// RecordAPIWebsocketEvent records a typed transport event. legacyFields is
+// reserved for compatibility call sites and should be nil in new transport
+// code; conversion to a dynamic map is confined to the timeline encoder.
+func RecordAPIWebsocketEvent(ctx context.Context, cfg *config.Config, name string, attributes observability.WebsocketAttributes, legacyFields map[string]any) {
 	ginCtx := ginContextFrom(ctx)
 	rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil)
-	observability.RecordWebsocketMetric(ctx, name, rootCorrelation, executionCorrelation, fields, false)
+	observability.RecordWebsocketEvent(ctx, observability.WebsocketEvent{
+		Name: name, RootCorrelation: rootCorrelation, ExecutionCorrelation: executionCorrelation,
+		Attributes: attributes, Fields: legacyFields,
+	})
 	if !requestLogCaptureEnabled(cfg) || ginCtx == nil {
 		return
+	}
+	fields := attributes.Fields()
+	for key, value := range legacyFields {
+		fields[key] = value
 	}
 	if rootCorrelation != "" {
 		payload := marshalAPIWebsocketMetric(name, rootCorrelation, executionCorrelation, fields)
@@ -458,9 +472,20 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 // request; retaining *gin.Context after a handler returns can attribute data to
 // a later request when Gin reuses the context.
 func RecordDetachedAPIWebsocketMetric(cfg *config.Config, name string, rootCorrelation string, executionCorrelation string, fields map[string]any) {
-	observability.RecordWebsocketMetric(context.Background(), name, rootCorrelation, executionCorrelation, fields, true)
+	RecordDetachedAPIWebsocketEvent(cfg, name, rootCorrelation, executionCorrelation, observability.WebsocketAttributes{}, fields)
+}
+
+func RecordDetachedAPIWebsocketEvent(cfg *config.Config, name string, rootCorrelation string, executionCorrelation string, attributes observability.WebsocketAttributes, legacyFields map[string]any) {
+	observability.RecordWebsocketEvent(context.Background(), observability.WebsocketEvent{
+		Name: name, RootCorrelation: rootCorrelation, ExecutionCorrelation: executionCorrelation,
+		Attributes: attributes, Fields: legacyFields, Detached: true,
+	})
 	if !requestLogCaptureEnabled(cfg) {
 		return
+	}
+	fields := attributes.Fields()
+	for key, value := range legacyFields {
+		fields[key] = value
 	}
 	payload := marshalAPIWebsocketMetric(name, rootCorrelation, executionCorrelation, fields)
 	if len(payload) == 0 {

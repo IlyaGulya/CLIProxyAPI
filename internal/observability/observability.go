@@ -431,6 +431,7 @@ type WebsocketEvent struct {
 	RootCorrelation      string
 	ExecutionCorrelation string
 	Fields               map[string]any
+	Attributes           WebsocketAttributes
 	Detached             bool
 }
 
@@ -438,7 +439,10 @@ func RecordWebsocketEvent(ctx context.Context, event WebsocketEvent) {
 	name := event.Name
 	rootCorrelation := event.RootCorrelation
 	executionCorrelation := event.ExecutionCorrelation
-	fields := event.Fields
+	fields := event.Attributes.fields()
+	for key, value := range event.Fields {
+		fields[key] = value
+	}
 	detached := event.Detached
 	t := Current()
 	if !t.Enabled {
