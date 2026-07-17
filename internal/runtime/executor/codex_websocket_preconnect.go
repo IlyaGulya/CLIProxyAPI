@@ -396,11 +396,6 @@ func (p *codexWebsocketPreconnectPool) completeReservationObserved(key codexWebs
 	return true
 }
 
-func (p *codexWebsocketPreconnectPool) takeOrWait(ctx context.Context, key codexWebsocketPreconnectKey, ttl time.Duration) (*websocket.Conn, time.Duration, bool) {
-	conn, age, _, ok := p.takeOrWaitObserved(ctx, key, ttl)
-	return conn, age, ok
-}
-
 func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, key codexWebsocketPreconnectKey, ttl time.Duration) (*websocket.Conn, time.Duration, codexWebsocketPreconnectObservation, bool) {
 	if p == nil {
 		return nil, 0, codexWebsocketPreconnectObservation{reason: "disabled"}, false

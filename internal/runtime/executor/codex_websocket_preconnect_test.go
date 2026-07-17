@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -159,6 +160,37 @@ func TestCodexWebsocketSpeculativePreconnectSettings(t *testing.T) {
 		enabled, maxIdle, ttl := exec.speculativePreconnectSettings()
 		if !enabled || maxIdle != 4 || ttl != 9*time.Second {
 			t.Fatalf("settings = (%v, %d, %s), want (true, 4, 9s)", enabled, maxIdle, ttl)
+		}
+	})
+}
+
+func TestCodexWebsocketPreconnectExpiryUsesDeterministicClock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var closes atomic.Int32
+		pool := newCodexWebsocketPreconnectPool(ctx, func(*websocket.Conn) error {
+			closes.Add(1)
+			return nil
+		})
+		key := codexWebsocketPreconnectKey{authID: "auth", wsURL: "ws://test"}
+		reserved, _, generation := pool.reserve(key, 1, time.Now())
+		if !reserved {
+			t.Fatal("reservation failed")
+		}
+		expired := make(chan struct{}, 1)
+		if !pool.completeReservationObserved(key, generation, &websocket.Conn{}, 1, time.Hour, time.Now(), func() { expired <- struct{}{} }) {
+			t.Fatal("reservation completion failed")
+		}
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if closes.Load() != 1 {
+			t.Fatalf("close count = %d, want 1", closes.Load())
+		}
+		select {
+		case <-expired:
+		default:
+			t.Fatal("expiry callback was not called")
 		}
 	})
 }

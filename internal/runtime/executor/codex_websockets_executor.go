@@ -373,7 +373,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				reporter.StartResponseTTFT()
 				if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
-					wsReqBody = wsReqBodyRetry
 				} else {
 					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
@@ -1096,7 +1095,7 @@ func shouldRetryCodexWebsocketReadError(err error) bool {
 
 func isTemporaryCodexWebsocketNetworkError(err error) bool {
 	var netErr net.Error
-	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func codexWebsocketRetryReason(err error) string {
@@ -1590,28 +1589,6 @@ func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
 		return false
 	}
 	return strings.TrimSpace(auth.Attributes["api_key"]) != ""
-}
-
-func ensureHeaderCasePreserved(target http.Header, source http.Header, key, configValue, fallbackValue string) {
-	if target == nil {
-		return
-	}
-	if strings.TrimSpace(headerValueCaseInsensitive(target, key)) != "" {
-		return
-	}
-	if source != nil {
-		if val := strings.TrimSpace(headerValueCaseInsensitive(source, key)); val != "" {
-			setHeaderCasePreserved(target, key, val)
-			return
-		}
-	}
-	if val := strings.TrimSpace(configValue); val != "" {
-		setHeaderCasePreserved(target, key, val)
-		return
-	}
-	if val := strings.TrimSpace(fallbackValue); val != "" {
-		setHeaderCasePreserved(target, key, val)
-	}
 }
 
 func setHeaderCasePreserved(headers http.Header, key string, value string) {
@@ -2126,11 +2103,6 @@ type codexIncrementalObservation struct {
 	resetReason string
 }
 
-func (s *codexWebsocketSession) prepareCodexIncrementalRequest(fullRequest []byte) []byte {
-	request, _ := s.prepareCodexIncrementalRequestObserved(fullRequest)
-	return request
-}
-
 func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullRequest []byte) ([]byte, codexIncrementalObservation) {
 	if s == nil || len(fullRequest) == 0 {
 		return fullRequest, codexIncrementalObservation{resetReason: "not_applicable"}
@@ -2486,30 +2458,6 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 	store.mu.Unlock()
 
 	e.closeExecutionSession(sess, "session_closed")
-}
-
-func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
-	if e == nil {
-		return
-	}
-
-	store := e.store
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	sessions := make([]*codexWebsocketSession, 0, len(store.sessions))
-	for sessionID, sess := range store.sessions {
-		delete(store.sessions, sessionID)
-		if sess != nil {
-			sessions = append(sessions, sess)
-		}
-	}
-	store.mu.Unlock()
-
-	for i := range sessions {
-		e.closeExecutionSession(sessions[i], reason)
-	}
 }
 
 func (e *CodexWebsocketsExecutor) drainExecutionSessions(reason string) {
