@@ -145,10 +145,10 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 		p.document.setMaxTokens(policy.MaximumOutput)
 	}
 	estimated, method := p.document.estimateInputTokens()
-	available := policy.EffectiveWindow - policy.SafetyMargin - estimated
-	if !countTokens && p.document.maxTokens() > available && available >= policy.MinimumOutput {
-		result.AdaptiveBudget = claudeAdaptiveOutputBudgetObservation{Applied: true, OriginalMaxTokens: p.document.maxTokens(), BudgetedMaxTokens: available, EstimatedInput: estimated, Method: method}
-		p.document.setMaxTokens(available)
+	budgetedOutput, adapted := adaptClaudeOutputBudget(policy, estimated, p.document.maxTokens())
+	if !countTokens && adapted {
+		result.AdaptiveBudget = claudeAdaptiveOutputBudgetObservation{Applied: true, OriginalMaxTokens: p.document.maxTokens(), BudgetedMaxTokens: budgetedOutput, EstimatedInput: estimated, Method: method}
+		p.document.setMaxTokens(budgetedOutput)
 	}
 	if errTransition := p.transition(claudePhaseBudgeted); errTransition != nil {
 		result.Err = errTransition

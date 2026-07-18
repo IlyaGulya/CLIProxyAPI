@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
-	"github.com/tiktoken-go/tokenizer"
 )
 
 const clearedToolResultText = "[Tool result cleared to preserve context]"
@@ -64,66 +61,6 @@ type claudeAdaptiveOutputBudgetObservation struct {
 	BudgetedMaxTokens int
 	EstimatedInput    int
 	Method            string
-}
-
-// applyClaudeReactiveCompactBudget recognizes Claude Code's internal recovery
-// prompt narrowly and reserves a bounded output budget before context preflight.
-// Codex reports usage only at completion, so carrying Claude's generic 32k
-// request reserve would reject a summary that needs only a few thousand tokens.
-func applyClaudeReactiveCompactBudget(input []byte) ([]byte, claudeReactiveCompactBudgetObservation) {
-	var root map[string]any
-	if json.Unmarshal(input, &root) != nil {
-		return input, claudeReactiveCompactBudgetObservation{}
-	}
-	messages, _ := root["messages"].([]any)
-	if len(messages) == 0 {
-		return input, claudeReactiveCompactBudgetObservation{}
-	}
-	last, _ := messages[len(messages)-1].(map[string]any)
-	if stringValue(last["role"]) != "user" || !isClaudeReactiveCompactPrompt(claudeMessageText(last["content"])) {
-		return input, claudeReactiveCompactBudgetObservation{}
-	}
-	original := int(gjson.GetBytes(input, "max_tokens").Int())
-	if original <= 0 || original <= claudeReactiveCompactMaxTokens {
-		return input, claudeReactiveCompactBudgetObservation{}
-	}
-	output, err := sjson.SetBytes(input, "max_tokens", claudeReactiveCompactMaxTokens)
-	if err != nil {
-		return input, claudeReactiveCompactBudgetObservation{}
-	}
-	return output, claudeReactiveCompactBudgetObservation{
-		Applied: true, OriginalMaxTokens: original, BudgetedMaxTokens: claudeReactiveCompactMaxTokens,
-	}
-}
-
-// applyClaudeAdaptiveOutputBudget preserves a useful output allowance while
-// avoiding a deterministic boundary rejection caused only by Claude Code's
-// generic 32k reserve. Requests that cannot fit at least 8k output remain
-// unchanged so normal preflight can reject them and trigger compaction.
-func applyClaudeAdaptiveOutputBudget(input []byte) ([]byte, claudeAdaptiveOutputBudgetObservation) {
-	estimated, method := estimateClaudeGPTInputTokens(input)
-	return applyClaudeAdaptiveOutputBudgetForEstimate(input, estimated, method)
-}
-
-func applyClaudeAdaptiveOutputBudgetForEstimate(input []byte, estimated int, method string) ([]byte, claudeAdaptiveOutputBudgetObservation) {
-	model := gjson.GetBytes(input, "model").String()
-	effectiveWindow, safetyMargin := claudeContextLimits(model)
-	if safetyMargin == 0 { // Apply only to the explicitly routed Claude Code models.
-		return input, claudeAdaptiveOutputBudgetObservation{}
-	}
-	original := int(gjson.GetBytes(input, "max_tokens").Int())
-	available := effectiveWindow - safetyMargin - estimated
-	if original <= 0 || original <= available || available < claudeMinimumUsefulOutputTokens {
-		return input, claudeAdaptiveOutputBudgetObservation{}
-	}
-	output, err := sjson.SetBytes(input, "max_tokens", available)
-	if err != nil {
-		return input, claudeAdaptiveOutputBudgetObservation{}
-	}
-	return output, claudeAdaptiveOutputBudgetObservation{
-		Applied: true, OriginalMaxTokens: original, BudgetedMaxTokens: available,
-		EstimatedInput: estimated, Method: method,
-	}
 }
 
 func isClaudeReactiveCompactPrompt(text string) bool {
@@ -245,12 +182,6 @@ func claudeRealUserMessageImages(message map[string]any) (int, bool) {
 	}
 }
 
-var (
-	claudePreflightTokenizerOnce sync.Once
-	claudePreflightTokenizer     tokenizer.Codec
-	claudePreflightTokenizerErr  error
-)
-
 // claudeContextPressure applies the same 95% effective-window reserve exposed
 // by Codex model metadata. It is intentionally conservative: preflight exists
 // to prevent a deterministic provider failure, never to promise exact billing.
@@ -291,23 +222,7 @@ func estimateClaudeGPTInputTokens(input []byte) (int, string) {
 	if json.Unmarshal(input, &root) != nil {
 		return approximateTokens(input), "bytes_fallback"
 	}
-	images := 0
-	sanitized := sanitizeClaudeTokenInput(root, &images)
-	encoded, err := json.Marshal(sanitized)
-	if err != nil {
-		return approximateTokens(input), "bytes_fallback"
-	}
-	claudePreflightTokenizerOnce.Do(func() {
-		claudePreflightTokenizer, claudePreflightTokenizerErr = tokenizer.ForModel(tokenizer.GPT5)
-	})
-	if claudePreflightTokenizerErr != nil || claudePreflightTokenizer == nil {
-		return approximateTokens(encoded) + images*85, "bytes_fallback"
-	}
-	count, err := claudePreflightTokenizer.Count(string(encoded))
-	if err != nil {
-		return approximateTokens(encoded) + images*85, "bytes_fallback"
-	}
-	return count + images*85, "gpt5_tokenizer"
+	return estimateClaudeGPTInputTokensValue(root)
 }
 
 func sanitizeClaudeTokenInput(value any, images *int) any {

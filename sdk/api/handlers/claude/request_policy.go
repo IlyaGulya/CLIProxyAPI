@@ -37,3 +37,11 @@ func claudePolicyFor(model string, kind claudeRequestKind) claudeRequestPolicy {
 	}
 	return claudeRequestPolicy{EffectiveWindow: 272_000 * 95 / 100, MaximumOutput: 32_000, MinimumOutput: 1}
 }
+
+func adaptClaudeOutputBudget(policy claudeRequestPolicy, estimatedInput, requestedOutput int) (int, bool) {
+	available := policy.EffectiveWindow - policy.SafetyMargin - estimatedInput
+	if requestedOutput <= 0 || requestedOutput <= available || available < policy.MinimumOutput {
+		return requestedOutput, false
+	}
+	return available, true
+}

@@ -190,49 +190,43 @@ func TestClaudeContextPressureKeepsCodexWindowForUnrelatedModels(t *testing.T) {
 func TestApplyClaudeReactiveCompactBudgetBeforePreflight(t *testing.T) {
 	t.Parallel()
 	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":[{"type":"text","text":"Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. Before providing your final summary, wrap your analysis in <analysis> tags. Your entire response must be plain text: an <analysis> block followed by a <summary> block."}]}]}`)
-	output, observation := applyClaudeReactiveCompactBudget(input)
+	result := newClaudeRequestPipeline(input, "").run(false)
+	observation := result.CompactBudget
 	if !observation.Applied || observation.OriginalMaxTokens != 32000 || observation.BudgetedMaxTokens != 8192 {
 		t.Fatalf("observation = %+v", observation)
 	}
-	if got := gjson.GetBytes(output, "max_tokens").Int(); got != 8192 {
-		t.Fatalf("max_tokens = %d, want 8192: %s", got, output)
+	if result.Err != nil || result.Rejected || result.Kind != claudeRequestReactiveCompact {
+		t.Fatalf("pipeline result = %+v", result)
 	}
-	pressure := claudeContextPressureForEstimate(output, 160_000, "fixture")
-	if pressure.Overflow {
-		t.Fatalf("bounded compact should fit routed headroom: %+v", pressure)
+	if got := gjson.GetBytes(result.Body, "max_tokens").Int(); got != 8192 {
+		t.Fatalf("max_tokens = %d, want 8192: %s", got, result.Body)
 	}
 }
 
 func TestApplyClaudeReactiveCompactBudgetDoesNotMatchOrdinarySummary(t *testing.T) {
 	t.Parallel()
 	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"Summarize this Gradle report in detail."}]}`)
-	output, observation := applyClaudeReactiveCompactBudget(input)
-	if observation.Applied || string(output) != string(input) {
-		t.Fatalf("ordinary summary was treated as reactive compact: %+v %s", observation, output)
+	result := newClaudeRequestPipeline(input, "").run(false)
+	if result.Err != nil || result.CompactBudget.Applied || result.Kind != claudeRequestInteractive {
+		t.Fatalf("ordinary summary was treated as reactive compact: %+v", result)
 	}
 }
 
 func TestApplyClaudeAdaptiveOutputBudgetAvoidsReactiveCompactAtBoundary(t *testing.T) {
 	t.Parallel()
-	input := []byte(`{"model":"gpt-5.6-luna","max_tokens":32000,"messages":[{"role":"user","content":"continue implementation"}]}`)
-	output, observation := applyClaudeAdaptiveOutputBudgetForEstimate(input, 139_887, "fixture")
-	if !observation.Applied || observation.OriginalMaxTokens != 32_000 || observation.BudgetedMaxTokens != 31_921 {
-		t.Fatalf("observation = %+v", observation)
-	}
-	if pressure := claudeContextPressureForEstimate(output, 139_887, "fixture"); pressure.Overflow {
-		t.Fatalf("adapted request still overflows: %+v", pressure)
+	policy := claudePolicyFor("gpt-5.6-luna", claudeRequestInteractive)
+	budget, applied := adaptClaudeOutputBudget(policy, 139_887, 32_000)
+	if !applied || budget != 31_921 {
+		t.Fatalf("budget = %d, applied = %t", budget, applied)
 	}
 }
 
 func TestApplyClaudeAdaptiveOutputBudgetRejectsWhenUsefulOutputCannotFit(t *testing.T) {
 	t.Parallel()
-	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"continue"}]}`)
-	output, observation := applyClaudeAdaptiveOutputBudgetForEstimate(input, 165_000, "fixture")
-	if observation.Applied || string(output) != string(input) {
-		t.Fatalf("unsafe request was shrunk below useful output: observation=%+v output=%s", observation, output)
-	}
-	if pressure := claudeContextPressureForEstimate(output, 165_000, "fixture"); !pressure.Overflow {
-		t.Fatalf("unsafe request should remain a deterministic preflight rejection: %+v", pressure)
+	policy := claudePolicyFor("gpt-5.6-sol", claudeRequestInteractive)
+	budget, applied := adaptClaudeOutputBudget(policy, 165_000, 32_000)
+	if applied || budget != 32_000 {
+		t.Fatalf("budget = %d, applied = %t", budget, applied)
 	}
 }
 

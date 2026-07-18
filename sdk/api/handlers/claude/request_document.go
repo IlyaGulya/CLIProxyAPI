@@ -119,23 +119,27 @@ func (d *claudeRequestDocument) estimateInputTokens() (int, string) {
 		return d.estimatedInput, d.estimationMethod
 	}
 	d.estimateComputations++
-	images := 0
-	sanitized := sanitizeClaudeTokenInput(d.root, &images)
-	encoded, errEncode := json.Marshal(sanitized)
-	if errEncode != nil {
-		d.estimatedInput, d.estimationMethod = approximateTokens(d.raw), "bytes_fallback"
-	} else {
-		requestDocumentTokenizerOnce.Do(func() {
-			requestDocumentTokenizer, requestDocumentTokenizerErr = tokenizer.ForModel(tokenizer.GPT5)
-		})
-		if requestDocumentTokenizerErr != nil || requestDocumentTokenizer == nil {
-			d.estimatedInput, d.estimationMethod = approximateTokens(encoded)+images*85, "bytes_fallback"
-		} else if count, errCount := requestDocumentTokenizer.Count(string(encoded)); errCount != nil {
-			d.estimatedInput, d.estimationMethod = approximateTokens(encoded)+images*85, "bytes_fallback"
-		} else {
-			d.estimatedInput, d.estimationMethod = count+images*85, "gpt5_tokenizer"
-		}
-	}
+	d.estimatedInput, d.estimationMethod = estimateClaudeGPTInputTokensValue(d.root)
 	d.estimateValid = true
 	return d.estimatedInput, d.estimationMethod
+}
+
+func estimateClaudeGPTInputTokensValue(value any) (int, string) {
+	images := 0
+	sanitized := sanitizeClaudeTokenInput(value, &images)
+	encoded, errEncode := json.Marshal(sanitized)
+	if errEncode != nil {
+		return 0, "bytes_fallback"
+	}
+	requestDocumentTokenizerOnce.Do(func() {
+		requestDocumentTokenizer, requestDocumentTokenizerErr = tokenizer.ForModel(tokenizer.GPT5)
+	})
+	if requestDocumentTokenizerErr != nil || requestDocumentTokenizer == nil {
+		return approximateTokens(encoded) + images*85, "bytes_fallback"
+	}
+	count, errCount := requestDocumentTokenizer.Count(string(encoded))
+	if errCount != nil {
+		return approximateTokens(encoded) + images*85, "bytes_fallback"
+	}
+	return count + images*85, "gpt5_tokenizer"
 }
