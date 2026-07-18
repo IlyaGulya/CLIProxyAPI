@@ -217,17 +217,17 @@ func TestCodexWebsocketIncrementalObservationReportsNoPreviousResponse(t *testin
 
 func TestCodexIncrementalInputRequiresMatchingRequestProperties(t *testing.T) {
 	input := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]}]`
-	previous := []byte(`{"model":"gpt-5.6-sol","input":` + input + `,"tools":[],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`)
+	previous := []byte(`{"model":"gpt-5.6-sol","input":` + input + `,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`)
 	previousOutput := []byte(`[]`)
 
 	tests := []struct {
 		name    string
 		current string
 	}{
-		{name: "model", current: `{"model":"gpt-5.6-luna","input":` + input + `,"tools":[],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`},
-		{name: "tools", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[{"type":"function","name":"shell"}],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`},
-		{name: "reasoning", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[],"reasoning":{"effort":"high"},"service_tier":"default","stream":true}`},
-		{name: "service tier", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[],"reasoning":{"effort":"medium"},"service_tier":"priority","stream":true}`},
+		{name: "model", current: `{"model":"gpt-5.6-luna","input":` + input + `,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`},
+		{name: "tools", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[{"type":"function","name":"shell","parameters":{"type":"object","required":["command"]}}],"reasoning":{"effort":"medium"},"service_tier":"default","stream":true}`},
+		{name: "reasoning", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],"reasoning":{"effort":"high"},"service_tier":"default","stream":true}`},
+		{name: "service tier", current: `{"model":"gpt-5.6-sol","input":` + input + `,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],"reasoning":{"effort":"medium"},"service_tier":"priority","stream":true}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

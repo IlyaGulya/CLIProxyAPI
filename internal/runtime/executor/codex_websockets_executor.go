@@ -989,10 +989,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			eventType := gjson.GetBytes(payload, "type").String()
 			if from.String() == "claude" && strings.HasPrefix(executionSessionID, helps.ClaudeCodeWebsocketSessionPrefix) {
-				if agentCallKey, ok := codexAgentToolCallKey(payload); ok {
+				if agentCallKey, toolName, ok := codexFanoutToolCall(payload); ok {
 					if _, seen := speculativeAgentCalls[agentCallKey]; !seen {
 						speculativeAgentCalls[agentCallKey] = struct{}{}
-						e.scheduleSpeculativePreconnect(ctx, auth, authID, wsURL, wsHeaders, executionSessionID, upstreamBody)
+						e.scheduleSpeculativePreconnectForFanout(ctx, auth, authID, wsURL, wsHeaders, executionSessionID, upstreamBody, toolName)
 					}
 				}
 			}
@@ -2123,7 +2123,7 @@ func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullReque
 	}
 	delta, ok := codexIncrementalInput(s.lastRequest, s.lastResponseOutput, fullRequest)
 	if !ok {
-		return fullRequest, codexIncrementalObservation{resetReason: "request_mismatch", compaction: compactionObservation}
+		return fullRequest, codexIncrementalObservation{resetReason: codexIncrementalPropertyResetReason(s.lastRequest, fullRequest), compaction: compactionObservation}
 	}
 	incremental, errSet := sjson.SetRawBytes(fullRequest, "input", delta)
 	if errSet != nil {

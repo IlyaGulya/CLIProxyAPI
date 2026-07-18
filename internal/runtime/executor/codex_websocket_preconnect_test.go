@@ -493,13 +493,15 @@ func TestCodexAgentToolCallKeyRecognizesOnlyAgentFunctionCalls(t *testing.T) {
 	}{
 		{name: "added", payload: `{"type":"response.output_item.added","item":{"type":"function_call","name":"Agent","call_id":"call-1"}}`, wantKey: "call-1", wantOK: true},
 		{name: "done case insensitive", payload: `{"type":"response.output_item.done","item":{"type":"function_call","name":"agent","id":"item-2"}}`, wantKey: "item-2", wantOK: true},
+		{name: "workflow added", payload: `{"type":"response.output_item.added","item":{"type":"function_call","name":"Workflow","call_id":"call-workflow"}}`, wantKey: "call-workflow", wantOK: true},
+		{name: "workflow done case insensitive", payload: `{"type":"response.output_item.done","item":{"type":"function_call","name":"workflow","id":"item-workflow"}}`, wantKey: "item-workflow", wantOK: true},
 		{name: "different tool", payload: `{"type":"response.output_item.added","item":{"type":"function_call","name":"Bash","call_id":"call-3"}}`},
 		{name: "non function item", payload: `{"type":"response.output_item.added","item":{"type":"message","name":"Agent","id":"item-4"}}`},
 		{name: "unrelated event", payload: `{"type":"response.created","item":{"type":"function_call","name":"Agent","call_id":"call-5"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotKey, gotOK := codexAgentToolCallKey([]byte(tt.payload))
+			gotKey, _, gotOK := codexFanoutToolCall([]byte(tt.payload))
 			if gotKey != tt.wantKey || gotOK != tt.wantOK {
 				t.Fatalf("codexAgentToolCallKey() = (%q, %v), want (%q, %v)", gotKey, gotOK, tt.wantKey, tt.wantOK)
 			}

@@ -129,30 +129,44 @@ func (e *CodexWebsocketsExecutor) speculativePreconnectSettings() (bool, int, ti
 	return true, runtimeCfg.PreconnectMaxIdle, runtimeCfg.PreconnectTTL
 }
 
-func codexAgentToolCallKey(payload []byte) (string, bool) {
+func codexFanoutToolCall(payload []byte) (string, string, bool) {
 	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 	if eventType != "response.output_item.added" && eventType != "response.output_item.done" {
-		return "", false
+		return "", "", false
 	}
 	item := gjson.GetBytes(payload, "item")
-	if strings.TrimSpace(item.Get("type").String()) != "function_call" || !strings.EqualFold(strings.TrimSpace(item.Get("name").String()), "Agent") {
-		return "", false
+	toolName := strings.TrimSpace(item.Get("name").String())
+	if strings.TrimSpace(item.Get("type").String()) != "function_call" || !codexFanoutToolName(toolName) {
+		return "", "", false
 	}
 	key := strings.TrimSpace(item.Get("call_id").String())
 	if key == "" {
 		key = strings.TrimSpace(item.Get("id").String())
 	}
 	if key == "" {
-		return "", false
+		return "", "", false
 	}
-	return key, true
+	return key, toolName, true
+}
+
+func codexFanoutToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "agent", "workflow":
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte) {
-	e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, warmupTemplate, "agent_tool")
+	e.scheduleSpeculativePreconnectForFanout(ctx, auth, authID, wsURL, headers, sessionID, warmupTemplate, "Agent")
 }
 
-func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, trigger string) {
+func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForFanout(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, toolName string) {
+	e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, warmupTemplate, "fanout_tool", toolName)
+}
+
+func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, trigger string, toolName string) {
 	enabled, maxIdle, ttl := e.speculativePreconnectSettings()
 	if !enabled || auth == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(wsURL) == "" {
 		return
@@ -164,7 +178,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 	route := codexAdaptivePreconnectRoute{AuthID: authID, Model: model}
 	if e.circuit != nil && e.circuit.suppressBackground(codexCircuitRoute(auth, model)) {
 		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_suppressed", observability.WebsocketAttributes{
-			SessionID: sessionID, Model: model, Reason: "route_circuit_open", Trigger: trigger,
+			SessionID: sessionID, Model: model, Reason: "route_circuit_open", Trigger: trigger, ToolName: toolName,
 		}, nil)
 		return
 	}
@@ -173,7 +187,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 		maxIdle = min(maxIdle, decision.Target)
 		ttl = min(ttl, decision.TTL)
 		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_adaptive_decision", observability.WebsocketAttributes{
-			SessionID: sessionID, Model: model, Reason: decision.Reason,
+			SessionID: sessionID, Model: model, Reason: decision.Reason, Trigger: trigger, ToolName: toolName,
 			AdaptiveTarget: observability.Some(int64(decision.Target)), AdaptiveHitRateBasisPoints: observability.Some(int64(decision.HitRateEWMA * 10_000)),
 			CounterfactualWaitUS: observability.Some(decision.DialLatencyEWMA.Microseconds()),
 		}, nil)
@@ -182,7 +196,7 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx co
 	reserved, reason, generation := e.sessions.pool.reserve(key, maxIdle, time.Now())
 	poolIdle, poolDialing := e.sessions.pool.snapshot()
 	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_triggered", observability.WebsocketAttributes{
-		SessionID: sessionID, Reserved: observability.Some(reserved), Reason: reason, Trigger: trigger,
+		SessionID: sessionID, Reserved: observability.Some(reserved), Reason: reason, Trigger: trigger, ToolName: toolName,
 		GenerateFalseWarmup: observability.Some(e.cfg.CodexWebsocketGenerateFalseWarmup), PoolIdle: observability.Some(int64(poolIdle)), PoolDialing: observability.Some(int64(poolDialing)),
 	}, nil)
 	if !reserved {
@@ -318,7 +332,7 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 		PoolIdle: observability.Some(int64(observation.idle)), PoolDialing: observability.Some(int64(observation.dialing)),
 	}, nil)
 	if e.cfg != nil && e.cfg.CodexWebsocketPreconnectReplenish {
-		e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, nil, "lease_replenish")
+		e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, nil, "lease_replenish", "")
 	}
 	return conn
 }

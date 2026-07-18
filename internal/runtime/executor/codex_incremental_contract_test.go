@@ -60,6 +60,27 @@ func TestCodexIncrementalPropertiesRejectUnknownField(t *testing.T) {
 	}
 }
 
+func TestCodexIncrementalPropertiesAllowOnlyAdditiveToolCatalogGrowth(t *testing.T) {
+	previous := []byte(`{"model":"gpt-5.6-sol","input":[],"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}]}`)
+	additive := []byte(`{"model":"gpt-5.6-sol","input":[],"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}},{"type":"function","name":"MCPRead","parameters":{"type":"object"}}]}`)
+	if !codexIncrementalPropertiesMatch(previous, additive) {
+		t.Fatal("an unchanged tool catalog prefix with additive MCP tools blocked response-chain reuse")
+	}
+
+	mutated := []byte(`{"model":"gpt-5.6-sol","input":[],"tools":[{"type":"function","name":"Read","parameters":{"type":"object","required":["path"]}}]}`)
+	if codexIncrementalPropertiesMatch(previous, mutated) {
+		t.Fatal("a semantic mutation of an existing tool was treated as additive")
+	}
+	if reason := codexIncrementalPropertyResetReason(previous, mutated); reason != "tool_catalog_changed" {
+		t.Fatalf("reset reason = %q, want tool_catalog_changed", reason)
+	}
+
+	removed := []byte(`{"model":"gpt-5.6-sol","input":[],"tools":[]}`)
+	if codexIncrementalPropertiesMatch(previous, removed) {
+		t.Fatal("tool removal was treated as additive")
+	}
+}
+
 func TestCodexIncrementalInputNormalizesOnlyTransportItemMetadata(t *testing.T) {
 	previous := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-old","status":"completed","role":"user","content":[{"type":"input_text","text":"one","annotations":[]}]}]}`)
 	current := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","id":"msg-new","status":"in_progress","role":"user","content":[{"type":"input_text","text":"one"}]}]}`)

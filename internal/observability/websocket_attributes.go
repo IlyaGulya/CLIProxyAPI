@@ -24,6 +24,7 @@ type WebsocketAttributes struct {
 	ChainSource             string
 	IncrementalResetReason  string
 	Trigger                 string
+	ToolName                string
 	PromptCacheScope        string
 	PromptPrefixFingerprint string
 	PromptCacheTTL          string
@@ -104,6 +105,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 		"overflow_base_source": a.OverflowBaseSource, "source_format": a.SourceFormat, "reason": a.Reason,
 		"last_event_type": a.LastEventType, "boundary": a.Boundary, "suppression_reason": a.SuppressionReason,
 		"chain_source": a.ChainSource, "incremental_reset_reason": a.IncrementalResetReason, "trigger": a.Trigger,
+		"tool_name":          a.ToolName,
 		"prompt_cache_scope": a.PromptCacheScope, "prompt_prefix_fingerprint": a.PromptPrefixFingerprint,
 		"prompt_cache_ttl": a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
 	} {

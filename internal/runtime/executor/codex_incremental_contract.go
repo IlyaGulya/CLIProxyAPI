@@ -43,7 +43,42 @@ func codexIncrementalPropertiesMatch(previous, current []byte) bool {
 		return false
 	}
 	currentProperties, ok := decodeCodexIncrementalProperties(current)
-	return ok && reflect.DeepEqual(previousProperties, currentProperties)
+	if !ok || !codexAdditiveToolCatalog(previousProperties.Tools, currentProperties.Tools) {
+		return false
+	}
+	previousProperties.Tools = nil
+	currentProperties.Tools = nil
+	return reflect.DeepEqual(previousProperties, currentProperties)
+}
+
+func codexAdditiveToolCatalog(previous, current any) bool {
+	previousTools, previousOK := previous.([]any)
+	currentTools, currentOK := current.([]any)
+	if !previousOK || !currentOK || len(currentTools) < len(previousTools) {
+		return reflect.DeepEqual(previous, current)
+	}
+	for index := range previousTools {
+		if !reflect.DeepEqual(previousTools[index], currentTools[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func codexIncrementalPropertyResetReason(previous, current []byte) string {
+	previousProperties, previousOK := decodeCodexIncrementalProperties(previous)
+	currentProperties, currentOK := decodeCodexIncrementalProperties(current)
+	if !previousOK || !currentOK {
+		return "request_mismatch"
+	}
+	previousTools := previousProperties.Tools
+	currentTools := currentProperties.Tools
+	previousProperties.Tools = nil
+	currentProperties.Tools = nil
+	if reflect.DeepEqual(previousProperties, currentProperties) && !codexAdditiveToolCatalog(previousTools, currentTools) {
+		return "tool_catalog_changed"
+	}
+	return "request_mismatch"
 }
 
 func decodeCodexIncrementalProperties(payload []byte) (codexIncrementalRequestProperties, bool) {
