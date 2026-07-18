@@ -109,10 +109,24 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	}
 	rawJSON, compactBudget := applyClaudeReactiveCompactBudget(rawJSON)
 	if compactBudget.Applied {
+		log.WithFields(log.Fields{
+			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": compactBudget.OriginalMaxTokens,
+			"budgeted_max_tokens": compactBudget.BudgetedMaxTokens,
+		}).Debug("Claude reactive compact output budget applied")
 		observability.RecordWebsocketMetric(c.Request.Context(), "reactive_compact_budget_applied", "", "", map[string]any{
 			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": compactBudget.OriginalMaxTokens,
 			"budgeted_max_tokens": compactBudget.BudgetedMaxTokens,
 		}, false)
+	}
+	rawJSON, adaptiveBudget := applyClaudeAdaptiveOutputBudget(rawJSON)
+	if adaptiveBudget.Applied {
+		fields := log.Fields{
+			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": adaptiveBudget.OriginalMaxTokens,
+			"budgeted_max_tokens": adaptiveBudget.BudgetedMaxTokens, "input_tokens": adaptiveBudget.EstimatedInput,
+			"estimation_method": adaptiveBudget.Method,
+		}
+		log.WithFields(fields).Debug("Claude adaptive output budget applied")
+		observability.RecordWebsocketMetric(c.Request.Context(), "adaptive_output_budget_applied", "", "", map[string]any(fields), false)
 	}
 	rawJSON, compactionReplay := applyClaudeCompactionReplay(rawJSON, claudeCompactionV2RetainedTokenBudget)
 	if compactionReplay.Applied {

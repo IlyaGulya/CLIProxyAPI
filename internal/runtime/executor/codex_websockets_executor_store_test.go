@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 func TestCodexWebsocketsExecutor_SessionStoreIsInstanceOwnedAndDrained(t *testing.T) {
@@ -212,6 +213,26 @@ func TestCodexWebsocketIncrementalObservationReportsNoPreviousResponse(t *testin
 	}
 	if observation.resetReason != "no_previous_response" || observation.incremental {
 		t.Fatalf("observation = %+v, want no_previous_response", observation)
+	}
+}
+
+func TestCodexWebsocketReactiveCompactStartsFreshResponseChain(t *testing.T) {
+	sess := &codexWebsocketSession{
+		lastRequest:        []byte(`{"model":"gpt-5.6-luna","input":[{"type":"function_call","call_id":"stale"}]}`),
+		lastResponseID:     "resp-stale",
+		lastResponseOutput: []byte(`[{"type":"function_call","call_id":"missing-result"}]`),
+	}
+	request := []byte(`{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Your task is to create a detailed summary of the conversation so far. Before providing your final summary, wrap your analysis in <analysis> tags. Your entire response must be an <analysis> block followed by a <summary> block."}]}]}`)
+
+	got, observation := sess.prepareCodexIncrementalRequestObserved(request)
+	if observation.incremental || observation.resetReason != "reactive_compact" {
+		t.Fatalf("observation = %+v", observation)
+	}
+	if gjson.GetBytes(got, "previous_response_id").Exists() {
+		t.Fatalf("reactive compact reused stale response chain: %s", got)
+	}
+	if string(got) != string(request) {
+		t.Fatalf("fresh compact request changed:\n got %s\nwant %s", got, request)
 	}
 }
 

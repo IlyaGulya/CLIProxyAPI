@@ -212,6 +212,30 @@ func TestApplyClaudeReactiveCompactBudgetDoesNotMatchOrdinarySummary(t *testing.
 	}
 }
 
+func TestApplyClaudeAdaptiveOutputBudgetAvoidsReactiveCompactAtBoundary(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-luna","max_tokens":32000,"messages":[{"role":"user","content":"continue implementation"}]}`)
+	output, observation := applyClaudeAdaptiveOutputBudgetForEstimate(input, 139_887, "fixture")
+	if !observation.Applied || observation.OriginalMaxTokens != 32_000 || observation.BudgetedMaxTokens != 31_921 {
+		t.Fatalf("observation = %+v", observation)
+	}
+	if pressure := claudeContextPressureForEstimate(output, 139_887, "fixture"); pressure.Overflow {
+		t.Fatalf("adapted request still overflows: %+v", pressure)
+	}
+}
+
+func TestApplyClaudeAdaptiveOutputBudgetRejectsWhenUsefulOutputCannotFit(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"continue"}]}`)
+	output, observation := applyClaudeAdaptiveOutputBudgetForEstimate(input, 165_000, "fixture")
+	if observation.Applied || string(output) != string(input) {
+		t.Fatalf("unsafe request was shrunk below useful output: observation=%+v output=%s", observation, output)
+	}
+	if pressure := claudeContextPressureForEstimate(output, 165_000, "fixture"); !pressure.Overflow {
+		t.Fatalf("unsafe request should remain a deterministic preflight rejection: %+v", pressure)
+	}
+}
+
 func TestClaudeContextOverflowMessageExposesParseableGap(t *testing.T) {
 	t.Parallel()
 	message := claudeContextOverflowMessage(claudeContextPressureResult{

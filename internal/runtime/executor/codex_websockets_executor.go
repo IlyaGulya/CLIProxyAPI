@@ -2116,6 +2116,14 @@ func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullReque
 		fullRequest = shaped
 		compactionObservation = observation
 	}
+	// Reactive compaction summarizes the complete replay. Reusing a prior
+	// response chain can make the provider validate stale function calls that
+	// are no longer present in the current full request.
+	if isCodexReactiveCompactRequest(fullRequest) {
+		s.resetCodexIncrementalStateLocked()
+		s.pendingRequest = bytes.Clone(fullRequest)
+		return fullRequest, codexIncrementalObservation{resetReason: "reactive_compact", compaction: compactionObservation}
+	}
 	if len(fullRequest) > codexWebsocketMaxIncrementalStateBytes {
 		s.resetCodexIncrementalStateLocked()
 		return fullRequest, codexIncrementalObservation{resetReason: "state_too_large", compaction: compactionObservation}
@@ -2137,6 +2145,12 @@ func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullReque
 		return fullRequest, codexIncrementalObservation{resetReason: "previous_response_encode_failed", compaction: compactionObservation}
 	}
 	return incremental, codexIncrementalObservation{incremental: true, compaction: compactionObservation}
+}
+
+func isCodexReactiveCompactRequest(request []byte) bool {
+	return bytes.Contains(request, []byte("create a detailed summary of the conversation so far")) &&
+		bytes.Contains(request, []byte("wrap your analysis in <analysis> tags")) &&
+		bytes.Contains(request, []byte("<analysis> block followed by a <summary> block"))
 }
 
 func (s *codexWebsocketSession) completeCodexIncrementalRequest(completedPayload []byte) {

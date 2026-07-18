@@ -16,6 +16,7 @@ const clearedToolResultText = "[Tool result cleared to preserve context]"
 const claudeContextEditGinKey = "claude_context_edit_result"
 const claudeCompactionV2RetainedTokenBudget = 64_000
 const claudeReactiveCompactMaxTokens = 8_192
+const claudeMinimumUsefulOutputTokens = 8_192
 
 type claudeContextEditResult struct {
 	Applied              bool                       `json:"applied"`
@@ -57,6 +58,14 @@ type claudeReactiveCompactBudgetObservation struct {
 	BudgetedMaxTokens int
 }
 
+type claudeAdaptiveOutputBudgetObservation struct {
+	Applied           bool
+	OriginalMaxTokens int
+	BudgetedMaxTokens int
+	EstimatedInput    int
+	Method            string
+}
+
 // applyClaudeReactiveCompactBudget recognizes Claude Code's internal recovery
 // prompt narrowly and reserves a bounded output budget before context preflight.
 // Codex reports usage only at completion, so carrying Claude's generic 32k
@@ -84,6 +93,36 @@ func applyClaudeReactiveCompactBudget(input []byte) ([]byte, claudeReactiveCompa
 	}
 	return output, claudeReactiveCompactBudgetObservation{
 		Applied: true, OriginalMaxTokens: original, BudgetedMaxTokens: claudeReactiveCompactMaxTokens,
+	}
+}
+
+// applyClaudeAdaptiveOutputBudget preserves a useful output allowance while
+// avoiding a deterministic boundary rejection caused only by Claude Code's
+// generic 32k reserve. Requests that cannot fit at least 8k output remain
+// unchanged so normal preflight can reject them and trigger compaction.
+func applyClaudeAdaptiveOutputBudget(input []byte) ([]byte, claudeAdaptiveOutputBudgetObservation) {
+	estimated, method := estimateClaudeGPTInputTokens(input)
+	return applyClaudeAdaptiveOutputBudgetForEstimate(input, estimated, method)
+}
+
+func applyClaudeAdaptiveOutputBudgetForEstimate(input []byte, estimated int, method string) ([]byte, claudeAdaptiveOutputBudgetObservation) {
+	model := gjson.GetBytes(input, "model").String()
+	effectiveWindow, safetyMargin := claudeContextLimits(model)
+	if safetyMargin == 0 { // Apply only to the explicitly routed Claude Code models.
+		return input, claudeAdaptiveOutputBudgetObservation{}
+	}
+	original := int(gjson.GetBytes(input, "max_tokens").Int())
+	available := effectiveWindow - safetyMargin - estimated
+	if original <= 0 || original <= available || available < claudeMinimumUsefulOutputTokens {
+		return input, claudeAdaptiveOutputBudgetObservation{}
+	}
+	output, err := sjson.SetBytes(input, "max_tokens", available)
+	if err != nil {
+		return input, claudeAdaptiveOutputBudgetObservation{}
+	}
+	return output, claudeAdaptiveOutputBudgetObservation{
+		Applied: true, OriginalMaxTokens: original, BudgetedMaxTokens: available,
+		EstimatedInput: estimated, Method: method,
 	}
 }
 
