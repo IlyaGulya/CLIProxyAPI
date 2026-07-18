@@ -140,9 +140,7 @@ func AnalyzeRun(runDir string) (RunSummary, error) {
 }
 
 func parseEventJournals(paths []string) ([]RequestSummary, map[string]int, error) {
-	requests := make([]RequestSummary, 0)
-	indices := make(map[string]int)
-	events := make(map[string]int)
+	reducer := newJournalTurnReducer()
 	for _, path := range paths {
 		file, errOpen := os.Open(path)
 		if errOpen != nil {
@@ -151,26 +149,11 @@ func parseEventJournals(paths []string) ([]RequestSummary, map[string]int, error
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 16*1024), 1<<20)
 		for scanner.Scan() {
-			var event map[string]any
+			var event journalRecord
 			if json.Unmarshal(scanner.Bytes(), &event) != nil {
 				continue // A crash may leave one truncated final record.
 			}
-			name := stringValue(event["name"])
-			key := stringValue(event["request_key"])
-			if name == "" {
-				continue
-			}
-			events[name]++
-			index, exists := indices[key]
-			if name == "request_prepared" && key != "" {
-				indices[key] = len(requests)
-				requests = append(requests, RequestSummary{File: filepath.Base(path), Role: "root"})
-				index, exists = len(requests)-1, true
-			}
-			if !exists {
-				continue
-			}
-			applyJournalEvent(&requests[index], name, event)
+			reducer.apply(filepath.Base(path), event)
 		}
 		errScan := scanner.Err()
 		_ = file.Close()
@@ -178,41 +161,89 @@ func parseEventJournals(paths []string) ([]RequestSummary, map[string]int, error
 			return nil, nil, fmt.Errorf("read event journal %s: %w", path, errScan)
 		}
 	}
-	return requests, events, nil
+	return reducer.requests, reducer.events, nil
 }
 
-func applyJournalEvent(request *RequestSummary, name string, event map[string]any) {
-	if role := stringValue(event["role"]); role == "child" || role == "root" {
-		request.Role = role
+type journalRecord struct {
+	Schema            int     `json:"schema"`
+	Name              string  `json:"name"`
+	RequestKey        string  `json:"request_key"`
+	Role              string  `json:"role"`
+	Model             string  `json:"model"`
+	ConnectionSource  string  `json:"connection_source"`
+	ChainSource       string  `json:"chain_source"`
+	Incremental       bool    `json:"incremental"`
+	IncrementalReset  string  `json:"incremental_reset_reason"`
+	ClientBodyBytes   int64   `json:"client_body_bytes"`
+	UpstreamBodyBytes int64   `json:"upstream_body_bytes"`
+	DurationUS        float64 `json:"duration_us"`
+	ElapsedUS         float64 `json:"elapsed_us"`
+	SinceSendUS       float64 `json:"since_send_us"`
+	InputTokens       int64   `json:"input_tokens"`
+	OutputTokens      int64   `json:"output_tokens"`
+	CacheReadTokens   int64   `json:"cache_read_tokens"`
+	Reason            string  `json:"reason"`
+}
+
+type journalTurnReducer struct {
+	requests []RequestSummary
+	active   map[string]int
+	events   map[string]int
+}
+
+func newJournalTurnReducer() *journalTurnReducer {
+	return &journalTurnReducer{active: make(map[string]int), events: make(map[string]int)}
+}
+
+func (r *journalTurnReducer) apply(file string, event journalRecord) {
+	if r == nil || event.Name == "" {
+		return
 	}
-	switch name {
+	r.events[event.Name]++
+	if event.Name == "request_prepared" {
+		if event.RequestKey == "" {
+			return
+		}
+		r.active[event.RequestKey] = len(r.requests)
+		r.requests = append(r.requests, RequestSummary{File: file, Role: "root"})
+	}
+	index, exists := r.active[event.RequestKey]
+	if !exists {
+		return
+	}
+	applyJournalRecord(&r.requests[index], event)
+	if event.Name == "request_finished" {
+		delete(r.active, event.RequestKey)
+	}
+}
+
+func applyJournalRecord(request *RequestSummary, event journalRecord) {
+	if event.Role == "child" || event.Role == "root" {
+		request.Role = event.Role
+	}
+	switch event.Name {
 	case "request_prepared":
-		request.Model = stringValue(event["model"])
-		request.ChainSource = stringValue(event["chain_source"])
-		request.Incremental = boolean(event["incremental"])
-		request.IncrementalReset = stringValue(event["incremental_reset_reason"])
-		request.ClientBodyBytes = int64(number(event["client_body_bytes"]))
-		request.UpstreamBodyBytes = int64(number(event["upstream_body_bytes"]))
+		request.Model = event.Model
+		request.ChainSource = event.ChainSource
+		request.Incremental = event.Incremental
+		request.IncrementalReset = event.IncrementalReset
+		request.ClientBodyBytes = event.ClientBodyBytes
+		request.UpstreamBodyBytes = event.UpstreamBodyBytes
 	case "connection_ready":
-		request.ConnectionSource = stringValue(event["connection_source"])
-		request.ConnectionReadyMS = number(event["duration_us"]) / 1000
+		request.ConnectionSource = event.ConnectionSource
+		request.ConnectionReadyMS = event.DurationUS / 1000
 	case "first_upstream_event":
-		request.FirstEventMS = number(event["since_send_us"]) / 1000
+		request.FirstEventMS = event.SinceSendUS / 1000
 	case "first_output_text_delta":
-		request.FirstTextMS = number(event["since_send_us"]) / 1000
+		request.FirstTextMS = event.SinceSendUS / 1000
 	case "usage":
-		request.InputTokens = int64(number(event["input_tokens"]))
-		request.OutputTokens = int64(number(event["output_tokens"]))
-		request.CacheReadTokens = int64(number(event["cache_read_tokens"]))
+		request.InputTokens = event.InputTokens
+		request.OutputTokens = event.OutputTokens
+		request.CacheReadTokens = event.CacheReadTokens
 	case "request_finished":
-		request.TotalMS = number(event["elapsed_us"]) / 1000
-		request.FinishReason = stringValue(event["reason"])
+		request.TotalMS = event.ElapsedUS / 1000
+		request.FinishReason = event.Reason
 	}
-}
-
-func boolean(value any) bool {
-	result, _ := value.(bool)
-	return result
 }
 
 func analyzeClaudeOutput(path string) ClaudeSummary {

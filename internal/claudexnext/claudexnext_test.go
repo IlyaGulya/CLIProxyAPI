@@ -314,6 +314,7 @@ func TestAnalyzeRunSegmentsRepeatedSessionRequestKeyByPreparedEvent(t *testing.T
 		`{"schema":1,"name":"connection_ready","request_key":"stable-root","connection_source":"session_reuse"}`,
 		`{"schema":1,"name":"usage","request_key":"stable-root","input_tokens":200,"output_tokens":2}`,
 		`{"schema":1,"name":"request_finished","request_key":"stable-root","reason":"completed"}`,
+		`{"schema":1,"name":"usage","request_key":"stable-root","input_tokens":999,"output_tokens":999}`,
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(eventsDir, "requests.jsonl"), []byte(journal), 0o600); err != nil {
 		t.Fatal(err)
@@ -330,6 +331,35 @@ func TestAnalyzeRunSegmentsRepeatedSessionRequestKeyByPreparedEvent(t *testing.T
 	}
 	if summary.Requests[0].InputTokens != 100 || summary.Requests[2].InputTokens != 200 {
 		t.Fatalf("turn usage was overwritten: %+v", summary.Requests)
+	}
+}
+
+func TestAnalyzeRunReducesRotatedJournalBeforeCurrentFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	eventsDir := filepath.Join(dir, "proxy", "events")
+	if err := os.MkdirAll(eventsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rotated := `{"schema":1,"name":"request_prepared","request_key":"root","role":"root","model":"gpt-5.6-sol"}
+{"schema":1,"name":"request_finished","request_key":"root","reason":"completed"}
+`
+	current := `{"schema":1,"name":"request_prepared","request_key":"child","role":"child","model":"gpt-5.6-luna"}
+{"schema":1,"name":"connection_ready","request_key":"child","connection_source":"speculative"}
+{"schema":1,"name":"request_finished","request_key":"child","reason":"completed"}
+`
+	if err := os.WriteFile(filepath.Join(eventsDir, "requests.jsonl.1"), []byte(rotated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(eventsDir, "requests.jsonl"), []byte(current), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, errAnalyze := AnalyzeRun(dir)
+	if errAnalyze != nil {
+		t.Fatal(errAnalyze)
+	}
+	if summary.RequestCount != 2 || summary.Requests[0].Role != "root" || summary.Requests[1].Role != "child" || summary.SpeculativeHitRate != 1 {
+		t.Fatalf("rotated journal order = %+v", summary)
 	}
 }
 
