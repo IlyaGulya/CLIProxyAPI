@@ -46,6 +46,7 @@ type Options struct {
 }
 
 type Manifest struct {
+	Status             string            `json:"status"`
 	RunID              string            `json:"run_id"`
 	SessionID          string            `json:"session_id"`
 	StartedAt          time.Time         `json:"started_at"`
@@ -62,6 +63,10 @@ type Manifest struct {
 	LauncherCommit     string            `json:"launcher_commit"`
 	LauncherBuildDate  string            `json:"launcher_build_date"`
 	ProxyVersion       string            `json:"proxy_version"`
+	Generation         string            `json:"generation"`
+	LauncherPID        int               `json:"launcher_pid"`
+	ProxyPID           int               `json:"proxy_pid"`
+	ClaudePID          int               `json:"claude_pid"`
 	ProxyPort          int               `json:"proxy_port"`
 	ExitCode           int               `json:"exit_code"`
 	Stack              StackStatus       `json:"observability_stack"`
@@ -205,6 +210,20 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		return runDir, 1, fmt.Errorf("proxy did not become ready (see %s): %w", proxyLog.Name(), errReady)
 	}
 	proxyReadyMS := time.Since(proxyReadyStartedAt).Milliseconds()
+	proxyHash, _ := fileSHA256(opts.ProxyBin)
+	liveManifest := Manifest{
+		Status: "proxy_ready", RunID: runID, SessionID: sessionID, StartedAt: startedAt, WorkingDir: workingDir,
+		ClaudeVersion: commandVersion(opts.ClaudeBin), RootModel: flagValue(BuildClaudeArgs(opts.ClaudeArgs, sessionID, filepath.Join(runDir, "claude", "debug.log")), "--model"),
+		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
+		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ProxyVersion: commandVersion(opts.ProxyBin),
+		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
+		Generation: buildinfo.Commit + ":" + proxyHash, LauncherPID: os.Getpid(), ProxyPID: proxyCmd.Process.Pid,
+		Stack: stack, ProxyReadyMS: proxyReadyMS, Telemetry: telemetryPrivacy(values),
+	}
+	if errWrite := writeJSON(filepath.Join(runDir, "manifest.json"), liveManifest); errWrite != nil {
+		return runDir, 1, errWrite
+	}
+	updateLatest(opts.RunsDir, runDir)
 	if launcherSpan != nil {
 		launcherSpan.AddEvent("proxy.ready", trace.WithAttributes(attribute.Int64("duration.ms", proxyReadyMS)))
 	}
@@ -253,7 +272,13 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	if launcherSpan != nil {
 		launcherSpan.AddEvent("claude.started")
 	}
-	errRun := claudeCmd.Run()
+	errRun := claudeCmd.Start()
+	if errRun == nil {
+		liveManifest.Status = "claude_running"
+		liveManifest.ClaudePID = claudeCmd.Process.Pid
+		_ = writeJSON(filepath.Join(runDir, "manifest.json"), liveManifest)
+		errRun = claudeCmd.Wait()
+	}
 	claudeRuntimeMS := time.Since(claudeStartedAt).Milliseconds()
 	exitCode := exitStatus(errRun)
 	if claudeStdout != nil {
@@ -312,15 +337,15 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		cancelFlush()
 	}
 
-	proxyHash, _ := fileSHA256(opts.ProxyBin)
 	manifest := Manifest{
-		RunID: runID, SessionID: sessionID, StartedAt: startedAt, FinishedAt: time.Now(), WorkingDir: workingDir,
+		Status: "finished", RunID: runID, SessionID: sessionID, StartedAt: startedAt, FinishedAt: time.Now(), WorkingDir: workingDir,
 		ClaudeVersion: commandVersion(opts.ClaudeBin), ClaudeArgs: redactArgs(claudeArgs), RootModel: flagValue(claudeArgs, "--model"),
 		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ExitCode: exitCode,
 		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
 		ProxyVersion: commandVersion(opts.ProxyBin),
-		Stack:        stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
+		Generation:   liveManifest.Generation, LauncherPID: os.Getpid(), ProxyPID: proxyCmd.Process.Pid, ClaudePID: liveManifest.ClaudePID,
+		Stack: stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
 		Telemetry:       telemetryPrivacy(values),
 		HarnessSchemaOK: harnessSchemaOK, HarnessSchemaError: harnessSchemaError,
 	}
@@ -499,8 +524,29 @@ func writeJSON(path string, value any) error {
 		return errMarshal
 	}
 	payload = append(payload, '\n')
-	if errWrite := os.WriteFile(path, payload, 0o600); errWrite != nil {
+	temporary, errTemp := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if errTemp != nil {
+		return fmt.Errorf("create temporary %s: %w", path, errTemp)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if errChmod := temporary.Chmod(0o600); errChmod != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("protect temporary %s: %w", path, errChmod)
+	}
+	if _, errWrite := temporary.Write(payload); errWrite != nil {
+		_ = temporary.Close()
 		return fmt.Errorf("write %s: %w", path, errWrite)
+	}
+	if errSync := temporary.Sync(); errSync != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync %s: %w", path, errSync)
+	}
+	if errClose := temporary.Close(); errClose != nil {
+		return fmt.Errorf("close %s: %w", path, errClose)
+	}
+	if errRename := os.Rename(temporaryPath, path); errRename != nil {
+		return fmt.Errorf("replace %s: %w", path, errRename)
 	}
 	return nil
 }
@@ -553,8 +599,11 @@ func copyFile(source, destination string) error {
 
 func updateLatest(runsDir, runDir string) {
 	latest := filepath.Join(filepath.Dir(runsDir), "latest")
-	_ = os.Remove(latest)
-	_ = os.Symlink(runDir, latest)
+	temporary := latest + ".tmp"
+	_ = os.Remove(temporary)
+	if os.Symlink(runDir, temporary) == nil {
+		_ = os.Rename(temporary, latest)
+	}
 }
 
 func writeChecksums(runDir string) error {
