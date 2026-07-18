@@ -88,6 +88,7 @@ func main() {
 	var homeJWT string
 	var homeDisableClusterDiscovery bool
 	var tuiMode bool
+	var showVersion bool
 	var standalone bool
 	var localModel bool
 
@@ -109,6 +110,7 @@ func main() {
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded models.json and codex_client_models.json only, skip remote model catalog fetching")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -145,6 +147,9 @@ func main() {
 
 	// Parse the command-line flags.
 	flag.Parse()
+	if showVersion {
+		return
+	}
 
 	// Core application variables.
 	var err error
