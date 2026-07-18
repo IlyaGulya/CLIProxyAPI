@@ -2,6 +2,8 @@ package claude
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -39,6 +41,69 @@ func TestClaudePolicyTableCoversRoutedModelsAndKinds(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestClaudeRequestPipelineBoundsSyntheticResumeRecovery(t *testing.T) {
+	t.Parallel()
+	compactPrompt := "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. Before providing your final summary, wrap your analysis in <analysis> tags. Your entire response must be plain text: an <analysis> block followed by a <summary> block."
+	tests := []struct {
+		name         string
+		targetTokens int
+		lastPrompt   string
+		wantKind     claudeRequestKind
+		wantRejected bool
+		wantCompact  bool
+		wantAdaptive bool
+	}{
+		{name: "boundary interactive adapts without compact loop", targetTokens: 160_000, lastPrompt: "Continue after restoring this session.", wantKind: claudeRequestInteractive, wantAdaptive: true},
+		{name: "true overflow compact rejects once with bounded reserve", targetTokens: 168_000, lastPrompt: compactPrompt, wantKind: claudeRequestReactiveCompact, wantRejected: true, wantCompact: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := syntheticClaudeResumeRequest(t, test.targetTokens, test.lastPrompt)
+			result := newClaudeRequestPipeline(request, "").run(false)
+			if result.Err != nil || result.Kind != test.wantKind || result.Rejected != test.wantRejected {
+				t.Fatalf("pipeline result = %+v", result)
+			}
+			if result.CompactBudget.Applied != test.wantCompact || result.AdaptiveBudget.Applied != test.wantAdaptive {
+				t.Fatalf("budget observations: compact=%+v adaptive=%+v", result.CompactBudget, result.AdaptiveBudget)
+			}
+			if test.wantCompact && result.Pressure.ReservedOutput != claudeReactiveCompactMaxTokens {
+				t.Fatalf("compact reserve = %d, want %d", result.Pressure.ReservedOutput, claudeReactiveCompactMaxTokens)
+			}
+			if test.wantRejected {
+				message := claudeContextOverflowMessage(result.Pressure)
+				for _, field := range []string{"input=", "requested_output=", "safety_margin=", "maximum"} {
+					if !strings.Contains(message, field) {
+						t.Fatalf("overflow message %q missing %q", message, field)
+					}
+				}
+			}
+		})
+	}
+}
+
+func syntheticClaudeResumeRequest(t *testing.T, targetTokens int, lastPrompt string) []byte {
+	t.Helper()
+	repeats := targetTokens / 4
+	for attempt := 0; attempt < 3; attempt++ {
+		history := strings.Repeat("resume-boundary-token ", repeats)
+		request := []byte(fmt.Sprintf(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":%q},{"role":"assistant","content":"preserved answer"},{"role":"user","content":%q}]}`, history, lastPrompt))
+		document, errDocument := newClaudeRequestDocument(request)
+		if errDocument != nil {
+			t.Fatal(errDocument)
+		}
+		estimated, _ := document.estimateInputTokens()
+		if estimated >= targetTokens-1_000 && estimated <= targetTokens+1_000 {
+			return request
+		}
+		if estimated <= 0 {
+			t.Fatalf("invalid token estimate %d", estimated)
+		}
+		repeats = repeats * targetTokens / estimated
+	}
+	t.Fatalf("could not construct request near %d tokens", targetTokens)
+	return nil
 }
 
 func FuzzClaudeRequestPipelineDeterministic(f *testing.F) {
