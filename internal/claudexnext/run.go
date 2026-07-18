@@ -214,9 +214,10 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		return runDir, 1, fmt.Errorf("proxy did not become ready (see %s): %w", proxyLog.Name(), errReady)
 	}
 	proxyReadyMS := time.Since(proxyReadyStartedAt).Milliseconds()
-	claudeArgs := BuildClaudeArgs(opts.ClaudeArgs, sessionID, filepath.Join(runDir, "claude", "debug.log"))
+	modelMappings := ConfigClaudeModelMappings(configOutput)
+	claudeArgs := BuildClaudeArgs(opts.ClaudeArgs, sessionID, filepath.Join(runDir, "claude", "debug.log"), modelMappings)
 	clientRootModel := flagValue(claudeArgs, "--model")
-	rootModel := claudecompat.RoutedModel(clientRootModel)
+	rootModel := claudecompat.RoutedModel(clientRootModel, modelMappings)
 	subagentModel := values["CLAUDE_CODE_SUBAGENT_MODEL"]
 	selectedModels := []string{rootModel, subagentModel}
 	modelToken := values["ANTHROPIC_AUTH_TOKEN"]
@@ -235,7 +236,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		contextWindow.Source = "registry_fallback"
 	}
 	ConfigureClaudeContextSafety(values, contextWindow)
-	configureClaudeClientModels(values)
+	configureClaudeClientModels(values, modelMappings)
 	proxyHash, _ := fileSHA256(opts.ProxyBin)
 	liveManifest := Manifest{
 		Status: "proxy_ready", RunID: runID, SessionID: sessionID, StartedAt: startedAt, WorkingDir: workingDir,

@@ -75,7 +75,8 @@ codex-websocket-generate-false-warmup: true
 		"request-log: false",
 		"logs-max-total-size-mb: 128",
 		"codex-prefer-upstream-websockets: true",
-		"claude-code-auto-mode-classifier-model: gpt-5.6-luna",
+		"claude-code-auto-mode-classifier-model: gpt-5.6-terra",
+		"claude-code-model-mappings:",
 		"codex-websocket-speculative-preconnect: true",
 		"codex-websocket-preconnect-replenish: true",
 		"codex-websocket-preconnect-max-idle: 2",
@@ -97,12 +98,26 @@ codex-websocket-generate-false-warmup: true
 	if !parsed.CodexPreferUpstreamWebsockets || !parsed.CodexWebsocketSpeculativePreconnect || parsed.RequestLog {
 		t.Fatalf("prepared runtime flags were not parsed: %+v", parsed.SDKConfig)
 	}
-	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-luna" {
-		t.Fatalf("classifier model = %q, want gpt-5.6-luna", parsed.ClaudeCodeAutoModeClassifierModel)
+	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-terra" {
+		t.Fatalf("classifier model = %q, want gpt-5.6-terra", parsed.ClaudeCodeAutoModeClassifierModel)
+	}
+	if parsed.ClaudeCodeModelMappings["claude-opus-4-6"] != "gpt-5.6-sol" || parsed.ClaudeCodeModelMappings["claude-sonnet-4-6"] != "gpt-5.6-luna" {
+		t.Fatalf("client model mappings = %#v", parsed.ClaudeCodeModelMappings)
 	}
 	aliases := aliasesByName(parsed.OAuthModelAlias["codex"])
 	if aliases["sol"] != "gpt-5.6-sol" || aliases["luna"] != "gpt-5.6-luna" || aliases["terra"] != "gpt-5.6-terra" {
 		t.Fatalf("workflow aliases = %#v, want sol/luna/terra defaults", aliases)
+	}
+}
+
+func TestPrepareConfigPreservesExplicitClientModelMappings(t *testing.T) {
+	got, err := PrepareConfig([]byte("claude-code-model-mappings:\n  client-a: routed-a\n"), 18432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, errParse := config.ParseConfigBytes(got)
+	if errParse != nil || len(parsed.ClaudeCodeModelMappings) != 1 || parsed.ClaudeCodeModelMappings["client-a"] != "routed-a" {
+		t.Fatalf("mappings=%#v err=%v", parsed.ClaudeCodeModelMappings, errParse)
 	}
 }
 
@@ -187,6 +202,19 @@ func TestConfigureClaudeClientModelsMapsOnlyKnownRoutedModels(t *testing.T) {
 	configureClaudeClientModels(values)
 	if values["CLAUDE_CODE_SUBAGENT_MODEL"] != "custom" {
 		t.Fatalf("custom subagent model was rewritten: %q", values["CLAUDE_CODE_SUBAGENT_MODEL"])
+	}
+}
+
+func TestLauncherUsesDeclarativeClientModelMappings(t *testing.T) {
+	mappings := map[string]string{"claude-custom-root[1m]": "root-route", "claude-custom-leaf[1m]": "leaf-route"}
+	got := BuildClaudeArgs([]string{"--model", "root-route"}, "session", "/tmp/debug", mappings)
+	if flagValue(got, "--model") != "claude-custom-root[1m]" {
+		t.Fatalf("root args = %#v", got)
+	}
+	values := map[string]string{"CLAUDE_CODE_SUBAGENT_MODEL": "leaf-route"}
+	configureClaudeClientModels(values, mappings)
+	if values["CLAUDE_CODE_SUBAGENT_MODEL"] != "claude-custom-leaf[1m]" {
+		t.Fatalf("subagent model = %q", values["CLAUDE_CODE_SUBAGENT_MODEL"])
 	}
 }
 

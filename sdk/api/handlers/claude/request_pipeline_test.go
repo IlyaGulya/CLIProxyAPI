@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
@@ -19,7 +20,7 @@ func TestClaudeRequestPipelineUsesRegisteredModelWindow(t *testing.T) {
 	t.Cleanup(func() { registryRef.UnregisterClient(clientID) })
 
 	request := []byte(fmt.Sprintf(`{"model":%q,"max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`, modelID))
-	result := newClaudeRequestPipeline(request, "").run(false)
+	result := newClaudeRequestPipeline(request, "", claudecompat.DefaultModelMappings()).run(false)
 	if result.Err != nil || result.Rejected {
 		t.Fatalf("pipeline result = err %v rejected %t", result.Err, result.Rejected)
 	}
@@ -28,9 +29,17 @@ func TestClaudeRequestPipelineUsesRegisteredModelWindow(t *testing.T) {
 	}
 }
 
+func TestClaudeRequestPipelineDoesNotRewriteClientProfileWithoutConfiguration(t *testing.T) {
+	request := []byte(`{"model":"claude-opus-4-6","max_tokens":32000,"messages":[]}`)
+	result := newClaudeRequestPipeline(request, "").run(false)
+	if result.Err != nil || result.Model != "claude-opus-4-6" || result.ClientModel != result.Model {
+		t.Fatalf("unconfigured pipeline result = %+v", result)
+	}
+}
+
 func TestClaudeRequestPipelineRoutesClientCapabilityProfileBeforePolicy(t *testing.T) {
 	request := []byte(`{"model":"claude-opus-4-6","max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`)
-	result := newClaudeRequestPipeline(request, "").run(false)
+	result := newClaudeRequestPipeline(request, "", claudecompat.DefaultModelMappings()).run(false)
 	if result.Err != nil || result.Rejected || result.Model != "gpt-5.6-sol" || result.ClientModel != "claude-opus-4-6" {
 		t.Fatalf("pipeline result = %+v", result)
 	}

@@ -2,6 +2,11 @@
 // between Claude Code's client-side capability profiles and proxy routing.
 package claudecompat
 
+import (
+	"sort"
+	"strings"
+)
+
 const (
 	SolClientProfile  = "claude-opus-4-6[1m]"
 	LunaClientProfile = "claude-sonnet-4-6[1m]"
@@ -9,32 +14,40 @@ const (
 	LunaRequestModel  = "claude-sonnet-4-6"
 )
 
-var routedByClient = map[string]string{
-	SolClientProfile:  "gpt-5.6-sol",
-	LunaClientProfile: "gpt-5.6-luna",
-	SolRequestModel:   "gpt-5.6-sol",
-	LunaRequestModel:  "gpt-5.6-luna",
-}
-
-var clientByRouted = map[string]string{
-	"gpt-5.6-sol":  SolClientProfile,
-	"gpt-5.6-luna": LunaClientProfile,
-}
-
 // RoutedModel returns the proxy model represented by an exact Claude Code
 // client capability profile. Unknown model names pass through unchanged.
-func RoutedModel(model string) string {
-	if routed, ok := routedByClient[model]; ok {
+func RoutedModel(model string, mappings map[string]string) string {
+	if routed := mappings[model]; routed != "" {
 		return routed
 	}
 	return model
 }
 
+// DefaultModelMappings returns a fresh declarative mapping for claudex-next's
+// isolated proxy. General proxy handlers have no implicit model rewrites.
+func DefaultModelMappings() map[string]string {
+	return map[string]string{
+		SolClientProfile: "gpt-5.6-sol", SolRequestModel: "gpt-5.6-sol",
+		LunaClientProfile: "gpt-5.6-luna", LunaRequestModel: "gpt-5.6-luna",
+	}
+}
+
 // ClientModel returns the Claude Code capability profile for a routed model.
 // Unknown model names pass through unchanged.
-func ClientModel(model string) string {
-	if client, ok := clientByRouted[model]; ok {
-		return client
+func ClientModel(model string, mappings ...map[string]string) string {
+	var configured map[string]string
+	if len(mappings) > 0 {
+		configured = mappings[0]
+	}
+	candidates := make([]string, 0)
+	for client, routed := range configured {
+		if routed == model && strings.HasSuffix(client, "[1m]") {
+			candidates = append(candidates, client)
+		}
+	}
+	if len(candidates) > 0 {
+		sort.Strings(candidates)
+		return candidates[0]
 	}
 	return model
 }

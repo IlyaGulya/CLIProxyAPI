@@ -50,7 +50,10 @@ func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
 	values["codex-cache-aware-compaction"] = true
 	values["codex-websocket-circuit-breaker"] = true
 	if _, configured := values["claude-code-auto-mode-classifier-model"]; !configured {
-		values["claude-code-auto-mode-classifier-model"] = "gpt-5.6-luna"
+		values["claude-code-auto-mode-classifier-model"] = "gpt-5.6-terra"
+	}
+	if _, configured := values["claude-code-model-mappings"]; !configured {
+		values["claude-code-model-mappings"] = claudecompat.DefaultModelMappings()
 	}
 	ensureWorkflowModelAliases(values)
 	out, errMarshal := yaml.Marshal(values)
@@ -144,11 +147,15 @@ func configString(value any) string {
 }
 
 // BuildClaudeArgs adds observable defaults while respecting explicit user flags.
-func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
-	args = mapClaudeModelFlag(args)
+func BuildClaudeArgs(args []string, sessionID, debugPath string, mappings ...map[string]string) []string {
+	configured := claudecompat.DefaultModelMappings()
+	if len(mappings) > 0 {
+		configured = mappings[0]
+	}
+	args = mapClaudeModelFlag(args, configured)
 	out := make([]string, 0, len(args)+8)
 	if !hasFlag(args, "--model") {
-		out = append(out, "--model", claudecompat.SolClientProfile)
+		out = append(out, "--model", claudecompat.ClientModel("gpt-5.6-sol", configured))
 	}
 	if !hasAnyFlag(args, "--session-id", "--resume", "-r", "--continue", "-c") {
 		out = append(out, "--session-id", sessionID)
@@ -164,25 +171,39 @@ func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
 	return append(out, args...)
 }
 
-func mapClaudeModelFlag(args []string) []string {
+func mapClaudeModelFlag(args []string, mappings map[string]string) []string {
 	out := append([]string(nil), args...)
 	for index, arg := range out {
 		if arg == "--model" && index+1 < len(out) {
-			out[index+1] = claudecompat.ClientModel(out[index+1])
+			out[index+1] = claudecompat.ClientModel(out[index+1], mappings)
 			return out
 		}
 		if value, ok := strings.CutPrefix(arg, "--model="); ok {
-			out[index] = "--model=" + claudecompat.ClientModel(value)
+			out[index] = "--model=" + claudecompat.ClientModel(value, mappings)
 			return out
 		}
 	}
 	return out
 }
 
-func configureClaudeClientModels(values map[string]string) {
-	if model := strings.TrimSpace(values["CLAUDE_CODE_SUBAGENT_MODEL"]); model != "" {
-		values["CLAUDE_CODE_SUBAGENT_MODEL"] = claudecompat.ClientModel(model)
+func configureClaudeClientModels(values map[string]string, mappings ...map[string]string) {
+	configured := claudecompat.DefaultModelMappings()
+	if len(mappings) > 0 {
+		configured = mappings[0]
 	}
+	if model := strings.TrimSpace(values["CLAUDE_CODE_SUBAGENT_MODEL"]); model != "" {
+		values["CLAUDE_CODE_SUBAGENT_MODEL"] = claudecompat.ClientModel(model, configured)
+	}
+}
+
+func ConfigClaudeModelMappings(input []byte) map[string]string {
+	var values struct {
+		Mappings map[string]string `yaml:"claude-code-model-mappings"`
+	}
+	if yaml.Unmarshal(input, &values) != nil {
+		return nil
+	}
+	return values.Mappings
 }
 
 func hasAnyFlag(args []string, names ...string) bool {

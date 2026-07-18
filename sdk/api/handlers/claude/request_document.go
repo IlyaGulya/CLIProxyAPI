@@ -3,9 +3,9 @@ package claude
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/tiktoken-go/tokenizer"
 )
 
@@ -86,12 +86,14 @@ func (d *claudeRequestDocument) mutate(applied bool) bool {
 	return true
 }
 
-func (d *claudeRequestDocument) normalizeModel() bool {
+func (d *claudeRequestDocument) normalizeModel(mappings map[string]string) bool {
 	changed := rewriteClaudeDDModelRoot(d.root)
 	if changed {
 		d.invalidate()
 	}
-	changed = d.setModel(claudecompat.RoutedModel(d.model())) || changed
+	if target := strings.TrimSpace(mappings[d.model()]); target != "" {
+		changed = d.setModel(target) || changed
+	}
 	return changed
 }
 

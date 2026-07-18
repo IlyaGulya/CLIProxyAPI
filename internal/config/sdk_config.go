@@ -101,6 +101,9 @@ type SDKConfig struct {
 	// safety classifier requests to the configured model. Empty disables rewriting.
 	// Only requests matching the classifier's narrow payload signature are changed.
 	ClaudeCodeAutoModeClassifierModel string `yaml:"claude-code-auto-mode-classifier-model,omitempty" json:"claude-code-auto-mode-classifier-model,omitempty"`
+	// ClaudeCodeModelMappings declares client-facing Claude capability profiles
+	// and their routed proxy models. An empty map disables profile rewriting.
+	ClaudeCodeModelMappings map[string]string `yaml:"claude-code-model-mappings,omitempty" json:"claude-code-model-mappings,omitempty"`
 
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`

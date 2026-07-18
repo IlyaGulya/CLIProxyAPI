@@ -28,6 +28,7 @@ type claudeRequestPipeline struct {
 	raw             []byte
 	document        *claudeRequestDocument
 	classifierModel string
+	modelMappings   map[string]string
 	kind            claudeRequestKind
 }
 
@@ -47,8 +48,12 @@ type claudePipelineResult struct {
 	Err              error
 }
 
-func newClaudeRequestPipeline(raw []byte, classifierModel string) *claudeRequestPipeline {
-	return &claudeRequestPipeline{phase: claudePhaseReceived, raw: raw, classifierModel: classifierModel, kind: claudeRequestInteractive}
+func newClaudeRequestPipeline(raw []byte, classifierModel string, mappings ...map[string]string) *claudeRequestPipeline {
+	pipeline := &claudeRequestPipeline{phase: claudePhaseReceived, raw: raw, classifierModel: classifierModel, kind: claudeRequestInteractive}
+	if len(mappings) > 0 {
+		pipeline.modelMappings = mappings[0]
+	}
+	return pipeline
 }
 
 func (p *claudeRequestPipeline) transition(next claudePipelinePhase) error {
@@ -73,7 +78,7 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 		return result
 	}
 
-	document.normalizeModel()
+	document.normalizeModel(p.modelMappings)
 	if errTransition := p.transition(claudePhaseNormalized); errTransition != nil {
 		result.Err = errTransition
 		return result

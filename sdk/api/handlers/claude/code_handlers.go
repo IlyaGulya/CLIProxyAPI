@@ -86,10 +86,12 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	}
 
 	classifierModel := ""
+	var modelMappings map[string]string
 	if h != nil && h.Cfg != nil {
 		classifierModel = h.Cfg.ClaudeCodeAutoModeClassifierModel
+		modelMappings = h.Cfg.ClaudeCodeModelMappings
 	}
-	pipeline := newClaudeRequestPipeline(rawJSON, classifierModel)
+	pipeline := newClaudeRequestPipeline(rawJSON, classifierModel, modelMappings)
 	result := pipeline.run(false)
 	if result.Err != nil {
 		message := "Invalid tool history"
@@ -262,7 +264,11 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 		return
 	}
 
-	result := newClaudeRequestPipeline(rawJSON, "").run(true)
+	var modelMappings map[string]string
+	if h != nil && h.Cfg != nil {
+		modelMappings = h.Cfg.ClaudeCodeModelMappings
+	}
+	result := newClaudeRequestPipeline(rawJSON, "", modelMappings).run(true)
 	if result.Err != nil {
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Message: "Invalid tool history", Type: "invalid_request_error"}})
 		return
