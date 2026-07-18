@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 )
 
 func TestProcessOwnerStopIsIdempotent(t *testing.T) {
@@ -373,17 +374,18 @@ func TestClaudeMetricsQueryIsRunScopedAndSurvivesExporterShutdown(t *testing.T) 
 	}
 }
 
-func TestClaudeNativeMetricsExportRequiresExplicitSuccess(t *testing.T) {
+func TestClaudeMetricsVerificationRequiresStructuredFlushEvidence(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(t.TempDir(), "debug.log")
-	if err := os.WriteFile(path, []byte("First metrics export: FAILURE\nFirst metrics export: SUCCESS\n"), 0o600); err != nil {
-		t.Fatal(err)
+	evidence := observability.TelemetryShutdownEvidence{
+		Schema: 1, Enabled: true, JournalCloseOK: true,
+		Metrics: observability.SignalShutdownEvidence{Configured: true, ForceFlushOK: true, ShutdownOK: true},
 	}
-	if !claudeNativeMetricsExported(path) {
-		t.Fatal("explicit Claude metrics export success was not recognized")
+	if !structuredClaudeMetricsExported(evidence) {
+		t.Fatal("complete structured metrics evidence was rejected")
 	}
-	if claudeNativeMetricsExported(filepath.Join(t.TempDir(), "missing.log")) {
-		t.Fatal("missing debug evidence was accepted")
+	evidence.Metrics.ForceFlushOK = false
+	if structuredClaudeMetricsExported(evidence) {
+		t.Fatal("failed metrics flush was accepted")
 	}
 }
 

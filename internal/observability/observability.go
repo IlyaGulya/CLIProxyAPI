@@ -67,6 +67,33 @@ type Telemetry struct {
 	journal         *eventJournal
 }
 
+type SignalShutdownEvidence struct {
+	Configured   bool `json:"configured"`
+	ForceFlushOK bool `json:"force_flush_ok"`
+	ShutdownOK   bool `json:"shutdown_ok"`
+}
+
+type TelemetryShutdownEvidence struct {
+	Schema         int                    `json:"schema"`
+	Enabled        bool                   `json:"enabled"`
+	JournalCloseOK bool                   `json:"journal_close_ok"`
+	Logs           SignalShutdownEvidence `json:"logs"`
+	Metrics        SignalShutdownEvidence `json:"metrics"`
+	Traces         SignalShutdownEvidence `json:"traces"`
+}
+
+func (e TelemetryShutdownEvidence) Succeeded() bool {
+	if !e.Enabled || !e.JournalCloseOK {
+		return false
+	}
+	for _, signal := range []SignalShutdownEvidence{e.Logs, e.Metrics, e.Traces} {
+		if signal.Configured && (!signal.ForceFlushOK || !signal.ShutdownOK) {
+			return false
+		}
+	}
+	return true
+}
+
 var current atomic.Pointer[Telemetry]
 var environmentMu sync.Mutex
 
@@ -323,20 +350,38 @@ func RecordOpenConnection(delta int64) {
 }
 
 func (t *Telemetry) Shutdown(ctx context.Context) error {
+	_, errShutdown := t.ShutdownWithEvidence(ctx)
+	return errShutdown
+}
+
+func (t *Telemetry) ShutdownWithEvidence(ctx context.Context) (TelemetryShutdownEvidence, error) {
+	evidence := TelemetryShutdownEvidence{Schema: 1, Enabled: t != nil && t.Enabled, JournalCloseOK: true}
+	if t == nil {
+		return evidence, nil
+	}
 	var errs []error
 	if t.journal != nil {
-		errs = append(errs, t.journal.close())
+		errClose := t.journal.close()
+		evidence.JournalCloseOK = errClose == nil
+		errs = append(errs, errClose)
 	}
-	if t.loggerProvider != nil {
-		errs = append(errs, t.loggerProvider.ForceFlush(ctx), t.loggerProvider.Shutdown(ctx))
+	flushSignal := func(configured bool, forceFlush, shutdown func(context.Context) error) SignalShutdownEvidence {
+		signal := SignalShutdownEvidence{Configured: configured}
+		if !configured {
+			return signal
+		}
+		errFlush := forceFlush(ctx)
+		signal.ForceFlushOK = errFlush == nil
+		errs = append(errs, errFlush)
+		errShutdown := shutdown(ctx)
+		signal.ShutdownOK = errShutdown == nil
+		errs = append(errs, errShutdown)
+		return signal
 	}
-	if t.meterProvider != nil {
-		errs = append(errs, t.meterProvider.ForceFlush(ctx), t.meterProvider.Shutdown(ctx))
-	}
-	if t.tracerProvider != nil {
-		errs = append(errs, t.tracerProvider.ForceFlush(ctx), t.tracerProvider.Shutdown(ctx))
-	}
-	return errors.Join(errs...)
+	evidence.Logs = flushSignal(t.loggerProvider != nil, func(ctx context.Context) error { return t.loggerProvider.ForceFlush(ctx) }, func(ctx context.Context) error { return t.loggerProvider.Shutdown(ctx) })
+	evidence.Metrics = flushSignal(t.meterProvider != nil, func(ctx context.Context) error { return t.meterProvider.ForceFlush(ctx) }, func(ctx context.Context) error { return t.meterProvider.Shutdown(ctx) })
+	evidence.Traces = flushSignal(t.tracerProvider != nil, func(ctx context.Context) error { return t.tracerProvider.ForceFlush(ctx) }, func(ctx context.Context) error { return t.tracerProvider.Shutdown(ctx) })
+	return evidence, errors.Join(errs...)
 }
 
 func HTTPMiddleware() gin.HandlerFunc {

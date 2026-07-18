@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 )
 
 type VerificationReport struct {
@@ -88,7 +90,7 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 			report.BackendErrors[name] = errProbe.Error()
 		}
 	}
-	if !report.Checks["claude_metrics_present"] && claudeNativeMetricsExported(filepath.Join(runDir, "claude", "debug.log")) {
+	if !report.Checks["claude_metrics_present"] && structuredClaudeMetricsExported(manifest.OTELExport) {
 		report.Checks["claude_metrics_present"] = true
 		delete(report.BackendErrors, "claude_metrics_present")
 	}
@@ -133,19 +135,8 @@ func claudeMetricsQuery(runID string) string {
 	return fmt.Sprintf(`sum(last_over_time({__name__=~"claude_code_.*|claudex_claude_.*",claudex_run_id=%q}[6h]))`, runID)
 }
 
-func claudeNativeMetricsExported(path string) bool {
-	file, errOpen := os.Open(path)
-	if errOpen != nil {
-		return false
-	}
-	defer func() { _ = file.Close() }()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if strings.Contains(scanner.Text(), "First metrics export: SUCCESS") {
-			return true
-		}
-	}
-	return false
+func structuredClaudeMetricsExported(evidence observability.TelemetryShutdownEvidence) bool {
+	return evidence.Schema == 1 && evidence.Enabled && evidence.Metrics.Configured && evidence.Metrics.ForceFlushOK && evidence.Metrics.ShutdownOK
 }
 
 func grafanaTempoTraceIDs(ctx context.Context, client *http.Client, endpoint string) (map[string]struct{}, error) {

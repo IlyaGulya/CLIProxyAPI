@@ -263,6 +263,22 @@ func TestStartServiceWithEnvironmentRestoresProcessEnvironment(t *testing.T) {
 	}
 }
 
+func TestTelemetryShutdownEvidenceRequiresEveryConfiguredSignal(t *testing.T) {
+	evidence := TelemetryShutdownEvidence{
+		Schema: 1, Enabled: true, JournalCloseOK: true,
+		Logs:    SignalShutdownEvidence{Configured: true, ForceFlushOK: true, ShutdownOK: true},
+		Metrics: SignalShutdownEvidence{Configured: true, ForceFlushOK: true, ShutdownOK: true},
+		Traces:  SignalShutdownEvidence{Configured: true, ForceFlushOK: true, ShutdownOK: true},
+	}
+	if !evidence.Succeeded() {
+		t.Fatal("complete shutdown evidence was rejected")
+	}
+	evidence.Traces.ShutdownOK = false
+	if evidence.Succeeded() {
+		t.Fatal("failed configured signal was accepted")
+	}
+}
+
 func TestEventJournalWritesPrivacySafeTypedRecordsWithoutOTEL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.jsonl")
 	t.Setenv("CLAUDEX_NEXT_EVENT_JOURNAL", path)

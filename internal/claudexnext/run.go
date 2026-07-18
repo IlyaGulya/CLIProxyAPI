@@ -46,36 +46,37 @@ type Options struct {
 }
 
 type Manifest struct {
-	Status             string            `json:"status"`
-	RunID              string            `json:"run_id"`
-	SessionID          string            `json:"session_id"`
-	StartedAt          time.Time         `json:"started_at"`
-	FinishedAt         time.Time         `json:"finished_at"`
-	WorkingDir         string            `json:"working_directory"`
-	ClaudeVersion      string            `json:"claude_version"`
-	ClaudeArgs         []string          `json:"claude_args"`
-	RootModel          string            `json:"root_model"`
-	SubagentModel      string            `json:"subagent_model"`
-	MaxConcurrency     string            `json:"max_tool_use_concurrency"`
-	ProxyBinary        string            `json:"proxy_binary"`
-	ProxySHA256        string            `json:"proxy_sha256"`
-	LauncherVersion    string            `json:"launcher_version"`
-	LauncherCommit     string            `json:"launcher_commit"`
-	LauncherBuildDate  string            `json:"launcher_build_date"`
-	ProxyVersion       string            `json:"proxy_version"`
-	Generation         string            `json:"generation"`
-	LauncherPID        int               `json:"launcher_pid"`
-	ProxyPID           int               `json:"proxy_pid"`
-	ClaudePID          int               `json:"claude_pid"`
-	ProxyPort          int               `json:"proxy_port"`
-	ExitCode           int               `json:"exit_code"`
-	Stack              StackStatus       `json:"observability_stack"`
-	ProxyReadyMS       int64             `json:"proxy_ready_ms"`
-	ClaudeRuntimeMS    int64             `json:"claude_runtime_ms"`
-	OTELFlushOK        bool              `json:"otel_flush_ok"`
-	Telemetry          map[string]string `json:"telemetry_privacy"`
-	HarnessSchemaOK    bool              `json:"harness_schema_ok"`
-	HarnessSchemaError string            `json:"harness_schema_error,omitempty"`
+	Status             string                                  `json:"status"`
+	RunID              string                                  `json:"run_id"`
+	SessionID          string                                  `json:"session_id"`
+	StartedAt          time.Time                               `json:"started_at"`
+	FinishedAt         time.Time                               `json:"finished_at"`
+	WorkingDir         string                                  `json:"working_directory"`
+	ClaudeVersion      string                                  `json:"claude_version"`
+	ClaudeArgs         []string                                `json:"claude_args"`
+	RootModel          string                                  `json:"root_model"`
+	SubagentModel      string                                  `json:"subagent_model"`
+	MaxConcurrency     string                                  `json:"max_tool_use_concurrency"`
+	ProxyBinary        string                                  `json:"proxy_binary"`
+	ProxySHA256        string                                  `json:"proxy_sha256"`
+	LauncherVersion    string                                  `json:"launcher_version"`
+	LauncherCommit     string                                  `json:"launcher_commit"`
+	LauncherBuildDate  string                                  `json:"launcher_build_date"`
+	ProxyVersion       string                                  `json:"proxy_version"`
+	Generation         string                                  `json:"generation"`
+	LauncherPID        int                                     `json:"launcher_pid"`
+	ProxyPID           int                                     `json:"proxy_pid"`
+	ClaudePID          int                                     `json:"claude_pid"`
+	ProxyPort          int                                     `json:"proxy_port"`
+	ExitCode           int                                     `json:"exit_code"`
+	Stack              StackStatus                             `json:"observability_stack"`
+	ProxyReadyMS       int64                                   `json:"proxy_ready_ms"`
+	ClaudeRuntimeMS    int64                                   `json:"claude_runtime_ms"`
+	OTELFlushOK        bool                                    `json:"otel_flush_ok"`
+	OTELExport         observability.TelemetryShutdownEvidence `json:"otel_export"`
+	Telemetry          map[string]string                       `json:"telemetry_privacy"`
+	HarnessSchemaOK    bool                                    `json:"harness_schema_ok"`
+	HarnessSchemaError string                                  `json:"harness_schema_error,omitempty"`
 }
 
 type processOwner struct {
@@ -327,13 +328,17 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		cacheReadTokens += request.CacheReadTokens
 	}
 	observability.RecordClaudeRun(ctx, flagValue(claudeArgs, "--model"), summary.Claude.TerminalReason, summary.Claude.CostUSD, claudeRuntimeMS, inputTokens, outputTokens, cacheReadTokens)
-	otelFlushOK := false
+	otelEvidence := observability.TelemetryShutdownEvidence{Schema: 1, JournalCloseOK: true}
 	if launcherSpan != nil {
 		launcherSpan.End()
 	}
 	if launcherTelemetry != nil {
 		flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
-		otelFlushOK = launcherTelemetry.Shutdown(flushCtx) == nil
+		var errShutdown error
+		otelEvidence, errShutdown = launcherTelemetry.ShutdownWithEvidence(flushCtx)
+		if errShutdown != nil {
+			otelEvidence.Enabled = true
+		}
 		cancelFlush()
 	}
 
@@ -345,7 +350,8 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
 		ProxyVersion: commandVersion(opts.ProxyBin),
 		Generation:   liveManifest.Generation, LauncherPID: os.Getpid(), ProxyPID: proxyCmd.Process.Pid, ClaudePID: liveManifest.ClaudePID,
-		Stack: stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
+		Stack: stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelEvidence.Succeeded() && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
+		OTELExport:      otelEvidence,
 		Telemetry:       telemetryPrivacy(values),
 		HarnessSchemaOK: harnessSchemaOK, HarnessSchemaError: harnessSchemaError,
 	}
