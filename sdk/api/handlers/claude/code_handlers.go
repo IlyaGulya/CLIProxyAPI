@@ -86,72 +86,71 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		return
 	}
 
-	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
-	repairedJSON, repairResult, errRepair := repairInterruptedClaudeToolHistory(rawJSON)
-	if errRepair != nil {
+	classifierModel := ""
+	if h != nil && h.Cfg != nil {
+		classifierModel = h.Cfg.ClaudeCodeAutoModeClassifierModel
+	}
+	pipeline := newClaudeRequestPipeline(rawJSON, classifierModel)
+	result := pipeline.run(false)
+	if result.Err != nil {
 		message := "Invalid tool history"
-		if !errors.Is(errRepair, errAmbiguousClaudeToolHistory) {
-			message = "Unable to validate tool history"
+		if !errors.Is(result.Err, errAmbiguousClaudeToolHistory) {
+			message = "Invalid request"
 		}
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Message: message, Type: "invalid_request_error"}})
 		return
 	}
-	rawJSON = repairedJSON
-	if repairResult.Applied {
+	rawJSON = result.Body
+	if result.Repair.Applied {
 		observability.RecordWebsocketEvent(c.Request.Context(), observability.WebsocketEvent{
 			Name: "tool_history_repaired",
 			Attributes: observability.WebsocketAttributes{
-				RepairedToolUses:           observability.Some(int64(repairResult.RepairedToolUses)),
-				SeparatedAssistantMessages: observability.Some(int64(repairResult.SeparatedAssistantMessages)),
+				RepairedToolUses:           observability.Some(int64(result.Repair.RepairedToolUses)),
+				SeparatedAssistantMessages: observability.Some(int64(result.Repair.SeparatedAssistantMessages)),
 			},
 		})
 	}
-	rawJSON, compactBudget := applyClaudeReactiveCompactBudget(rawJSON)
-	if compactBudget.Applied {
+	if result.CompactBudget.Applied {
 		log.WithFields(log.Fields{
-			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": compactBudget.OriginalMaxTokens,
-			"budgeted_max_tokens": compactBudget.BudgetedMaxTokens,
+			"model": result.Model, "original_max_tokens": result.CompactBudget.OriginalMaxTokens,
+			"budgeted_max_tokens": result.CompactBudget.BudgetedMaxTokens,
 		}).Debug("Claude reactive compact output budget applied")
 		observability.RecordWebsocketMetric(c.Request.Context(), "reactive_compact_budget_applied", "", "", map[string]any{
-			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": compactBudget.OriginalMaxTokens,
-			"budgeted_max_tokens": compactBudget.BudgetedMaxTokens,
+			"model": result.Model, "original_max_tokens": result.CompactBudget.OriginalMaxTokens,
+			"budgeted_max_tokens": result.CompactBudget.BudgetedMaxTokens,
 		}, false)
 	}
-	rawJSON, adaptiveBudget := applyClaudeAdaptiveOutputBudget(rawJSON)
-	if adaptiveBudget.Applied {
+	if result.AdaptiveBudget.Applied {
 		fields := log.Fields{
-			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": adaptiveBudget.OriginalMaxTokens,
-			"budgeted_max_tokens": adaptiveBudget.BudgetedMaxTokens, "input_tokens": adaptiveBudget.EstimatedInput,
-			"estimation_method": adaptiveBudget.Method,
+			"model": result.Model, "original_max_tokens": result.AdaptiveBudget.OriginalMaxTokens,
+			"budgeted_max_tokens": result.AdaptiveBudget.BudgetedMaxTokens, "input_tokens": result.AdaptiveBudget.EstimatedInput,
+			"estimation_method": result.AdaptiveBudget.Method,
 		}
 		log.WithFields(fields).Debug("Claude adaptive output budget applied")
 		observability.RecordWebsocketMetric(c.Request.Context(), "adaptive_output_budget_applied", "", "", map[string]any(fields), false)
 	}
-	rawJSON, compactionReplay := applyClaudeCompactionReplay(rawJSON, claudeCompactionV2RetainedTokenBudget)
-	if compactionReplay.Applied {
+	if result.Replay.Applied {
 		observability.RecordWebsocketEvent(c.Request.Context(), observability.WebsocketEvent{
 			Name: "compaction_replay_shaped",
 			Attributes: observability.WebsocketAttributes{
-				Model: gjson.GetBytes(rawJSON, "model").String(), CompactionApplied: observability.Some(true),
-				CompactionRetainedMessages: observability.Some(int64(compactionReplay.RetainedUserMessages)),
-				CompactionRetainedImages:   observability.Some(int64(compactionReplay.RetainedImages)),
-				CompactionDroppedItems:     observability.Some(int64(compactionReplay.DroppedMessages)),
-				CompactionRetainedTokens:   observability.Some(int64(compactionReplay.RetainedTokens)),
+				Model: result.Model, CompactionApplied: observability.Some(true),
+				CompactionRetainedMessages: observability.Some(int64(result.Replay.RetainedUserMessages)),
+				CompactionRetainedImages:   observability.Some(int64(result.Replay.RetainedImages)),
+				CompactionDroppedItems:     observability.Some(int64(result.Replay.DroppedMessages)),
+				CompactionRetainedTokens:   observability.Some(int64(result.Replay.RetainedTokens)),
 			},
 		})
 	}
-	var editResult claudeContextEditResult
-	rawJSON, editResult = applyClaudeContextEditing(rawJSON)
-	if editResult.Applied {
-		c.Set(claudeContextEditGinKey, editResult)
+	if result.Edit.Applied {
+		c.Set(claudeContextEditGinKey, result.Edit)
 		observability.RecordWebsocketMetric(c.Request.Context(), "context_edit_applied", "", "", map[string]any{
-			"cleared_tool_uses":    editResult.ClearedToolUses,
-			"cleared_tool_results": editResult.ClearedToolResults,
-			"cleared_input_tokens": editResult.ClearedInputTokens,
+			"cleared_tool_uses":    result.Edit.ClearedToolUses,
+			"cleared_tool_results": result.Edit.ClearedToolResults,
+			"cleared_input_tokens": result.Edit.ClearedInputTokens,
 		}, false)
 	}
-	if pressure := claudeContextPressure(rawJSON); pressure.Overflow {
+	if result.Rejected {
+		pressure := result.Pressure
 		observability.RecordWebsocketMetric(c.Request.Context(), "context_preflight_rejected", "", "", map[string]any{
 			"model":                    gjson.GetBytes(rawJSON, "model").String(),
 			"input_tokens":             pressure.EstimatedInput,
@@ -166,16 +165,11 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		}})
 		return
 	}
-	classifierModel := ""
-	if h != nil && h.Cfg != nil {
-		classifierModel = h.Cfg.ClaudeCodeAutoModeClassifierModel
-	}
-	if rewrittenJSON, rewritten := rewriteClaudeCodeAutoModeClassifierModel(rawJSON, classifierModel); rewritten {
+	if result.ClassifierRouted {
 		log.WithFields(log.Fields{
 			"source_model": "claude-sonnet-5",
-			"target_model": strings.TrimSpace(classifierModel),
+			"target_model": result.Model,
 		}).Debug("Claude Code auto-mode classifier model rewritten")
-		rawJSON = rewrittenJSON
 	}
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -248,16 +242,12 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 		return
 	}
 
-	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
-	repairedJSON, _, errRepair := repairInterruptedClaudeToolHistory(rawJSON)
-	if errRepair != nil {
+	result := newClaudeRequestPipeline(rawJSON, "").run(true)
+	if result.Err != nil {
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{Message: "Invalid tool history", Type: "invalid_request_error"}})
 		return
 	}
-	rawJSON = repairedJSON
-	rawJSON, _ = applyClaudeCompactionReplay(rawJSON, claudeCompactionV2RetainedTokenBudget)
-	rawJSON, _ = applyClaudeContextEditing(rawJSON)
+	rawJSON = result.Body
 
 	c.Header("Content-Type", "application/json")
 

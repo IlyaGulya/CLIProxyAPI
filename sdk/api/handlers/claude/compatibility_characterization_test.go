@@ -30,14 +30,10 @@ func BenchmarkClaudeCompatibilityRequest(b *testing.B) {
 			b.SetBytes(int64(len(body)))
 			b.ResetTimer()
 			for range b.N {
-				repaired, _, errRepair := repairInterruptedClaudeToolHistory(body)
-				if errRepair != nil {
-					b.Fatal(errRepair)
+				result := newClaudeRequestPipeline(body, "").run(false)
+				if result.Err != nil {
+					b.Fatal(result.Err)
 				}
-				repaired, _ = applyClaudeReactiveCompactBudget(repaired)
-				repaired, _ = applyClaudeCompactionReplay(repaired, claudeCompactionV2RetainedTokenBudget)
-				repaired, _ = applyClaudeContextEditing(repaired)
-				_ = claudeContextPressure(repaired)
 			}
 		})
 	}

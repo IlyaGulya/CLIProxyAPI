@@ -276,14 +276,8 @@ func claudeContextPressureForEstimate(input []byte, estimated int, method string
 }
 
 func claudeContextLimits(model string) (effectiveWindow, safetyMargin int) {
-	const codexEffectiveWindow = 272_000 * 95 / 100
-	normalized := strings.ToLower(strings.TrimSpace(model))
-	for _, routed := range []string{"sol", "luna", "terra"} {
-		if normalized == routed || strings.HasSuffix(normalized, "-"+routed) {
-			return 180_000, 8_192
-		}
-	}
-	return codexEffectiveWindow, 0
+	policy := claudePolicyFor(model, claudeRequestInteractive)
+	return policy.EffectiveWindow, policy.SafetyMargin
 }
 
 func claudeContextOverflowMessage(pressure claudeContextPressureResult) string {
