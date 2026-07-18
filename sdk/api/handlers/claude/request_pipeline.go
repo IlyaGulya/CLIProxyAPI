@@ -71,27 +71,16 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 		return result
 	}
 
-	body, _ := document.bytes()
-	normalized := rewriteClaudeDDModelInBody(body)
-	if string(normalized) != string(body) {
-		document, errDocument = newClaudeRequestDocument(normalized)
-		if errDocument != nil {
-			result.Err = errDocument
-			return result
-		}
-		p.document = document
-	}
+	document.normalizeModel()
 	if errTransition := p.transition(claudePhaseNormalized); errTransition != nil {
 		result.Err = errTransition
 		return result
 	}
 
-	body, _ = p.document.bytes()
 	if countTokens {
 		p.kind = claudeRequestCountTokens
-	} else if rewritten, routed := rewriteClaudeCodeAutoModeClassifierModel(body, p.classifierModel); routed {
+	} else if p.document.routeClassifier(p.classifierModel) {
 		p.kind = claudeRequestClassifier
-		p.document, _ = newClaudeRequestDocument(rewritten)
 		result.ClassifierRouted = true
 	} else if isClaudeReactiveCompactDocument(p.document) {
 		p.kind = claudeRequestReactiveCompact
@@ -102,16 +91,12 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 	}
 
 	if p.document.hasContentType("tool_use") {
-		body, _ = p.document.bytes()
-		repaired, repair, errRepair := repairInterruptedClaudeToolHistory(body)
+		repair, errRepair := p.document.repairToolHistory()
 		if errRepair != nil {
 			result.Err = errRepair
 			return result
 		}
 		result.Repair = repair
-		if repair.Applied {
-			p.document, _ = newClaudeRequestDocument(repaired)
-		}
 	}
 	if errTransition := p.transition(claudePhaseRepaired); errTransition != nil {
 		result.Err = errTransition
@@ -119,20 +104,10 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 	}
 
 	if p.document.hasContentType("compaction") {
-		body, _ = p.document.bytes()
-		shaped, replay := applyClaudeCompactionReplay(body, claudeCompactionV2RetainedTokenBudget)
-		result.Replay = replay
-		if replay.Applied {
-			p.document, _ = newClaudeRequestDocument(shaped)
-		}
+		result.Replay = p.document.shapeCompaction(claudeCompactionV2RetainedTokenBudget)
 	}
 	if p.document.hasContextEdits() {
-		body, _ = p.document.bytes()
-		shaped, edit := applyClaudeContextEditing(body)
-		result.Edit = edit
-		if edit.Applied {
-			p.document, _ = newClaudeRequestDocument(shaped)
-		}
+		result.Edit = p.document.applyContextEditing()
 	}
 	if errTransition := p.transition(claudePhaseShaped); errTransition != nil {
 		result.Err = errTransition

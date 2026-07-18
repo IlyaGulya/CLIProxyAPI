@@ -29,6 +29,18 @@ func repairInterruptedClaudeToolHistory(input []byte) ([]byte, claudeToolHistory
 	if errDecode := json.Unmarshal(input, &root); errDecode != nil {
 		return input, claudeToolHistoryRepairResult{}, nil
 	}
+	result, errRepair := repairInterruptedClaudeToolHistoryRoot(root)
+	if errRepair != nil || !result.Applied {
+		return input, result, errRepair
+	}
+	output, errEncode := json.Marshal(root)
+	if errEncode != nil {
+		return input, claudeToolHistoryRepairResult{}, fmt.Errorf("encode repaired Claude tool history: %w", errEncode)
+	}
+	return output, result, nil
+}
+
+func repairInterruptedClaudeToolHistoryRoot(root map[string]any) (claudeToolHistoryRepairResult, error) {
 	messages, _ := root["messages"].([]any)
 	messages, separated := separateClaudeAssistantContentAfterToolUse(messages)
 	seen := make(map[string]struct{})
@@ -40,7 +52,7 @@ func repairInterruptedClaudeToolHistory(input []byte) ([]byte, claudeToolHistory
 		}
 		uses, errUses := claudeToolUses(message["content"], seen)
 		if errUses != nil {
-			return input, claudeToolHistoryRepairResult{}, errUses
+			return claudeToolHistoryRepairResult{}, errUses
 		}
 		if len(uses) == 0 {
 			continue
@@ -83,14 +95,10 @@ func repairInterruptedClaudeToolHistory(input []byte) ([]byte, claudeToolHistory
 		result.RepairedToolUses += len(missing)
 	}
 	if !result.Applied {
-		return input, result, nil
+		return result, nil
 	}
 	root["messages"] = messages
-	output, errEncode := json.Marshal(root)
-	if errEncode != nil {
-		return input, claudeToolHistoryRepairResult{}, fmt.Errorf("encode repaired Claude tool history: %w", errEncode)
-	}
-	return output, result, nil
+	return result, nil
 }
 
 func separateClaudeAssistantContentAfterToolUse(messages []any) ([]any, int) {

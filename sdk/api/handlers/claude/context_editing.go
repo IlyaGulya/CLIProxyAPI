@@ -96,6 +96,18 @@ func applyClaudeCompactionReplay(input []byte, retainedTokenBudget int) ([]byte,
 	if json.Unmarshal(input, &root) != nil {
 		return input, claudeCompactionReplayObservation{}
 	}
+	observation := applyClaudeCompactionReplayRoot(root, retainedTokenBudget)
+	if !observation.Applied {
+		return input, observation
+	}
+	output, err := json.Marshal(root)
+	if err != nil {
+		return input, claudeCompactionReplayObservation{}
+	}
+	return output, observation
+}
+
+func applyClaudeCompactionReplayRoot(root map[string]any, retainedTokenBudget int) claudeCompactionReplayObservation {
 	messages, _ := root["messages"].([]any)
 	compactionMessage, compactionPart := -1, -1
 	for messageIndex, rawMessage := range messages {
@@ -109,7 +121,7 @@ func applyClaudeCompactionReplay(input []byte, retainedTokenBudget int) ([]byte,
 		}
 	}
 	if compactionMessage < 0 {
-		return input, claudeCompactionReplayObservation{}
+		return claudeCompactionReplayObservation{}
 	}
 	if retainedTokenBudget <= 0 {
 		retainedTokenBudget = claudeCompactionV2RetainedTokenBudget
@@ -149,11 +161,7 @@ func applyClaudeCompactionReplay(input []byte, retainedTokenBudget int) ([]byte,
 	retained = append(retained, compaction)
 	retained = append(retained, messages[compactionMessage+1:]...)
 	root["messages"] = retained
-	output, err := json.Marshal(root)
-	if err != nil {
-		return input, claudeCompactionReplayObservation{}
-	}
-	return output, observation
+	return observation
 }
 
 func claudeRealUserMessageImages(message map[string]any) (int, bool) {
@@ -268,6 +276,17 @@ func applyClaudeContextEditing(input []byte) ([]byte, claudeContextEditResult) {
 	if json.Unmarshal(input, &root) != nil {
 		return input, claudeContextEditResult{}
 	}
+	result := applyClaudeContextEditingRoot(root)
+	if result.Applied {
+		out, err := json.Marshal(root)
+		if err == nil {
+			return out, result
+		}
+	}
+	return input, claudeContextEditResult{}
+}
+
+func applyClaudeContextEditingRoot(root map[string]any) claudeContextEditResult {
 	management, _ := root["context_management"].(map[string]any)
 	edits, _ := management["edits"].([]any)
 	messages, _ := root["messages"].([]any)
@@ -279,7 +298,7 @@ func applyClaudeContextEditing(input []byte) ([]byte, claudeContextEditResult) {
 			// Anthropic requires clear_thinking to precede every other edit. Treat
 			// malformed policies as a no-op rather than silently reordering them.
 			if editIndex != 0 {
-				return input, claudeContextEditResult{}
+				return claudeContextEditResult{}
 			}
 			clearedTurns, clearedTokens := clearClaudeThinkingTurns(messages, edit["keep"])
 			if clearedTurns == 0 {
@@ -336,12 +355,8 @@ func applyClaudeContextEditing(input []byte) ([]byte, claudeContextEditResult) {
 	}
 	if result.Applied {
 		root["messages"] = messages
-		out, err := json.Marshal(root)
-		if err == nil {
-			return out, result
-		}
 	}
-	return input, claudeContextEditResult{}
+	return result
 }
 
 func clearClaudeThinkingTurns(messages []any, keepValue any) (int, int) {
@@ -463,6 +478,19 @@ func nestedNumber(value map[string]any, outer, inner string) int {
 func stringValue(value any) string {
 	text, _ := value.(string)
 	return strings.TrimSpace(text)
+}
+
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	default:
+		return 0
+	}
 }
 
 func stringSet(value any) map[string]bool {

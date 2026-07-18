@@ -50,14 +50,7 @@ func (d *claudeRequestDocument) bytes() ([]byte, error) {
 func (d *claudeRequestDocument) model() string { return stringValue(d.root["model"]) }
 
 func (d *claudeRequestDocument) maxTokens() int {
-	switch value := d.root["max_tokens"].(type) {
-	case float64:
-		return int(value)
-	case int:
-		return value
-	default:
-		return 0
-	}
+	return intValue(d.root["max_tokens"])
 }
 
 func (d *claudeRequestDocument) setModel(model string) bool {
@@ -82,6 +75,40 @@ func (d *claudeRequestDocument) invalidate() {
 	d.dirty = true
 	d.estimateValid = false
 	d.raw = nil
+}
+
+func (d *claudeRequestDocument) mutate(applied bool) bool {
+	if d == nil || !applied {
+		return false
+	}
+	d.invalidate()
+	return true
+}
+
+func (d *claudeRequestDocument) normalizeModel() bool {
+	return d.mutate(rewriteClaudeDDModelRoot(d.root))
+}
+
+func (d *claudeRequestDocument) routeClassifier(targetModel string) bool {
+	return d.mutate(rewriteClaudeCodeAutoModeClassifierModelRoot(d.root, targetModel))
+}
+
+func (d *claudeRequestDocument) repairToolHistory() (claudeToolHistoryRepairResult, error) {
+	result, errRepair := repairInterruptedClaudeToolHistoryRoot(d.root)
+	d.mutate(result.Applied)
+	return result, errRepair
+}
+
+func (d *claudeRequestDocument) shapeCompaction(retainedTokenBudget int) claudeCompactionReplayObservation {
+	result := applyClaudeCompactionReplayRoot(d.root, retainedTokenBudget)
+	d.mutate(result.Applied)
+	return result
+}
+
+func (d *claudeRequestDocument) applyContextEditing() claudeContextEditResult {
+	result := applyClaudeContextEditingRoot(d.root)
+	d.mutate(result.Applied)
+	return result
 }
 
 func (d *claudeRequestDocument) hasContentType(want string) bool {

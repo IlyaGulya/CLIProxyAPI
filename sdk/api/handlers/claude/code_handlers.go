@@ -31,7 +31,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ClaudeCodeAPIHandler contains the handlers for Claude API endpoints.
@@ -186,40 +185,51 @@ const claudeCodeAutoModeClassifierPrompt = "You are a security monitor for auton
 // auto-mode safety classifier. The full signature avoids changing ordinary
 // requests that happen to use the same client-visible model name.
 func rewriteClaudeCodeAutoModeClassifierModel(rawJSON []byte, targetModel string) ([]byte, bool) {
+	var root map[string]any
+	if json.Unmarshal(rawJSON, &root) != nil || !rewriteClaudeCodeAutoModeClassifierModelRoot(root, targetModel) {
+		return rawJSON, false
+	}
+	updated, errEncode := json.Marshal(root)
+	if errEncode != nil {
+		return rawJSON, false
+	}
+	return updated, true
+}
+
+func rewriteClaudeCodeAutoModeClassifierModelRoot(root map[string]any, targetModel string) bool {
 	targetModel = strings.TrimSpace(targetModel)
 	if targetModel == "" || targetModel == "claude-sonnet-5" {
-		return rawJSON, false
+		return false
 	}
-	if gjson.GetBytes(rawJSON, "model").String() != "claude-sonnet-5" ||
-		gjson.GetBytes(rawJSON, "max_tokens").Int() != 64 ||
-		gjson.GetBytes(rawJSON, "thinking.type").String() != "disabled" {
-		return rawJSON, false
+	thinking, _ := root["thinking"].(map[string]any)
+	if stringValue(root["model"]) != "claude-sonnet-5" || intValue(root["max_tokens"]) != 64 || stringValue(thinking["type"]) != "disabled" {
+		return false
 	}
 	hasStopSequence := false
-	for _, stop := range gjson.GetBytes(rawJSON, "stop_sequences").Array() {
-		if stop.String() == "</block>" {
+	stopSequences, _ := root["stop_sequences"].([]any)
+	for _, stop := range stopSequences {
+		if stringValue(stop) == "</block>" {
 			hasStopSequence = true
 			break
 		}
 	}
 	if !hasStopSequence {
-		return rawJSON, false
+		return false
 	}
 	hasClassifierPrompt := false
-	for _, block := range gjson.GetBytes(rawJSON, "system").Array() {
-		if strings.HasPrefix(block.Get("text").String(), claudeCodeAutoModeClassifierPrompt) {
+	system, _ := root["system"].([]any)
+	for _, rawBlock := range system {
+		block, _ := rawBlock.(map[string]any)
+		if strings.HasPrefix(stringValue(block["text"]), claudeCodeAutoModeClassifierPrompt) {
 			hasClassifierPrompt = true
 			break
 		}
 	}
 	if !hasClassifierPrompt {
-		return rawJSON, false
+		return false
 	}
-	updated, errSet := sjson.SetBytes(rawJSON, "model", targetModel)
-	if errSet != nil {
-		return rawJSON, false
-	}
-	return updated, true
+	root["model"] = targetModel
+	return true
 }
 
 // ClaudeMessages handles Claude-compatible streaming chat completions.
@@ -272,16 +282,25 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 // rewriteClaudeDDModelInBody decodes model IDs of the form claude-fable-5-dd-<reversed>
 // back into the original model name used for routing and upstream requests.
 func rewriteClaudeDDModelInBody(rawJSON []byte) []byte {
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	resolved := util.ResolveClaudeModelIDPrefix(modelName)
-	if resolved == modelName {
+	var root map[string]any
+	if json.Unmarshal(rawJSON, &root) != nil || !rewriteClaudeDDModelRoot(root) {
 		return rawJSON
 	}
-	updated, errSet := sjson.SetBytes(rawJSON, "model", resolved)
-	if errSet != nil {
+	updated, errEncode := json.Marshal(root)
+	if errEncode != nil {
 		return rawJSON
 	}
 	return updated
+}
+
+func rewriteClaudeDDModelRoot(root map[string]any) bool {
+	modelName := stringValue(root["model"])
+	resolved := util.ResolveClaudeModelIDPrefix(modelName)
+	if resolved == modelName {
+		return false
+	}
+	root["model"] = resolved
+	return true
 }
 
 // ClaudeModels handles the Claude models listing endpoint.

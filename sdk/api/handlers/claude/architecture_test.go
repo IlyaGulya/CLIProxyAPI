@@ -23,6 +23,7 @@ func TestClaudeCompatibilityLayerOwnership(t *testing.T) {
 		"claudePreflightTokenizer":                   true,
 	}
 	seenPipelineAdapter := false
+	pipelineDocumentConstructors := 0
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
@@ -42,10 +43,16 @@ func TestClaudeCompatibilityLayerOwnership(t *testing.T) {
 			if entry.Name() == "code_handlers.go" && identifier.Name == "newClaudeRequestPipeline" {
 				seenPipelineAdapter = true
 			}
+			if entry.Name() == "request_pipeline.go" && identifier.Name == "newClaudeRequestDocument" {
+				pipelineDocumentConstructors++
+			}
 			return true
 		})
 	}
 	if !seenPipelineAdapter {
 		t.Fatal("code_handlers.go must delegate request mutation to newClaudeRequestPipeline")
+	}
+	if pipelineDocumentConstructors != 1 {
+		t.Fatalf("request pipeline constructs %d decoded documents, want exactly one", pipelineDocumentConstructors)
 	}
 }
