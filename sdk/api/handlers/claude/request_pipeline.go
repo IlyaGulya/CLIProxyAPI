@@ -133,7 +133,7 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 	estimated, method = p.document.estimateInputTokens()
 	result.Pressure = claudeContextPressureResult{
 		EstimatedInput: estimated, ReservedOutput: p.document.maxTokens(), EffectiveWindow: policy.EffectiveWindow,
-		SafetyMargin: policy.SafetyMargin, Method: method,
+		SafetyMargin: policy.SafetyMargin, Method: method, MetadataSource: policy.MetadataSource,
 	}
 	result.Pressure.Overflow = !countTokens && estimated+result.Pressure.ReservedOutput+policy.SafetyMargin > policy.EffectiveWindow
 	if errTransition := p.transition(claudePhasePreflighted); errTransition != nil {

@@ -5,7 +5,28 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
+
+func TestClaudeRequestPipelineUsesRegisteredModelWindow(t *testing.T) {
+	const clientID = "claude-window-policy-test"
+	const modelID = "gpt-window-policy-sol"
+	registryRef := registry.GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "codex", []*registry.ModelInfo{{
+		ID: modelID, ContextLength: 240_000, MaxCompletionTokens: 48_000,
+	}})
+	t.Cleanup(func() { registryRef.UnregisterClient(clientID) })
+
+	request := []byte(fmt.Sprintf(`{"model":%q,"max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`, modelID))
+	result := newClaudeRequestPipeline(request, "").run(false)
+	if result.Err != nil || result.Rejected {
+		t.Fatalf("pipeline result = err %v rejected %t", result.Err, result.Rejected)
+	}
+	if result.Pressure.EffectiveWindow != 240_000 {
+		t.Fatalf("effective window = %d, want 240000", result.Pressure.EffectiveWindow)
+	}
+}
 
 func TestClaudeRequestPipelineRejectsOutOfOrderAndRepeatedTransitions(t *testing.T) {
 	pipeline := newClaudeRequestPipeline([]byte(`{"model":"gpt-5.6-sol","messages":[]}`), "")
@@ -27,7 +48,7 @@ func TestClaudeRequestPipelineRoutesClassifierBeforeBudgeting(t *testing.T) {
 	if result.Err != nil || result.Model != "gpt-5.6-terra" || result.Kind != claudeRequestClassifier {
 		t.Fatalf("pipeline result = %+v", result)
 	}
-	if result.Pressure.EffectiveWindow != 180_000 {
+	if result.Pressure.EffectiveWindow != claudePolicyFor("gpt-5.6-terra", claudeRequestClassifier).EffectiveWindow {
 		t.Fatalf("preflight used pre-route model policy: %+v", result.Pressure)
 	}
 }
@@ -36,7 +57,7 @@ func TestClaudePolicyTableCoversRoutedModelsAndKinds(t *testing.T) {
 	for _, model := range []string{"sol", "gpt-5.6-sol", "luna", "gpt-5.6-luna", "terra", "gpt-5.6-terra"} {
 		for _, kind := range []claudeRequestKind{claudeRequestInteractive, claudeRequestReactiveCompact, claudeRequestClassifier, claudeRequestCountTokens} {
 			policy := claudePolicyFor(model, kind)
-			if policy.EffectiveWindow != 180_000 || policy.SafetyMargin != 8_192 || policy.MinimumOutput <= 0 {
+			if policy.EffectiveWindow != claudePolicyFor("gpt-5.6-"+strings.TrimPrefix(model, "gpt-5.6-"), kind).EffectiveWindow || policy.SafetyMargin != 8_192 || policy.MinimumOutput <= 0 {
 				t.Fatalf("policy(%s,%s) = %+v", model, kind, policy)
 			}
 		}
@@ -55,8 +76,8 @@ func TestClaudeRequestPipelineBoundsSyntheticResumeRecovery(t *testing.T) {
 		wantCompact  bool
 		wantAdaptive bool
 	}{
-		{name: "boundary interactive adapts without compact loop", targetTokens: 160_000, lastPrompt: "Continue after restoring this session.", wantKind: claudeRequestInteractive, wantAdaptive: true},
-		{name: "true overflow compact rejects once with bounded reserve", targetTokens: 168_000, lastPrompt: compactPrompt, wantKind: claudeRequestReactiveCompact, wantRejected: true, wantCompact: true},
+		{name: "boundary interactive adapts without compact loop", targetTokens: 340_000, lastPrompt: "Continue after restoring this session.", wantKind: claudeRequestInteractive, wantAdaptive: true},
+		{name: "true overflow compact rejects once with bounded reserve", targetTokens: 360_000, lastPrompt: compactPrompt, wantKind: claudeRequestReactiveCompact, wantRejected: true, wantCompact: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

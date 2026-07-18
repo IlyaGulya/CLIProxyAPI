@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 func TestProcessOwnerStopIsIdempotent(t *testing.T) {
@@ -183,8 +184,8 @@ func TestConfigureClaudeContextSafetyUsesCodexCompatibleHeadroom(t *testing.T) {
 	t.Parallel()
 	values := map[string]string{}
 	ConfigureClaudeContextSafety(values)
-	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "180000" {
-		t.Fatalf("auto compact window = %q, want 180000", got)
+	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "200000" {
+		t.Fatalf("auto compact window = %q, want metadata fallback 200000", got)
 	}
 	if got := values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]; got != "80" {
 		t.Fatalf("auto compact percent = %q, want 80", got)
@@ -200,6 +201,62 @@ func TestConfigureClaudeContextSafetyPreservesExplicitOverrides(t *testing.T) {
 	ConfigureClaudeContextSafety(values)
 	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" || values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
 		t.Fatalf("explicit context settings changed: %#v", values)
+	}
+}
+
+func TestResolveClaudeContextWindowUsesMinimumModelMetadata(t *testing.T) {
+	models := []ClaudeModelMetadata{
+		{ID: util.EnsureClaudeModelIDPrefix("gpt-5.6-sol"), MaxInputTokens: 240_000},
+		{ID: util.EnsureClaudeModelIDPrefix("gpt-5.6-luna"), MaxInputTokens: 200_000},
+	}
+	resolution := ResolveClaudeContextWindow(models, []string{"gpt-5.6-sol", "gpt-5.6-luna"})
+	if resolution.Window != 200_000 || resolution.Source != "proxy_model_metadata" {
+		t.Fatalf("resolution = %+v", resolution)
+	}
+	values := map[string]string{}
+	ConfigureClaudeContextSafety(values, resolution)
+	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "200000" {
+		t.Fatalf("window = %q, want 200000", values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+	}
+}
+
+func TestConfigAPIKeyReturnsFirstConfiguredKey(t *testing.T) {
+	t.Parallel()
+	if got := ConfigAPIKey([]byte("api-keys:\n  - first-secret\n  - second-secret\n")); got != "first-secret" {
+		t.Fatalf("ConfigAPIKey = %q", got)
+	}
+}
+
+func TestResolveClaudeContextWindowBoundsMissingSelectedModel(t *testing.T) {
+	t.Parallel()
+	models := []ClaudeModelMetadata{{ID: util.EnsureClaudeModelIDPrefix("gpt-5.6-sol"), MaxInputTokens: 372_000}}
+	resolution := ResolveClaudeContextWindow(models, []string{"gpt-5.6-sol", "gpt-5.6-luna"})
+	if resolution.Window != 200_000 || resolution.Source != "partial_registry_fallback" {
+		t.Fatalf("resolution = %+v", resolution)
+	}
+}
+
+func TestFetchClaudeModelMetadataUsesAnthropicCatalog(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/models" || request.URL.Query().Get("limit") != "1000" || request.Header.Get("X-Api-Key") != "secret" || request.Header.Get("Anthropic-Version") != "2023-06-01" {
+			t.Errorf("request = %s headers=%v", request.URL, request.Header)
+		}
+		_, _ = io.WriteString(writer, `{"data":[{"id":"claude-gpt-5.6-sol","max_input_tokens":372000}]}`)
+	}))
+	defer server.Close()
+	models, errModels := FetchClaudeModelMetadata(context.Background(), server.Client(), server.URL, "secret")
+	if errModels != nil || len(models) != 1 || models[0].MaxInputTokens != 372_000 {
+		t.Fatalf("models = %+v, err = %v", models, errModels)
+	}
+}
+
+func TestConfigureClaudeContextSafetyPreservesExplicitWindow(t *testing.T) {
+	values := map[string]string{"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "77"}
+	resolution := ClaudeContextWindowResolution{Window: 200_000, Source: "proxy_model_metadata"}
+	ConfigureClaudeContextSafety(values, resolution)
+	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" || values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
+		t.Fatalf("explicit settings changed: %#v", values)
 	}
 }
 

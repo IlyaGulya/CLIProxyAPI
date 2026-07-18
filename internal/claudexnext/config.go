@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -237,20 +239,69 @@ func flattenEnv(values map[string]string) []string {
 	return out
 }
 
-// ConfigureClaudeContextSafety reserves enough headroom for a large tool result
-// to arrive before Claude Code has a chance to compact. The absolute default is
-// aligned with Claude Code's effective 180k routed window. Compacting at 80%
-// leaves room for a 32k response plus tokenizer/provider variance. Explicit
-// user settings always win.
-func ConfigureClaudeContextSafety(values map[string]string) {
-	defaults := map[string]string{
-		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "180000",
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+type ClaudeModelMetadata struct {
+	ID             string `json:"id"`
+	MaxInputTokens int    `json:"max_input_tokens"`
+}
+
+type ClaudeContextWindowResolution struct {
+	Window int    `json:"window"`
+	Source string `json:"source"`
+}
+
+func ResolveClaudeContextWindow(models []ClaudeModelMetadata, selected []string) ClaudeContextWindowResolution {
+	byID := make(map[string]int, len(models))
+	for _, model := range models {
+		byID[util.ResolveClaudeModelIDPrefix(strings.TrimSpace(model.ID))] = model.MaxInputTokens
 	}
-	for key, value := range defaults {
-		if _, configured := values[key]; !configured {
-			values[key] = value
+	window := 0
+	fallback := false
+	for _, model := range selected {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
 		}
+		candidate := byID[util.ResolveClaudeModelIDPrefix(model)]
+		if candidate <= 0 {
+			candidate = 200_000
+			fallback = true
+		}
+		if candidate > 0 && (window == 0 || candidate < window) {
+			window = candidate
+		}
+	}
+	if window > 0 {
+		source := "proxy_model_metadata"
+		if fallback {
+			source = "partial_registry_fallback"
+		}
+		return ClaudeContextWindowResolution{Window: window, Source: source}
+	}
+	return ClaudeContextWindowResolution{Window: 200_000, Source: "registry_fallback"}
+}
+
+func ConfigAPIKey(input []byte) string {
+	var values struct {
+		APIKeys []string `yaml:"api-keys"`
+	}
+	if yaml.Unmarshal(input, &values) != nil || len(values.APIKeys) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values.APIKeys[0])
+}
+
+// ConfigureClaudeContextSafety passes the full resolved model window to Claude
+// Code. Claude owns its own output reserve; explicit user settings always win.
+func ConfigureClaudeContextSafety(values map[string]string, resolutions ...ClaudeContextWindowResolution) {
+	resolution := ClaudeContextWindowResolution{Window: 200_000, Source: "registry_fallback"}
+	if len(resolutions) > 0 && resolutions[0].Window > 0 {
+		resolution = resolutions[0]
+	}
+	if _, configured := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; !configured {
+		values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = strconv.Itoa(resolution.Window)
+	}
+	if _, configured := values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]; !configured {
+		values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "80"
 	}
 }
 

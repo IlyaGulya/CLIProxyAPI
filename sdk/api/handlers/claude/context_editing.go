@@ -39,6 +39,7 @@ type claudeContextPressureResult struct {
 	SafetyMargin    int
 	Overflow        bool
 	Method          string
+	MetadataSource  string
 }
 
 type claudeCompactionReplayObservation struct {
@@ -199,7 +200,8 @@ func claudeContextPressure(input []byte) claudeContextPressureResult {
 }
 
 func claudeContextPressureForEstimate(input []byte, estimated int, method string) claudeContextPressureResult {
-	effectiveWindow, safetyMargin := claudeContextLimits(gjson.GetBytes(input, "model").String())
+	policy := claudePolicyFor(gjson.GetBytes(input, "model").String(), claudeRequestInteractive)
+	effectiveWindow, safetyMargin := policy.EffectiveWindow, policy.SafetyMargin
 	reserved := int(gjson.GetBytes(input, "max_tokens").Int())
 	if reserved < 0 {
 		reserved = 0
@@ -211,6 +213,7 @@ func claudeContextPressureForEstimate(input []byte, estimated int, method string
 		SafetyMargin:    safetyMargin,
 		Overflow:        estimated+reserved+safetyMargin > effectiveWindow,
 		Method:          method,
+		MetadataSource:  policy.MetadataSource,
 	}
 }
 

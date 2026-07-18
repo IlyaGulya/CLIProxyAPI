@@ -77,6 +77,7 @@ type Manifest struct {
 	Telemetry          map[string]string                       `json:"telemetry_privacy"`
 	HarnessSchemaOK    bool                                    `json:"harness_schema_ok"`
 	HarnessSchemaError string                                  `json:"harness_schema_error,omitempty"`
+	ContextWindow      ClaudeContextWindowResolution           `json:"context_window"`
 }
 
 type processOwner struct {
@@ -143,7 +144,6 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		return runDir, 1, errEnv
 	}
 	values := envMap(baseEnv)
-	ConfigureClaudeContextSafety(values)
 	values["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + strconv.Itoa(port)
 	values["CLAUDEX_NEXT_RUN_ID"] = runID
 	values["CLAUDEX_NEXT_EVENT_JOURNAL"] = filepath.Join(runDir, "proxy", "events", "requests.jsonl")
@@ -211,26 +211,45 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		return runDir, 1, fmt.Errorf("proxy did not become ready (see %s): %w", proxyLog.Name(), errReady)
 	}
 	proxyReadyMS := time.Since(proxyReadyStartedAt).Milliseconds()
+	claudeArgs := BuildClaudeArgs(opts.ClaudeArgs, sessionID, filepath.Join(runDir, "claude", "debug.log"))
+	rootModel := flagValue(claudeArgs, "--model")
+	selectedModels := []string{rootModel, values["CLAUDE_CODE_SUBAGENT_MODEL"]}
+	modelToken := values["ANTHROPIC_AUTH_TOKEN"]
+	if strings.TrimSpace(modelToken) == "" {
+		modelToken = ConfigAPIKey(configOutput)
+	}
+	models, errModels := FetchClaudeModelMetadata(ctx, http.DefaultClient, values["ANTHROPIC_BASE_URL"], modelToken)
+	contextWindow := ResolveClaudeContextWindow(models, selectedModels)
+	if explicit := strings.TrimSpace(values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]); explicit != "" {
+		if parsed, errParse := strconv.Atoi(explicit); errParse == nil && parsed > 0 {
+			contextWindow = ClaudeContextWindowResolution{Window: parsed, Source: "explicit_environment"}
+		}
+	} else if errModels != nil {
+		contextWindow.Source = "registry_fallback"
+	}
+	ConfigureClaudeContextSafety(values, contextWindow)
 	proxyHash, _ := fileSHA256(opts.ProxyBin)
 	liveManifest := Manifest{
 		Status: "proxy_ready", RunID: runID, SessionID: sessionID, StartedAt: startedAt, WorkingDir: workingDir,
-		ClaudeVersion: commandVersion(opts.ClaudeBin), RootModel: flagValue(BuildClaudeArgs(opts.ClaudeArgs, sessionID, filepath.Join(runDir, "claude", "debug.log")), "--model"),
+		ClaudeVersion: commandVersion(opts.ClaudeBin), RootModel: rootModel,
 		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ProxyVersion: commandVersion(opts.ProxyBin),
 		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
 		Generation: buildinfo.Commit + ":" + proxyHash, LauncherPID: os.Getpid(), ProxyPID: proxyCmd.Process.Pid,
-		Stack: stack, ProxyReadyMS: proxyReadyMS, Telemetry: telemetryPrivacy(values),
+		Stack: stack, ProxyReadyMS: proxyReadyMS, Telemetry: telemetryPrivacy(values), ContextWindow: contextWindow,
 	}
 	if errWrite := writeJSON(filepath.Join(runDir, "manifest.json"), liveManifest); errWrite != nil {
 		return runDir, 1, errWrite
 	}
 	updateLatest(opts.RunsDir, runDir)
 	if launcherSpan != nil {
-		launcherSpan.AddEvent("proxy.ready", trace.WithAttributes(attribute.Int64("duration.ms", proxyReadyMS)))
+		launcherSpan.AddEvent("proxy.ready", trace.WithAttributes(
+			attribute.Int64("duration.ms", proxyReadyMS),
+			attribute.Int("claude.context_window", contextWindow.Window),
+			attribute.String("claude.context_window.source", contextWindow.Source),
+		))
 	}
 
-	debugPath := filepath.Join(runDir, "claude", "debug.log")
-	claudeArgs := BuildClaudeArgs(opts.ClaudeArgs, sessionID, debugPath)
 	commandName := opts.ClaudeBin
 	commandArgs := claudeArgs
 	if opts.Interactive && runtime.GOOS != "windows" {

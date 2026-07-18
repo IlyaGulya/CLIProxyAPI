@@ -88,9 +88,10 @@ func TestApplyClaudeContextEditingRejectsClearThinkingAfterAnotherEdit(t *testin
 
 func TestClaudeContextPreflightReservesOutputHeadroom(t *testing.T) {
 	t.Parallel()
-	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + strings.Repeat(" antidisestablishmentarianism", 50000) + `"}]}`)
-	pressure := claudeContextPressure(input)
-	if !pressure.Overflow || pressure.EffectiveWindow != 180000 || pressure.ReservedOutput != 32000 {
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`)
+	policy := claudePolicyFor("gpt-5.6-sol", claudeRequestInteractive)
+	pressure := claudeContextPressureForEstimate(input, policy.EffectiveWindow-policy.SafetyMargin-32_000+1, "fixture")
+	if !pressure.Overflow || pressure.EffectiveWindow != policy.EffectiveWindow || pressure.ReservedOutput != 32000 {
 		t.Fatalf("pressure = %+v", pressure)
 	}
 	if safe := claudeContextPressure([]byte(`{"model":"gpt-5.6-sol","max_tokens":1000,"messages":[{"role":"user","content":"hello"}]}`)); safe.Overflow {
@@ -98,7 +99,7 @@ func TestClaudeContextPreflightReservesOutputHeadroom(t *testing.T) {
 	}
 }
 
-func TestClaudeContextPreflightRejectsCompactPayloadWithoutOutputHeadroom(t *testing.T) {
+func TestClaudeContextPreflightAdmitsCompactPayloadWithinRegisteredWindow(t *testing.T) {
 	t.Parallel()
 	// Mirrors the observed reactive-compaction regression: a roughly 950 KB
 	// prose-heavy JSON request represented about 169k model tokens. A bytes/4
@@ -109,8 +110,8 @@ func TestClaudeContextPreflightRejectsCompactPayloadWithoutOutputHeadroom(t *tes
 		t.Fatalf("fixture too small: %d bytes", len(input))
 	}
 	pressure := claudeContextPressure(input)
-	if !pressure.Overflow {
-		t.Fatalf("compact payload without output headroom admitted: %+v", pressure)
+	if pressure.Overflow {
+		t.Fatalf("compact payload within registered window rejected: %+v", pressure)
 	}
 	if pressure.EstimatedInput < 100000 || pressure.EstimatedInput > 220000 {
 		t.Fatalf("unexpected token estimate for compact fixture: %+v", pressure)
@@ -170,12 +171,10 @@ func TestApplyClaudeCompactionReplayRetainsRecentRealUserAndDropsToolHistory(t *
 
 func TestClaudeContextPressureUsesRoutedClaudeCodeHeadroom(t *testing.T) {
 	input := []byte(`{"model":"gpt-5.6-luna","max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`)
-	result := claudeContextPressureForEstimate(input, 141_045, "fixture")
-	if !result.Overflow {
-		t.Fatalf("pressure = %+v, want overflow before the upstream rejects the request", result)
-	}
-	if result.EffectiveWindow != 180_000 || result.SafetyMargin != 8_192 {
-		t.Fatalf("pressure = %+v, want Claude Code routed window and safety margin", result)
+	policy := claudePolicyFor("gpt-5.6-luna", claudeRequestInteractive)
+	result := claudeContextPressureForEstimate(input, policy.EffectiveWindow-32_000-policy.SafetyMargin+1, "fixture")
+	if !result.Overflow || result.EffectiveWindow != policy.EffectiveWindow || result.SafetyMargin != claudeContextSafetyMargin {
+		t.Fatalf("pressure = %+v, want metadata-driven routed window and safety margin", result)
 	}
 }
 
@@ -215,7 +214,8 @@ func TestApplyClaudeReactiveCompactBudgetDoesNotMatchOrdinarySummary(t *testing.
 func TestApplyClaudeAdaptiveOutputBudgetAvoidsReactiveCompactAtBoundary(t *testing.T) {
 	t.Parallel()
 	policy := claudePolicyFor("gpt-5.6-luna", claudeRequestInteractive)
-	budget, applied := adaptClaudeOutputBudget(policy, 139_887, 32_000)
+	estimated := policy.EffectiveWindow - policy.SafetyMargin - 31_921
+	budget, applied := adaptClaudeOutputBudget(policy, estimated, 32_000)
 	if !applied || budget != 31_921 {
 		t.Fatalf("budget = %d, applied = %t", budget, applied)
 	}
@@ -224,7 +224,7 @@ func TestApplyClaudeAdaptiveOutputBudgetAvoidsReactiveCompactAtBoundary(t *testi
 func TestApplyClaudeAdaptiveOutputBudgetRejectsWhenUsefulOutputCannotFit(t *testing.T) {
 	t.Parallel()
 	policy := claudePolicyFor("gpt-5.6-sol", claudeRequestInteractive)
-	budget, applied := adaptClaudeOutputBudget(policy, 165_000, 32_000)
+	budget, applied := adaptClaudeOutputBudget(policy, policy.EffectiveWindow-policy.SafetyMargin-policy.MinimumOutput+1, 32_000)
 	if applied || budget != 32_000 {
 		t.Fatalf("budget = %d, applied = %t", budget, applied)
 	}

@@ -1,6 +1,10 @@
 package claude
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+)
 
 type claudeRequestKind string
 
@@ -16,26 +20,53 @@ type claudeRequestPolicy struct {
 	SafetyMargin    int
 	MaximumOutput   int
 	MinimumOutput   int
+	MetadataSource  string
 }
 
-var routedClaudePolicies = map[claudeRequestKind]claudeRequestPolicy{
-	claudeRequestInteractive:     {EffectiveWindow: 180_000, SafetyMargin: 8_192, MaximumOutput: 32_000, MinimumOutput: 8_192},
-	claudeRequestReactiveCompact: {EffectiveWindow: 180_000, SafetyMargin: 8_192, MaximumOutput: 8_192, MinimumOutput: 8_192},
-	claudeRequestClassifier:      {EffectiveWindow: 180_000, SafetyMargin: 8_192, MaximumOutput: 64, MinimumOutput: 64},
-	claudeRequestCountTokens:     {EffectiveWindow: 180_000, SafetyMargin: 8_192, MaximumOutput: 1, MinimumOutput: 1},
-}
+const claudeContextSafetyMargin = 8_192
 
 func claudePolicyFor(model string, kind claudeRequestKind) claudeRequestPolicy {
 	normalized := strings.ToLower(strings.TrimSpace(model))
+	lookupModel := model
+	if normalized == "sol" || normalized == "luna" || normalized == "terra" {
+		lookupModel = "gpt-5.6-" + normalized
+	}
+	window := 0
+	maximumOutput := 0
+	if info := registry.LookupModelInfo(lookupModel, "codex"); info != nil {
+		window = info.ContextLength
+		maximumOutput = info.MaxCompletionTokens
+	}
+	metadataSource := "model_registry"
+	if window <= 0 {
+		window = registry.DefaultClaudeMaxInputTokens
+		metadataSource = "registry_fallback"
+	}
+	if maximumOutput <= 0 {
+		maximumOutput = registry.DefaultClaudeMaxOutputTokens
+	}
 	for _, routed := range []string{"sol", "luna", "terra"} {
-		if normalized == routed || strings.HasSuffix(normalized, "-"+routed) {
-			if policy, exists := routedClaudePolicies[kind]; exists {
-				return policy
-			}
-			return routedClaudePolicies[claudeRequestInteractive]
+		if normalized == routed || strings.HasSuffix(normalized, "-"+routed) || strings.Contains(normalized, "-"+routed+"-") {
+			return claudePolicyForKind(window, maximumOutput, kind, metadataSource)
 		}
 	}
+	if registry.LookupModelInfo(lookupModel) != nil {
+		return claudePolicyForKind(window, maximumOutput, kind, metadataSource)
+	}
 	return claudeRequestPolicy{EffectiveWindow: 272_000 * 95 / 100, MaximumOutput: 32_000, MinimumOutput: 1}
+}
+
+func claudePolicyForKind(window, maximumOutput int, kind claudeRequestKind, source string) claudeRequestPolicy {
+	policy := claudeRequestPolicy{EffectiveWindow: window, SafetyMargin: claudeContextSafetyMargin, MaximumOutput: maximumOutput, MinimumOutput: 8_192, MetadataSource: source}
+	switch kind {
+	case claudeRequestReactiveCompact:
+		policy.MaximumOutput = min(policy.MaximumOutput, claudeReactiveCompactMaxTokens)
+	case claudeRequestClassifier:
+		policy.MaximumOutput, policy.MinimumOutput = 64, 64
+	case claudeRequestCountTokens:
+		policy.MaximumOutput, policy.MinimumOutput = 1, 1
+	}
+	return policy
 }
 
 func adaptClaudeOutputBudget(policy claudeRequestPolicy, estimatedInput, requestedOutput int) (int, bool) {

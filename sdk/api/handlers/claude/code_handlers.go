@@ -148,15 +148,24 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 			"cleared_input_tokens": result.Edit.ClearedInputTokens,
 		}, false)
 	}
+	pressure := result.Pressure
+	remainingHeadroom := pressure.EffectiveWindow - pressure.EstimatedInput - pressure.ReservedOutput - pressure.SafetyMargin
+	observability.RecordWebsocketMetric(c.Request.Context(), "context_preflight", "", "", map[string]any{
+		"model": result.Model, "input_tokens": pressure.EstimatedInput,
+		"reserved_output_tokens": pressure.ReservedOutput, "effective_context_window": pressure.EffectiveWindow,
+		"context_safety_margin": pressure.SafetyMargin, "remaining_headroom_tokens": remainingHeadroom,
+		"estimation_method": pressure.Method, "metadata_source": pressure.MetadataSource, "overflow": pressure.Overflow,
+	}, false)
 	if result.Rejected {
-		pressure := result.Pressure
 		observability.RecordWebsocketMetric(c.Request.Context(), "context_preflight_rejected", "", "", map[string]any{
-			"model":                    gjson.GetBytes(rawJSON, "model").String(),
-			"input_tokens":             pressure.EstimatedInput,
-			"reserved_output_tokens":   pressure.ReservedOutput,
-			"effective_context_window": pressure.EffectiveWindow,
-			"context_safety_margin":    pressure.SafetyMargin,
-			"estimation_method":        pressure.Method,
+			"model":                     gjson.GetBytes(rawJSON, "model").String(),
+			"input_tokens":              pressure.EstimatedInput,
+			"reserved_output_tokens":    pressure.ReservedOutput,
+			"effective_context_window":  pressure.EffectiveWindow,
+			"context_safety_margin":     pressure.SafetyMargin,
+			"estimation_method":         pressure.Method,
+			"metadata_source":           pressure.MetadataSource,
+			"remaining_headroom_tokens": remainingHeadroom,
 		}, false)
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{
 			Message: claudeContextOverflowMessage(pressure),
