@@ -74,7 +74,14 @@ func AnalyzeRun(runDir string) (RunSummary, error) {
 	if errJournalGlob != nil {
 		return summary, fmt.Errorf("find event journals: %w", errJournalGlob)
 	}
-	sort.Strings(journalPaths)
+	sort.Slice(journalPaths, func(left, right int) bool {
+		leftCurrent := !strings.HasSuffix(journalPaths[left], ".1")
+		rightCurrent := !strings.HasSuffix(journalPaths[right], ".1")
+		if leftCurrent != rightCurrent {
+			return !leftCurrent // Rotated history precedes the current journal.
+		}
+		return journalPaths[left] < journalPaths[right]
+	})
 	if len(journalPaths) > 0 {
 		requests, events, errJournal := parseEventJournals(journalPaths)
 		if errJournal != nil {
@@ -155,7 +162,7 @@ func parseEventJournals(paths []string) ([]RequestSummary, map[string]int, error
 			}
 			events[name]++
 			index, exists := indices[key]
-			if name == "request_prepared" && key != "" && !exists {
+			if name == "request_prepared" && key != "" {
 				indices[key] = len(requests)
 				requests = append(requests, RequestSummary{File: filepath.Base(path), Role: "root"})
 				index, exists = len(requests)-1, true

@@ -16,7 +16,7 @@ case "$case_name" in
   prompt_suggestions) args+=(--prompt-suggestions true) ;;
   structured_output) args=(--print --output-format json --max-budget-usd "$budget" --max-turns 3 --json-schema '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}') ;;
   background_agent) args+=(--background --dangerously-skip-permissions) ;;
-  workflow) args+=(--dangerously-skip-permissions) ; prompt="Use one dynamic workflow with one leaf agent, then reply OK." ;;
+  workflow) args+=(--dangerously-skip-permissions) ; prompt="Use one dynamic workflow with one leaf agent. In the workflow agent() call, do not set model; rely on the configured subagent model. Wait for it to complete, then reply OK." ;;
   fork_session)
     session_id="${CLAUDEX_NEXT_COMPAT_SESSION_ID:?set CLAUDEX_NEXT_COMPAT_SESSION_ID to a completed session}"
     args+=(--resume "$session_id" --fork-session)

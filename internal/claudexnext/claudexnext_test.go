@@ -295,6 +295,54 @@ func TestAnalyzeRunUsesEventJournalWhenRequestLogDisabled(t *testing.T) {
 	}
 }
 
+func TestAnalyzeRunSegmentsRepeatedSessionRequestKeyByPreparedEvent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	eventsDir := filepath.Join(dir, "proxy", "events")
+	if err := os.MkdirAll(eventsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journal := strings.Join([]string{
+		`{"schema":1,"name":"request_prepared","request_key":"stable-root","role":"root","model":"gpt-5.6-sol"}`,
+		`{"schema":1,"name":"connection_ready","request_key":"stable-root","connection_source":"cold"}`,
+		`{"schema":1,"name":"usage","request_key":"stable-root","input_tokens":100,"output_tokens":1}`,
+		`{"schema":1,"name":"request_finished","request_key":"stable-root","reason":"completed"}`,
+		`{"schema":1,"name":"request_prepared","request_key":"stable-child","role":"child","model":"gpt-5.6-luna"}`,
+		`{"schema":1,"name":"connection_ready","request_key":"stable-child","connection_source":"speculative"}`,
+		`{"schema":1,"name":"request_finished","request_key":"stable-child","reason":"completed"}`,
+		`{"schema":1,"name":"request_prepared","request_key":"stable-root","role":"root","model":"gpt-5.6-sol"}`,
+		`{"schema":1,"name":"connection_ready","request_key":"stable-root","connection_source":"session_reuse"}`,
+		`{"schema":1,"name":"usage","request_key":"stable-root","input_tokens":200,"output_tokens":2}`,
+		`{"schema":1,"name":"request_finished","request_key":"stable-root","reason":"completed"}`,
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(eventsDir, "requests.jsonl"), []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, errAnalyze := AnalyzeRun(dir)
+	if errAnalyze != nil {
+		t.Fatal(errAnalyze)
+	}
+	if summary.RequestCount != 3 || summary.RootRequests != 2 || summary.ChildRequests != 1 {
+		t.Fatalf("request segmentation = %+v", summary)
+	}
+	if summary.Models["gpt-5.6-sol"] != 2 || summary.SpeculativeHitRate != 1 {
+		t.Fatalf("routing/transport summary = %+v", summary)
+	}
+	if summary.Requests[0].InputTokens != 100 || summary.Requests[2].InputTokens != 200 {
+		t.Fatalf("turn usage was overwritten: %+v", summary.Requests)
+	}
+}
+
+func TestClaudeMetricsQueryIsRunScopedAndSurvivesExporterShutdown(t *testing.T) {
+	t.Parallel()
+	query := claudeMetricsQuery("run-safe")
+	for _, want := range []string{"last_over_time", `claudex_run_id="run-safe"`, "claudex_claude_.*"} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("query %q missing %q", query, want)
+		}
+	}
+}
+
 func TestLoadEnvFileDoesNotOverrideExistingEnvironment(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "existing")
 	t.Setenv("CLAUDE_CODE_SUBAGENT_MODEL", "user-selected-model")
