@@ -33,9 +33,9 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 	if errRead := readJSON(filepath.Join(runDir, "manifest.json"), &manifest); errRead != nil {
 		return VerificationReport{}, errRead
 	}
-	var summary RunSummary
-	if errRead := readJSON(filepath.Join(runDir, "summary.json"), &summary); errRead != nil {
-		return VerificationReport{}, errRead
+	summary, errAnalyze := AnalyzeRun(runDir)
+	if errAnalyze != nil {
+		return VerificationReport{}, fmt.Errorf("analyze verification evidence: %w", errAnalyze)
 	}
 	if grafanaURL == "" {
 		grafanaURL = manifest.Stack.Grafana
