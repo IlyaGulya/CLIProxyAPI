@@ -9,12 +9,14 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"github.com/tiktoken-go/tokenizer"
 )
 
 var (
@@ -98,6 +100,9 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
 		template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
 		template, _ = sjson.SetBytes(template, "message.id", rootResult.Get("response.id").String())
+		if estimated := estimateClaudeStreamInputTokens(originalRequestRawJSON); estimated > 0 {
+			template, _ = sjson.SetBytes(template, "message.usage.input_tokens", estimated)
+		}
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
 	case "response.reasoning_summary_part.added":
@@ -298,6 +303,64 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	}
 
 	return [][]byte{output}
+}
+
+func estimateClaudeStreamInputTokens(input []byte) int64 {
+	if len(input) == 0 {
+		return 0
+	}
+	var decoded any
+	if json.Unmarshal(input, &decoded) != nil {
+		return 0
+	}
+	images := int64(0)
+	sanitized := sanitizeClaudeStreamTokenInput(decoded, &images)
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		return 0
+	}
+	codec, err := tokenizer.ForModel(tokenizer.GPT5)
+	if err != nil || codec == nil {
+		return 0
+	}
+	count, err := codec.Count(string(encoded))
+	if err != nil {
+		return 0
+	}
+	return int64(count) + images*85
+}
+
+func sanitizeClaudeStreamTokenInput(value any, images *int64) any {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]any, len(typed))
+		for index := range typed {
+			out[index] = sanitizeClaudeStreamTokenInput(typed[index], images)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		isImage := strings.Contains(strings.ToLower(stringJSONValue(typed["type"])), "image")
+		isBase64 := strings.EqualFold(stringJSONValue(typed["type"]), "base64")
+		if isImage {
+			*images++
+		}
+		for key, child := range typed {
+			if isBase64 && key == "data" {
+				out[key] = "[image bytes omitted]"
+				continue
+			}
+			out[key] = sanitizeClaudeStreamTokenInput(child, images)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func stringJSONValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func codexStreamErrorToClaudeError(rootResult gjson.Result) []byte {

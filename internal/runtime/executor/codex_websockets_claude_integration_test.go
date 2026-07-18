@@ -181,10 +181,15 @@ func TestClaudeCodexWebsocketSameModelTurnUsesPreviousResponseDelta(t *testing.T
 		if errExecute != nil {
 			t.Fatalf("turn %d ExecuteStream() error = %v", turn, errExecute)
 		}
+		var translated bytes.Buffer
 		for chunk := range result.Chunks {
 			if chunk.Err != nil {
 				t.Fatalf("turn %d stream error = %v", turn, chunk.Err)
 			}
+			translated.Write(chunk.Payload)
+		}
+		if got := firstSSEJSONEvent(translated.String(), "message_start").Get("message.usage.input_tokens").Int(); got <= 0 {
+			t.Fatalf("turn %d message_start input usage = %d; stream=%s", turn, got, translated.String())
 		}
 	}
 
@@ -208,6 +213,19 @@ func TestClaudeCodexWebsocketSameModelTurnUsesPreviousResponseDelta(t *testing.T
 	default:
 	}
 	exec.CloseExecutionSession(sessionID)
+}
+
+func firstSSEJSONEvent(stream, eventType string) gjson.Result {
+	for _, line := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		parsed := gjson.Parse(strings.TrimPrefix(line, "data: "))
+		if parsed.Get("type").String() == eventType {
+			return parsed
+		}
+	}
+	return gjson.Result{}
 }
 
 func TestClaudeCodexWebsocketHTTPFallbackIsStickyAcrossTurns(t *testing.T) {

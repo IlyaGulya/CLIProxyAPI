@@ -69,6 +69,41 @@ func TestConvertCodexResponseToClaude_StreamThinkingIncludesSignature(t *testing
 	}
 }
 
+func TestConvertCodexResponseToClaudeStreamReportsEstimatedUsageAtMessageStart(t *testing.T) {
+	t.Parallel()
+	originalRequest := []byte(`{"model":"gpt-5.6-sol","system":"system instructions","messages":[{"role":"user","content":"` + strings.Repeat("workflow context ", 200) + `"}]}`)
+	var param any
+	started := ConvertCodexResponseToClaude(context.Background(), "gpt-5.6-sol", originalRequest, nil,
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_usage","model":"gpt-5.6-sol"}}`), &param)
+	start, ok := firstClaudeStreamPayloadForEvent(joinClaudeStreamChunks(started), "message_start")
+	if !ok || start.Get("message.usage.input_tokens").Int() <= 0 {
+		t.Fatalf("message_start missing estimated input usage: %q", started)
+	}
+
+	terminal := ConvertCodexResponseToClaude(context.Background(), "gpt-5.6-sol", originalRequest, nil,
+		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":321,"input_tokens_details":{"cached_tokens":300},"output_tokens":45},"output":[]}}`), &param)
+	delta, ok := firstClaudeStreamPayloadForEvent(joinClaudeStreamChunks(terminal), "message_delta")
+	if !ok || delta.Get("usage.input_tokens").Int() != 21 || delta.Get("usage.cache_read_input_tokens").Int() != 300 || delta.Get("usage.output_tokens").Int() != 45 {
+		t.Fatalf("terminal usage must remain factual and cumulative: %q", terminal)
+	}
+}
+
+func TestEstimateClaudeStreamInputTokensOmitsBase64Payload(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"` + strings.Repeat("A", 1_000_000) + `"}}]}]}`)
+	if got := estimateClaudeStreamInputTokens(input); got <= 0 || got > 1_000 {
+		t.Fatalf("base64 payload affected live usage estimate: %d", got)
+	}
+}
+
+func joinClaudeStreamChunks(chunks [][]byte) string {
+	var joined strings.Builder
+	for _, chunk := range chunks {
+		joined.Write(chunk)
+	}
+	return joined.String()
+}
+
 func TestConvertCodexResponseToClaude_StreamCyberPolicyError(t *testing.T) {
 	ctx := context.Background()
 	var param any
