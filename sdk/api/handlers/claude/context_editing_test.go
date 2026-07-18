@@ -186,3 +186,40 @@ func TestClaudeContextPressureKeepsCodexWindowForUnrelatedModels(t *testing.T) {
 		t.Fatalf("pressure = %+v, want legacy Codex-compatible window", result)
 	}
 }
+
+func TestApplyClaudeReactiveCompactBudgetBeforePreflight(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":[{"type":"text","text":"Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. Before providing your final summary, wrap your analysis in <analysis> tags. Your entire response must be plain text: an <analysis> block followed by a <summary> block."}]}]}`)
+	output, observation := applyClaudeReactiveCompactBudget(input)
+	if !observation.Applied || observation.OriginalMaxTokens != 32000 || observation.BudgetedMaxTokens != 8192 {
+		t.Fatalf("observation = %+v", observation)
+	}
+	if got := gjson.GetBytes(output, "max_tokens").Int(); got != 8192 {
+		t.Fatalf("max_tokens = %d, want 8192: %s", got, output)
+	}
+	pressure := claudeContextPressureForEstimate(output, 160_000, "fixture")
+	if pressure.Overflow {
+		t.Fatalf("bounded compact should fit routed headroom: %+v", pressure)
+	}
+}
+
+func TestApplyClaudeReactiveCompactBudgetDoesNotMatchOrdinarySummary(t *testing.T) {
+	t.Parallel()
+	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"Summarize this Gradle report in detail."}]}`)
+	output, observation := applyClaudeReactiveCompactBudget(input)
+	if observation.Applied || string(output) != string(input) {
+		t.Fatalf("ordinary summary was treated as reactive compact: %+v %s", observation, output)
+	}
+}
+
+func TestClaudeContextOverflowMessageExposesParseableGap(t *testing.T) {
+	t.Parallel()
+	message := claudeContextOverflowMessage(claudeContextPressureResult{
+		EstimatedInput: 160_000, ReservedOutput: 32_000, SafetyMargin: 8_192, EffectiveWindow: 180_000,
+	})
+	for _, want := range []string{"200192 tokens", "180000 maximum", "input=160000", "requested_output=32000", "safety_margin=8192"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("overflow message %q missing %q", message, want)
+		}
+	}
+}

@@ -107,6 +107,13 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 			},
 		})
 	}
+	rawJSON, compactBudget := applyClaudeReactiveCompactBudget(rawJSON)
+	if compactBudget.Applied {
+		observability.RecordWebsocketMetric(c.Request.Context(), "reactive_compact_budget_applied", "", "", map[string]any{
+			"model": gjson.GetBytes(rawJSON, "model").String(), "original_max_tokens": compactBudget.OriginalMaxTokens,
+			"budgeted_max_tokens": compactBudget.BudgetedMaxTokens,
+		}, false)
+	}
 	rawJSON, compactionReplay := applyClaudeCompactionReplay(rawJSON, claudeCompactionV2RetainedTokenBudget)
 	if compactionReplay.Applied {
 		observability.RecordWebsocketEvent(c.Request.Context(), observability.WebsocketEvent{
@@ -140,7 +147,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 			"estimation_method":        pressure.Method,
 		}, false)
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{
-			Message: "Prompt is too long: input plus requested output exceeds this model's context window",
+			Message: claudeContextOverflowMessage(pressure),
 			Type:    "invalid_request_error",
 		}})
 		return

@@ -3,16 +3,19 @@ package claude
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"github.com/tiktoken-go/tokenizer"
 )
 
 const clearedToolResultText = "[Tool result cleared to preserve context]"
 const claudeContextEditGinKey = "claude_context_edit_result"
 const claudeCompactionV2RetainedTokenBudget = 64_000
+const claudeReactiveCompactMaxTokens = 8_192
 
 type claudeContextEditResult struct {
 	Applied              bool                       `json:"applied"`
@@ -46,6 +49,65 @@ type claudeCompactionReplayObservation struct {
 	RetainedImages       int
 	DroppedMessages      int
 	RetainedTokens       int
+}
+
+type claudeReactiveCompactBudgetObservation struct {
+	Applied           bool
+	OriginalMaxTokens int
+	BudgetedMaxTokens int
+}
+
+// applyClaudeReactiveCompactBudget recognizes Claude Code's internal recovery
+// prompt narrowly and reserves a bounded output budget before context preflight.
+// Codex reports usage only at completion, so carrying Claude's generic 32k
+// request reserve would reject a summary that needs only a few thousand tokens.
+func applyClaudeReactiveCompactBudget(input []byte) ([]byte, claudeReactiveCompactBudgetObservation) {
+	var root map[string]any
+	if json.Unmarshal(input, &root) != nil {
+		return input, claudeReactiveCompactBudgetObservation{}
+	}
+	messages, _ := root["messages"].([]any)
+	if len(messages) == 0 {
+		return input, claudeReactiveCompactBudgetObservation{}
+	}
+	last, _ := messages[len(messages)-1].(map[string]any)
+	if stringValue(last["role"]) != "user" || !isClaudeReactiveCompactPrompt(claudeMessageText(last["content"])) {
+		return input, claudeReactiveCompactBudgetObservation{}
+	}
+	original := int(gjson.GetBytes(input, "max_tokens").Int())
+	if original <= 0 || original <= claudeReactiveCompactMaxTokens {
+		return input, claudeReactiveCompactBudgetObservation{}
+	}
+	output, err := sjson.SetBytes(input, "max_tokens", claudeReactiveCompactMaxTokens)
+	if err != nil {
+		return input, claudeReactiveCompactBudgetObservation{}
+	}
+	return output, claudeReactiveCompactBudgetObservation{
+		Applied: true, OriginalMaxTokens: original, BudgetedMaxTokens: claudeReactiveCompactMaxTokens,
+	}
+}
+
+func isClaudeReactiveCompactPrompt(text string) bool {
+	normalized := strings.ToLower(text)
+	return strings.Contains(normalized, "create a detailed summary of the conversation so far") &&
+		strings.Contains(normalized, "wrap your analysis in <analysis> tags") &&
+		strings.Contains(normalized, "<analysis> block followed by a <summary> block")
+}
+
+func claudeMessageText(content any) string {
+	if text, ok := content.(string); ok {
+		return text
+	}
+	parts, _ := content.([]any)
+	var joined strings.Builder
+	for _, rawPart := range parts {
+		part, _ := rawPart.(map[string]any)
+		if stringValue(part["type"]) == "text" {
+			joined.WriteString(stringValue(part["text"]))
+			joined.WriteByte('\n')
+		}
+	}
+	return joined.String()
 }
 
 // applyClaudeCompactionReplay emulates Claude's stateless compaction replay
@@ -183,6 +245,12 @@ func claudeContextLimits(model string) (effectiveWindow, safetyMargin int) {
 		}
 	}
 	return codexEffectiveWindow, 0
+}
+
+func claudeContextOverflowMessage(pressure claudeContextPressureResult) string {
+	total := pressure.EstimatedInput + pressure.ReservedOutput + pressure.SafetyMargin
+	return fmt.Sprintf("Prompt is too long: %d tokens > %d maximum (input=%d, requested_output=%d, safety_margin=%d)",
+		total, pressure.EffectiveWindow, pressure.EstimatedInput, pressure.ReservedOutput, pressure.SafetyMargin)
 }
 
 func estimateClaudeGPTInputTokens(input []byte) (int, string) {
