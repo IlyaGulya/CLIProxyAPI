@@ -90,7 +90,7 @@ func TestClaudeContextPreflightReservesOutputHeadroom(t *testing.T) {
 	t.Parallel()
 	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + strings.Repeat(" antidisestablishmentarianism", 50000) + `"}]}`)
 	pressure := claudeContextPressure(input)
-	if !pressure.Overflow || pressure.EffectiveWindow != 258400 || pressure.ReservedOutput != 32000 {
+	if !pressure.Overflow || pressure.EffectiveWindow != 180000 || pressure.ReservedOutput != 32000 {
 		t.Fatalf("pressure = %+v", pressure)
 	}
 	if safe := claudeContextPressure([]byte(`{"model":"gpt-5.6-sol","max_tokens":1000,"messages":[{"role":"user","content":"hello"}]}`)); safe.Overflow {
@@ -98,19 +98,19 @@ func TestClaudeContextPreflightReservesOutputHeadroom(t *testing.T) {
 	}
 }
 
-func TestClaudeContextPreflightDoesNotRejectLargeButTokenSafeCompactPayload(t *testing.T) {
+func TestClaudeContextPreflightRejectsCompactPayloadWithoutOutputHeadroom(t *testing.T) {
 	t.Parallel()
 	// Mirrors the observed reactive-compaction regression: a roughly 950 KB
 	// prose-heavy JSON request represented about 169k model tokens. A bytes/4
-	// estimate rejected it 16 times even though it fit with output headroom.
+	// estimate previously admitted it even though the requested output did not fit.
 	prose := strings.Repeat("This is compact context with repeated prose and repository state. ", 15000)
 	input := []byte(`{"model":"gpt-5.6-sol","max_tokens":32000,"messages":[{"role":"user","content":"` + prose + `"}]}`)
 	if len(input) < 900000 {
 		t.Fatalf("fixture too small: %d bytes", len(input))
 	}
 	pressure := claudeContextPressure(input)
-	if pressure.Overflow {
-		t.Fatalf("token-safe compact payload rejected: %+v", pressure)
+	if !pressure.Overflow {
+		t.Fatalf("compact payload without output headroom admitted: %+v", pressure)
 	}
 	if pressure.EstimatedInput < 100000 || pressure.EstimatedInput > 220000 {
 		t.Fatalf("unexpected token estimate for compact fixture: %+v", pressure)
@@ -165,5 +165,24 @@ func TestApplyClaudeCompactionReplayRetainsRecentRealUserAndDropsToolHistory(t *
 		if strings.Contains(serialized, forbidden) {
 			t.Fatalf("replay retained %q: %s", forbidden, serialized)
 		}
+	}
+}
+
+func TestClaudeContextPressureUsesRoutedClaudeCodeHeadroom(t *testing.T) {
+	input := []byte(`{"model":"gpt-5.6-luna","max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`)
+	result := claudeContextPressureForEstimate(input, 141_045, "fixture")
+	if !result.Overflow {
+		t.Fatalf("pressure = %+v, want overflow before the upstream rejects the request", result)
+	}
+	if result.EffectiveWindow != 180_000 || result.SafetyMargin != 8_192 {
+		t.Fatalf("pressure = %+v, want Claude Code routed window and safety margin", result)
+	}
+}
+
+func TestClaudeContextPressureKeepsCodexWindowForUnrelatedModels(t *testing.T) {
+	input := []byte(`{"model":"unrelated-model","max_tokens":32000}`)
+	result := claudeContextPressureForEstimate(input, 141_045, "fixture")
+	if result.Overflow || result.EffectiveWindow != 258_400 {
+		t.Fatalf("pressure = %+v, want legacy Codex-compatible window", result)
 	}
 }

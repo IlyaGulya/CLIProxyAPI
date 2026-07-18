@@ -68,7 +68,8 @@ codex-websocket-generate-false-warmup: true
 		"port: 18432",
 		"debug: true",
 		"logging-to-file: true",
-		"request-log: true",
+		"request-log: false",
+		"logs-max-total-size-mb: 128",
 		"codex-prefer-upstream-websockets: true",
 		"claude-code-auto-mode-classifier-model: gpt-5.6-luna",
 		"codex-websocket-speculative-preconnect: true",
@@ -89,7 +90,7 @@ codex-websocket-generate-false-warmup: true
 	if errParse != nil {
 		t.Fatalf("parse prepared config: %v", errParse)
 	}
-	if !parsed.CodexPreferUpstreamWebsockets || !parsed.CodexWebsocketSpeculativePreconnect || !parsed.RequestLog {
+	if !parsed.CodexPreferUpstreamWebsockets || !parsed.CodexWebsocketSpeculativePreconnect || parsed.RequestLog {
 		t.Fatalf("prepared runtime flags were not parsed: %+v", parsed.SDKConfig)
 	}
 	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-luna" {
@@ -181,11 +182,11 @@ func TestConfigureClaudeContextSafetyUsesCodexCompatibleHeadroom(t *testing.T) {
 	t.Parallel()
 	values := map[string]string{}
 	ConfigureClaudeContextSafety(values)
-	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "232560" {
-		t.Fatalf("auto compact window = %q, want 232560", got)
+	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "180000" {
+		t.Fatalf("auto compact window = %q, want 180000", got)
 	}
-	if got := values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]; got != "85" {
-		t.Fatalf("auto compact percent = %q, want 85", got)
+	if got := values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]; got != "80" {
+		t.Fatalf("auto compact percent = %q, want 80", got)
 	}
 }
 

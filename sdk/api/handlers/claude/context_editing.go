@@ -35,6 +35,7 @@ type claudeContextPressureResult struct {
 	EstimatedInput  int
 	ReservedOutput  int
 	EffectiveWindow int
+	SafetyMargin    int
 	Overflow        bool
 	Method          string
 }
@@ -153,20 +154,35 @@ var (
 // by Codex model metadata. It is intentionally conservative: preflight exists
 // to prevent a deterministic provider failure, never to promise exact billing.
 func claudeContextPressure(input []byte) claudeContextPressureResult {
-	const physicalWindow = 272000
-	const effectiveWindow = physicalWindow * 95 / 100
+	estimated, method := estimateClaudeGPTInputTokens(input)
+	return claudeContextPressureForEstimate(input, estimated, method)
+}
+
+func claudeContextPressureForEstimate(input []byte, estimated int, method string) claudeContextPressureResult {
+	effectiveWindow, safetyMargin := claudeContextLimits(gjson.GetBytes(input, "model").String())
 	reserved := int(gjson.GetBytes(input, "max_tokens").Int())
 	if reserved < 0 {
 		reserved = 0
 	}
-	estimated, method := estimateClaudeGPTInputTokens(input)
 	return claudeContextPressureResult{
 		EstimatedInput:  estimated,
 		ReservedOutput:  reserved,
 		EffectiveWindow: effectiveWindow,
-		Overflow:        estimated+reserved > effectiveWindow,
+		SafetyMargin:    safetyMargin,
+		Overflow:        estimated+reserved+safetyMargin > effectiveWindow,
 		Method:          method,
 	}
+}
+
+func claudeContextLimits(model string) (effectiveWindow, safetyMargin int) {
+	const codexEffectiveWindow = 272_000 * 95 / 100
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	for _, routed := range []string{"sol", "luna", "terra"} {
+		if normalized == routed || strings.HasSuffix(normalized, "-"+routed) {
+			return 180_000, 8_192
+		}
+	}
+	return codexEffectiveWindow, 0
 }
 
 func estimateClaudeGPTInputTokens(input []byte) (int, string) {

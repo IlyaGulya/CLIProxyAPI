@@ -29,7 +29,14 @@ func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
 	}
 	values["debug"] = true
 	values["logging-to-file"] = true
-	values["request-log"] = true
+	// Full request logs contain prompts and grow quickly. Keep the default run
+	// metric-only; an explicit true in the source config remains an opt-in.
+	if _, configured := values["request-log"]; !configured {
+		values["request-log"] = false
+	}
+	if _, configured := values["logs-max-total-size-mb"]; !configured {
+		values["logs-max-total-size-mb"] = 128
+	}
 	values["codex-prefer-upstream-websockets"] = true
 	values["codex-websocket-speculative-preconnect"] = true
 	values["codex-websocket-generate-false-warmup"] = false
@@ -232,14 +239,13 @@ func flattenEnv(values map[string]string) []string {
 
 // ConfigureClaudeContextSafety reserves enough headroom for a large tool result
 // to arrive before Claude Code has a chance to compact. The absolute default is
-// derived from Codex's 272k advertised window, 95% effective window, and 90%
-// auto-compaction threshold. Claude Code's percentage override is deliberately
-// more conservative because tool results can be substantially larger than the
-// preceding turn. Explicit user settings always win.
+// aligned with Claude Code's effective 180k routed window. Compacting at 80%
+// leaves room for a 32k response plus tokenizer/provider variance. Explicit
+// user settings always win.
 func ConfigureClaudeContextSafety(values map[string]string) {
 	defaults := map[string]string{
-		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "232560",
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "85",
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "180000",
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
 	}
 	for key, value := range defaults {
 		if _, configured := values[key]; !configured {

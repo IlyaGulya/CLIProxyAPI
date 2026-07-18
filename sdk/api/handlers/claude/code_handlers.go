@@ -136,6 +136,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 			"input_tokens":             pressure.EstimatedInput,
 			"reserved_output_tokens":   pressure.ReservedOutput,
 			"effective_context_window": pressure.EffectiveWindow,
+			"context_safety_margin":    pressure.SafetyMargin,
 			"estimation_method":        pressure.Method,
 		}, false)
 		c.JSON(http.StatusBadRequest, claudeErrorResponse{Type: "error", Error: claudeErrorDetail{
@@ -155,6 +156,14 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		}).Debug("Claude Code auto-mode classifier model rewritten")
 		rawJSON = rewrittenJSON
 	}
+	if h != nil && h.Cfg != nil && strings.TrimSpace(c.GetHeader(helps.ClaudeCodeAgentHeader)) != "" {
+		if rewrittenJSON, rewritten := rewriteClaudeCodeSubagentEffort(rawJSON, h.Cfg.ClaudeCodeSubagentEffort); rewritten {
+			rawJSON = rewrittenJSON
+			observability.RecordWebsocketMetric(c.Request.Context(), "subagent_effort_rewritten", "", "", map[string]any{
+				"model": gjson.GetBytes(rawJSON, "model").String(), "effort": strings.ToLower(strings.TrimSpace(h.Cfg.ClaudeCodeSubagentEffort)),
+			}, false)
+		}
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -162,6 +171,21 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		h.handleNonStreamingResponse(c, rawJSON)
 	} else {
 		h.handleStreamingResponse(c, rawJSON)
+	}
+}
+
+func rewriteClaudeCodeSubagentEffort(rawJSON []byte, effort string) ([]byte, bool) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch effort {
+	case "low", "medium", "high", "xhigh":
+		out, err := sjson.SetBytes(rawJSON, "thinking.type", "adaptive")
+		if err != nil {
+			return rawJSON, false
+		}
+		out, err = sjson.SetBytes(out, "output_config.effort", effort)
+		return out, err == nil
+	default:
+		return rawJSON, false
 	}
 }
 

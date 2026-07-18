@@ -237,7 +237,9 @@ func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
 		cleared = true
 	}
 	s.activeMu.Unlock()
-	if cleared {
+	// Invalidation can move a busy session to idle before the stream's deferred
+	// cleanup runs. Only a still-busy live connection may become ready again.
+	if cleared && s.lifecycle.state() == codexSessionBusy {
 		s.moveLifecycle(codexSessionReady)
 	}
 }
@@ -769,6 +771,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			incompleteToolCalls := streamSnapshot.IncompleteToolCalls
 			helps.RecordAPIWebsocketEvent(ctx, e.cfg, "request_finished", observability.WebsocketAttributes{
 				SessionID: executionSessionID, Model: baseModel, ConnectionSource: string(connectionSource), Reason: terminateReason,
+				Success:       observability.Some(terminateReason == "completed"),
 				LastEventType: streamSnapshot.LastEventType, CloseCode: observability.Some(int64(closeCode)),
 				ToolCallStarted: observability.Some(streamSnapshot.ToolCallsStarted > 0), ToolCallCompleted: observability.Some(streamSnapshot.ToolCallsStarted > 0 && incompleteToolCalls == 0),
 				ToolCallInProgress: observability.Some(incompleteToolCalls > 0), ToolCallsStarted: observability.Some(streamSnapshot.ToolCallsStarted),

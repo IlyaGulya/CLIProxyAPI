@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -57,6 +58,10 @@ type Manifest struct {
 	MaxConcurrency     string            `json:"max_tool_use_concurrency"`
 	ProxyBinary        string            `json:"proxy_binary"`
 	ProxySHA256        string            `json:"proxy_sha256"`
+	LauncherVersion    string            `json:"launcher_version"`
+	LauncherCommit     string            `json:"launcher_commit"`
+	LauncherBuildDate  string            `json:"launcher_build_date"`
+	ProxyVersion       string            `json:"proxy_version"`
 	ProxyPort          int               `json:"proxy_port"`
 	ExitCode           int               `json:"exit_code"`
 	Stack              StackStatus       `json:"observability_stack"`
@@ -311,7 +316,9 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		ClaudeVersion: commandVersion(opts.ClaudeBin), ClaudeArgs: redactArgs(claudeArgs), RootModel: flagValue(claudeArgs, "--model"),
 		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ExitCode: exitCode,
-		Stack: stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
+		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
+		ProxyVersion: commandVersion(opts.ProxyBin),
+		Stack:        stack, ProxyReadyMS: proxyReadyMS, ClaudeRuntimeMS: claudeRuntimeMS, OTELFlushOK: otelFlushOK && proxyStopped && !fileContains(proxyLog.Name(), "OpenTelemetry flush failed"),
 		Telemetry:       telemetryPrivacy(values),
 		HarnessSchemaOK: harnessSchemaOK, HarnessSchemaError: harnessSchemaError,
 	}
