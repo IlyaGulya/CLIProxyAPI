@@ -69,20 +69,6 @@ func TestRewriteClaudeCodeAutoModeClassifierModel(t *testing.T) {
 	}
 }
 
-func TestRewriteClaudeCodeSubagentEffortIsNeutralAndValidated(t *testing.T) {
-	input := []byte(`{"model":"gpt-5.6-luna","thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}}`)
-	if got, changed := rewriteClaudeCodeSubagentEffort(input, ""); changed || string(got) != string(input) {
-		t.Fatalf("empty policy changed request: %s", got)
-	}
-	got, changed := rewriteClaudeCodeSubagentEffort(input, "high")
-	if !changed || gjson.GetBytes(got, "output_config.effort").String() != "high" {
-		t.Fatalf("configured policy not applied: %s", got)
-	}
-	if _, changed := rewriteClaudeCodeSubagentEffort(input, "absurd"); changed {
-		t.Fatal("invalid effort was applied")
-	}
-}
-
 func TestClaudeMessagesRoutesAutoModeClassifierToConfiguredModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &classifierCaptureExecutor{}

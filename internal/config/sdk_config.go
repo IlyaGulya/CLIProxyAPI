@@ -102,10 +102,6 @@ type SDKConfig struct {
 	// Only requests matching the classifier's narrow payload signature are changed.
 	ClaudeCodeAutoModeClassifierModel string `yaml:"claude-code-auto-mode-classifier-model,omitempty" json:"claude-code-auto-mode-classifier-model,omitempty"`
 
-	// ClaudeCodeSubagentEffort optionally overrides adaptive effort only for
-	// requests carrying Claude Code's subagent header. Empty preserves passthrough.
-	ClaudeCodeSubagentEffort string `yaml:"claude-code-subagent-effort,omitempty" json:"claude-code-subagent-effort,omitempty"`
-
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 

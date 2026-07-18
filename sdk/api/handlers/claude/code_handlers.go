@@ -156,36 +156,12 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		}).Debug("Claude Code auto-mode classifier model rewritten")
 		rawJSON = rewrittenJSON
 	}
-	if h != nil && h.Cfg != nil && strings.TrimSpace(c.GetHeader(helps.ClaudeCodeAgentHeader)) != "" {
-		if rewrittenJSON, rewritten := rewriteClaudeCodeSubagentEffort(rawJSON, h.Cfg.ClaudeCodeSubagentEffort); rewritten {
-			rawJSON = rewrittenJSON
-			observability.RecordWebsocketMetric(c.Request.Context(), "subagent_effort_rewritten", "", "", map[string]any{
-				"model": gjson.GetBytes(rawJSON, "model").String(), "effort": strings.ToLower(strings.TrimSpace(h.Cfg.ClaudeCodeSubagentEffort)),
-			}, false)
-		}
-	}
-
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if !streamResult.Exists() || streamResult.Type == gjson.False {
 		h.handleNonStreamingResponse(c, rawJSON)
 	} else {
 		h.handleStreamingResponse(c, rawJSON)
-	}
-}
-
-func rewriteClaudeCodeSubagentEffort(rawJSON []byte, effort string) ([]byte, bool) {
-	effort = strings.ToLower(strings.TrimSpace(effort))
-	switch effort {
-	case "low", "medium", "high", "xhigh":
-		out, err := sjson.SetBytes(rawJSON, "thinking.type", "adaptive")
-		if err != nil {
-			return rawJSON, false
-		}
-		out, err = sjson.SetBytes(out, "output_config.effort", effort)
-		return out, err == nil
-	default:
-		return rawJSON, false
 	}
 }
 
