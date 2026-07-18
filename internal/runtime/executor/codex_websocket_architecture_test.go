@@ -10,19 +10,19 @@ import (
 func TestCodexSessionStateMachineLegalLifecycle(t *testing.T) {
 	t.Parallel()
 	machine := newCodexSessionStateMachine()
-	for _, next := range []codexSessionState{
-		codexSessionDialing,
-		codexSessionReady,
-		codexSessionBusy,
-		codexSessionReady,
-		codexSessionDraining,
-		codexSessionClosed,
+	for _, event := range []codexSessionEvent{
+		codexEventDialRequested,
+		codexEventConnected,
+		codexEventRequestStarted,
+		codexEventRequestFinished,
+		codexEventDrainRequested,
+		codexEventClosed,
 	} {
-		transition, err := machine.transition(next)
+		transition, err := machine.apply(event)
 		if err != nil {
-			t.Fatalf("transition to %s: %v", next, err)
+			t.Fatalf("apply %s: %v", event, err)
 		}
-		if transition.To != next || transition.From == transition.To || transition.At.IsZero() {
+		if transition.From == transition.To || transition.At.IsZero() || transition.Event != event {
 			t.Fatalf("invalid transition: %+v", transition)
 		}
 	}
@@ -34,31 +34,46 @@ func TestCodexSessionStateMachineLegalLifecycle(t *testing.T) {
 func TestCodexSessionStateMachineRejectsIllegalTransitions(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name string
-		path []codexSessionState
-		next codexSessionState
+		name  string
+		path  []codexSessionEvent
+		event codexSessionEvent
 	}{
-		{name: "idle to busy", next: codexSessionBusy},
-		{name: "dialing to busy", path: []codexSessionState{codexSessionDialing}, next: codexSessionBusy},
-		{name: "closed to dialing", path: []codexSessionState{codexSessionClosed}, next: codexSessionDialing},
-		{name: "draining to ready", path: []codexSessionState{codexSessionDraining}, next: codexSessionReady},
+		{name: "idle request start", event: codexEventRequestStarted},
+		{name: "dialing request start", path: []codexSessionEvent{codexEventDialRequested}, event: codexEventRequestStarted},
+		{name: "closed dial", path: []codexSessionEvent{codexEventDrainRequested, codexEventClosed}, event: codexEventDialRequested},
+		{name: "draining connected", path: []codexSessionEvent{codexEventDrainRequested}, event: codexEventConnected},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			machine := newCodexSessionStateMachine()
-			for _, next := range test.path {
-				if _, err := machine.transition(next); err != nil {
-					t.Fatalf("setup transition to %s: %v", next, err)
+			for _, event := range test.path {
+				if _, err := machine.apply(event); err != nil {
+					t.Fatalf("setup event %s: %v", event, err)
 				}
 			}
 			before := machine.state()
-			if _, err := machine.transition(test.next); !errors.Is(err, errCodexSessionTransition) {
+			if _, err := machine.apply(test.event); !errors.Is(err, errCodexSessionTransition) {
 				t.Fatalf("transition error = %v", err)
 			}
 			if got := machine.state(); got != before {
 				t.Fatalf("illegal transition mutated state: got %s want %s", got, before)
 			}
 		})
+	}
+}
+
+func TestCodexSessionReducerExhaustiveMatrix(t *testing.T) {
+	t.Parallel()
+	for state := codexSessionIdle; state <= codexSessionClosed; state++ {
+		for event := codexEventDialRequested; event <= codexEventClosed; event++ {
+			next, actions, errReduce := reduceCodexSession(state, event)
+			if errReduce == nil && next == state {
+				t.Fatalf("accepted no-op transition: %s + %s", state, event)
+			}
+			if event == codexEventIdleExpired && errReduce == nil && len(actions) != 2 {
+				t.Fatalf("idle expiry actions = %v", actions)
+			}
+		}
 	}
 }
 
@@ -126,11 +141,11 @@ func BenchmarkCodexSessionStateLifecycle(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		machine := newCodexSessionStateMachine()
-		_, _ = machine.transition(codexSessionDialing)
-		_, _ = machine.transition(codexSessionReady)
-		_, _ = machine.transition(codexSessionBusy)
-		_, _ = machine.transition(codexSessionReady)
-		_, _ = machine.transition(codexSessionDraining)
-		_, _ = machine.transition(codexSessionClosed)
+		_, _ = machine.apply(codexEventDialRequested)
+		_, _ = machine.apply(codexEventConnected)
+		_, _ = machine.apply(codexEventRequestStarted)
+		_, _ = machine.apply(codexEventRequestFinished)
+		_, _ = machine.apply(codexEventDrainRequested)
+		_, _ = machine.apply(codexEventClosed)
 	}
 }

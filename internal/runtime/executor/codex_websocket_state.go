@@ -19,30 +19,85 @@ const (
 )
 
 func (s codexSessionState) String() string {
-	switch s {
-	case codexSessionIdle:
-		return "idle"
-	case codexSessionDialing:
-		return "dialing"
-	case codexSessionReady:
-		return "ready"
-	case codexSessionBusy:
-		return "busy"
-	case codexSessionDraining:
-		return "draining"
-	case codexSessionClosed:
-		return "closed"
-	default:
-		return "unknown"
-	}
+	return [...]string{"idle", "dialing", "ready", "busy", "draining", "closed"}[min(int(s), 5)]
 }
 
-var errCodexSessionTransition = errors.New("invalid codex websocket session transition")
+type codexSessionEvent uint8
+
+const (
+	codexEventDialRequested codexSessionEvent = iota
+	codexEventConnected
+	codexEventRequestStarted
+	codexEventSemanticFailed
+	codexEventTransportFailed
+	codexEventRequestFinished
+	codexEventIdleExpired
+	codexEventDrainRequested
+	codexEventClosed
+)
+
+func (e codexSessionEvent) String() string {
+	return [...]string{"dial_requested", "connected", "request_started", "semantic_failed", "transport_failed", "request_finished", "idle_expired", "drain_requested", "closed"}[min(int(e), 8)]
+}
+
+type codexSessionAction uint8
+
+const (
+	codexActionNone codexSessionAction = iota
+	codexActionResetResponseChain
+	codexActionCloseConnection
+)
+
+var errCodexSessionTransition = errors.New("invalid codex websocket session event")
 
 type codexSessionTransition struct {
-	From codexSessionState
-	To   codexSessionState
-	At   time.Time
+	From    codexSessionState
+	To      codexSessionState
+	Event   codexSessionEvent
+	Actions []codexSessionAction
+	At      time.Time
+}
+
+func reduceCodexSession(state codexSessionState, event codexSessionEvent) (codexSessionState, []codexSessionAction, error) {
+	switch event {
+	case codexEventDialRequested:
+		if state == codexSessionIdle || state == codexSessionReady || state == codexSessionBusy {
+			return codexSessionDialing, nil, nil
+		}
+	case codexEventConnected:
+		if state == codexSessionDialing {
+			return codexSessionReady, nil, nil
+		}
+	case codexEventRequestStarted:
+		if state == codexSessionReady {
+			return codexSessionBusy, nil, nil
+		}
+	case codexEventRequestFinished:
+		if state == codexSessionBusy {
+			return codexSessionReady, nil, nil
+		}
+	case codexEventSemanticFailed:
+		if state == codexSessionBusy || state == codexSessionReady {
+			return codexSessionIdle, []codexSessionAction{codexActionResetResponseChain, codexActionCloseConnection}, nil
+		}
+	case codexEventTransportFailed:
+		if state == codexSessionDialing || state == codexSessionReady || state == codexSessionBusy {
+			return codexSessionIdle, []codexSessionAction{codexActionResetResponseChain, codexActionCloseConnection}, nil
+		}
+	case codexEventIdleExpired:
+		if state == codexSessionReady || state == codexSessionBusy {
+			return codexSessionIdle, []codexSessionAction{codexActionResetResponseChain, codexActionCloseConnection}, nil
+		}
+	case codexEventDrainRequested:
+		if state != codexSessionClosed && state != codexSessionDraining {
+			return codexSessionDraining, []codexSessionAction{codexActionResetResponseChain, codexActionCloseConnection}, nil
+		}
+	case codexEventClosed:
+		if state == codexSessionDraining {
+			return codexSessionClosed, nil, nil
+		}
+	}
+	return state, nil, fmt.Errorf("%w: %s + %s", errCodexSessionTransition, state, event)
 }
 
 type codexSessionStateMachine struct {
@@ -64,39 +119,21 @@ func (m *codexSessionStateMachine) state() codexSessionState {
 	return m.value
 }
 
-func (m *codexSessionStateMachine) transition(next codexSessionState) (codexSessionTransition, error) {
+func (m *codexSessionStateMachine) apply(event codexSessionEvent) (codexSessionTransition, error) {
 	if m == nil {
 		return codexSessionTransition{}, fmt.Errorf("%w: nil state machine", errCodexSessionTransition)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	previous := m.value
-	if !validCodexSessionTransition(previous, next) {
-		return codexSessionTransition{}, fmt.Errorf("%w: %s -> %s", errCodexSessionTransition, previous, next)
+	next, actions, errReduce := reduceCodexSession(m.value, event)
+	if errReduce != nil {
+		return codexSessionTransition{}, errReduce
 	}
+	previous := m.value
 	m.value = next
 	now := m.now
 	if now == nil {
 		now = time.Now
 	}
-	return codexSessionTransition{From: previous, To: next, At: now()}, nil
-}
-
-func validCodexSessionTransition(from, to codexSessionState) bool {
-	switch from {
-	case codexSessionIdle:
-		return to == codexSessionDialing || to == codexSessionDraining || to == codexSessionClosed
-	case codexSessionDialing:
-		return to == codexSessionIdle || to == codexSessionReady || to == codexSessionDraining || to == codexSessionClosed
-	case codexSessionReady:
-		return to == codexSessionIdle || to == codexSessionBusy || to == codexSessionDialing || to == codexSessionDraining || to == codexSessionClosed
-	case codexSessionBusy:
-		return to == codexSessionIdle || to == codexSessionReady || to == codexSessionDialing || to == codexSessionDraining || to == codexSessionClosed
-	case codexSessionDraining:
-		return to == codexSessionClosed
-	case codexSessionClosed:
-		return false
-	default:
-		return false
-	}
+	return codexSessionTransition{From: previous, To: next, Event: event, Actions: actions, At: now()}, nil
 }

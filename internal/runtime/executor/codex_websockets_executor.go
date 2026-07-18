@@ -217,7 +217,7 @@ func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
 	}
 	s.activeMu.Unlock()
 	if ch != nil {
-		s.moveLifecycle(codexSessionBusy)
+		s.applyLifecycle(codexEventRequestStarted)
 	}
 }
 
@@ -240,19 +240,26 @@ func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
 	// Invalidation can move a busy session to idle before the stream's deferred
 	// cleanup runs. Only a still-busy live connection may become ready again.
 	if cleared && s.lifecycle.state() == codexSessionBusy {
-		s.moveLifecycle(codexSessionReady)
+		s.applyLifecycle(codexEventRequestFinished)
 	}
 }
 
-func (s *codexWebsocketSession) moveLifecycle(next codexSessionState) {
+func (s *codexWebsocketSession) applyLifecycle(event codexSessionEvent) {
 	if s == nil {
 		return
 	}
-	if s.lifecycle.state() == next || s.lifecycle.state() == codexSessionClosed {
+	if s.lifecycle.state() == codexSessionClosed {
 		return
 	}
-	if _, errTransition := s.lifecycle.transition(next); errTransition != nil {
-		log.WithError(errTransition).WithFields(log.Fields{"session_id": s.sessionID, "target_state": next.String()}).Debug("codex websockets: lifecycle transition rejected")
+	transition, errTransition := s.lifecycle.apply(event)
+	if errTransition != nil {
+		log.WithError(errTransition).WithFields(log.Fields{"session_id": s.sessionID, "event": event.String()}).Error("codex websockets: lifecycle event rejected")
+		return
+	}
+	for _, action := range transition.Actions {
+		if action == codexActionResetResponseChain {
+			s.resetCodexIncrementalState()
+		}
 	}
 }
 
@@ -2312,7 +2319,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 		}
 		return conn, nil, codexWebsocketConnectionSessionReuse, nil
 	}
-	sess.moveLifecycle(codexSessionDialing)
+	sess.applyLifecycle(codexEventDialRequested)
 	if pooledConn := e.takeSpeculativePreconnect(ctx, auth, authID, wsURL, headers, sess.sessionID); pooledConn != nil {
 		sess.connMu.Lock()
 		sess.conn = pooledConn
@@ -2323,13 +2330,13 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 		sess.configureConn(pooledConn)
 		go e.readUpstreamLoop(sess, pooledConn)
 		logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
-		sess.moveLifecycle(codexSessionReady)
+		sess.applyLifecycle(codexEventConnected)
 		return pooledConn, nil, codexWebsocketConnectionSpeculative, nil
 	}
 
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
-		sess.moveLifecycle(codexSessionIdle)
+		sess.applyLifecycle(codexEventTransportFailed)
 		return nil, resp, codexWebsocketConnectionCold, errDial
 	}
 
@@ -2351,7 +2358,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnObserved(ctx context.Context
 	sess.configureConn(conn)
 	go e.readUpstreamLoop(sess, conn)
 	logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
-	sess.moveLifecycle(codexSessionReady)
+	sess.applyLifecycle(codexEventConnected)
 	return conn, resp, codexWebsocketConnectionCold, nil
 }
 
@@ -2436,8 +2443,13 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	}
 	sess.connMu.Unlock()
 
-	sess.resetCodexIncrementalState()
-	sess.moveLifecycle(codexSessionIdle)
+	event := codexEventTransportFailed
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		event = codexEventIdleExpired
+	} else if reason == "upstream_error" {
+		event = codexEventSemanticFailed
+	}
+	sess.applyLifecycle(event)
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	sess.notifyUpstreamDisconnect(err)
 	if errClose := e.closeCodexConnection(conn); errClose != nil {
@@ -2500,7 +2512,7 @@ func (e *CodexWebsocketsExecutor) closeCodexWebsocketSession(sess *codexWebsocke
 	if reason == "" {
 		reason = "session_closed"
 	}
-	sess.moveLifecycle(codexSessionDraining)
+	sess.applyLifecycle(codexEventDrainRequested)
 
 	sess.connMu.Lock()
 	conn := sess.conn
@@ -2514,14 +2526,14 @@ func (e *CodexWebsocketsExecutor) closeCodexWebsocketSession(sess *codexWebsocke
 	sess.connMu.Unlock()
 
 	if conn == nil {
-		sess.moveLifecycle(codexSessionClosed)
+		sess.applyLifecycle(codexEventClosed)
 		return
 	}
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
 	if errClose := e.closeCodexConnection(conn); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}
-	sess.moveLifecycle(codexSessionClosed)
+	sess.applyLifecycle(codexEventClosed)
 }
 
 func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {
