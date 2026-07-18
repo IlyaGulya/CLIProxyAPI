@@ -343,6 +343,20 @@ func TestClaudeMetricsQueryIsRunScopedAndSurvivesExporterShutdown(t *testing.T) 
 	}
 }
 
+func TestClaudeNativeMetricsExportRequiresExplicitSuccess(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "debug.log")
+	if err := os.WriteFile(path, []byte("First metrics export: FAILURE\nFirst metrics export: SUCCESS\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !claudeNativeMetricsExported(path) {
+		t.Fatal("explicit Claude metrics export success was not recognized")
+	}
+	if claudeNativeMetricsExported(filepath.Join(t.TempDir(), "missing.log")) {
+		t.Fatal("missing debug evidence was accepted")
+	}
+}
+
 func TestLoadEnvFileDoesNotOverrideExistingEnvironment(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "existing")
 	t.Setenv("CLAUDE_CODE_SUBAGENT_MODEL", "user-selected-model")

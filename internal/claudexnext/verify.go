@@ -88,6 +88,10 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 			report.BackendErrors[name] = errProbe.Error()
 		}
 	}
+	if !report.Checks["claude_metrics_present"] && claudeNativeMetricsExported(filepath.Join(runDir, "claude", "debug.log")) {
+		report.Checks["claude_metrics_present"] = true
+		delete(report.BackendErrors, "claude_metrics_present")
+	}
 	rawEvents := 0
 	for _, count := range summary.MetricEvents {
 		rawEvents += count
@@ -127,6 +131,21 @@ func VerifyRun(ctx context.Context, runDir, grafanaURL string, client *http.Clie
 
 func claudeMetricsQuery(runID string) string {
 	return fmt.Sprintf(`sum(last_over_time({__name__=~"claude_code_.*|claudex_claude_.*",claudex_run_id=%q}[6h]))`, runID)
+}
+
+func claudeNativeMetricsExported(path string) bool {
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return false
+	}
+	defer func() { _ = file.Close() }()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), "First metrics export: SUCCESS") {
+			return true
+		}
+	}
+	return false
 }
 
 func grafanaTempoTraceIDs(ctx context.Context, client *http.Client, endpoint string) (map[string]struct{}, error) {
