@@ -141,5 +141,5 @@ var eventJournalFieldAllowlist = []string{
 	"compaction_dropped_items", "compaction_retained_tokens", "adaptive_target", "adaptive_hit_rate_basis_points",
 	"counterfactual_wait_us", "predicted_savings_bytes",
 	"reserved_output_tokens", "effective_context_window", "context_safety_margin", "remaining_headroom_tokens",
-	"budgeted_max_tokens", "original_max_tokens", "estimation_method", "metadata_source",
+	"budgeted_max_tokens", "original_max_tokens", "estimation_method", "metadata_source", "client_model",
 }

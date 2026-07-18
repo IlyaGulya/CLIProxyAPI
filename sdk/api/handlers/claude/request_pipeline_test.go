@@ -28,6 +28,20 @@ func TestClaudeRequestPipelineUsesRegisteredModelWindow(t *testing.T) {
 	}
 }
 
+func TestClaudeRequestPipelineRoutesClientCapabilityProfileBeforePolicy(t *testing.T) {
+	request := []byte(`{"model":"claude-opus-4-6","max_tokens":32000,"messages":[{"role":"user","content":"hello"}]}`)
+	result := newClaudeRequestPipeline(request, "").run(false)
+	if result.Err != nil || result.Rejected || result.Model != "gpt-5.6-sol" || result.ClientModel != "claude-opus-4-6" {
+		t.Fatalf("pipeline result = %+v", result)
+	}
+	if result.Pressure.EffectiveWindow != 372_000 {
+		t.Fatalf("effective window = %d, want routed Sol window 372000", result.Pressure.EffectiveWindow)
+	}
+	if strings.Contains(string(result.Body), "claude-opus-4-6") {
+		t.Fatalf("client capability profile leaked past routing boundary: %s", result.Body)
+	}
+}
+
 func TestClaudeRequestPipelineRejectsOutOfOrderAndRepeatedTransitions(t *testing.T) {
 	pipeline := newClaudeRequestPipeline([]byte(`{"model":"gpt-5.6-sol","messages":[]}`), "")
 	if errTransition := pipeline.transition(claudePhaseClassified); !errors.Is(errTransition, errClaudePipelineTransition) {

@@ -33,6 +33,7 @@ type claudeRequestPipeline struct {
 
 type claudePipelineResult struct {
 	Body             []byte
+	ClientModel      string
 	Model            string
 	Kind             claudeRequestKind
 	Pressure         claudeContextPressureResult
@@ -66,6 +67,7 @@ func (p *claudeRequestPipeline) run(countTokens bool) claudePipelineResult {
 		return result
 	}
 	p.document = document
+	result.ClientModel = document.model()
 	if errTransition := p.transition(claudePhaseDecoded); errTransition != nil {
 		result.Err = errTransition
 		return result

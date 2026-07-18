@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"gopkg.in/yaml.v3"
 )
@@ -144,9 +145,10 @@ func configString(value any) string {
 
 // BuildClaudeArgs adds observable defaults while respecting explicit user flags.
 func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
+	args = mapClaudeModelFlag(args)
 	out := make([]string, 0, len(args)+8)
 	if !hasFlag(args, "--model") {
-		out = append(out, "--model", "gpt-5.6-sol")
+		out = append(out, "--model", claudecompat.SolClientProfile)
 	}
 	if !hasAnyFlag(args, "--session-id", "--resume", "-r", "--continue", "-c") {
 		out = append(out, "--session-id", sessionID)
@@ -160,6 +162,27 @@ func BuildClaudeArgs(args []string, sessionID, debugPath string) []string {
 		out = append(out, "--settings", `{"skillOverrides":{"claude-api":"user-invocable-only"}}`)
 	}
 	return append(out, args...)
+}
+
+func mapClaudeModelFlag(args []string) []string {
+	out := append([]string(nil), args...)
+	for index, arg := range out {
+		if arg == "--model" && index+1 < len(out) {
+			out[index+1] = claudecompat.ClientModel(out[index+1])
+			return out
+		}
+		if value, ok := strings.CutPrefix(arg, "--model="); ok {
+			out[index] = "--model=" + claudecompat.ClientModel(value)
+			return out
+		}
+	}
+	return out
+}
+
+func configureClaudeClientModels(values map[string]string) {
+	if model := strings.TrimSpace(values["CLAUDE_CODE_SUBAGENT_MODEL"]); model != "" {
+		values["CLAUDE_CODE_SUBAGENT_MODEL"] = claudecompat.ClientModel(model)
+	}
 }
 
 func hasAnyFlag(args []string, names ...string) bool {

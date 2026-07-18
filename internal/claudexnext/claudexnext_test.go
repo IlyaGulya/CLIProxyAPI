@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -159,7 +161,7 @@ func aliasesByName(entries []config.OAuthModelAlias) map[string]string {
 func TestBuildClaudeArgsDefaultsRootToSolWithoutOverridingUserFlags(t *testing.T) {
 	t.Parallel()
 	got := BuildClaudeArgs([]string{"--effort", "xhigh"}, "session-1", "/run/debug.log")
-	want := []string{"--model", "gpt-5.6-sol", "--session-id", "session-1", "--debug-file", "/run/debug.log", "--settings", `{"skillOverrides":{"claude-api":"user-invocable-only"}}`, "--effort", "xhigh"}
+	want := []string{"--model", "claude-opus-4-6[1m]", "--session-id", "session-1", "--debug-file", "/run/debug.log", "--settings", `{"skillOverrides":{"claude-api":"user-invocable-only"}}`, "--effort", "xhigh"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -168,6 +170,23 @@ func TestBuildClaudeArgsDefaultsRootToSolWithoutOverridingUserFlags(t *testing.T
 	joined := strings.Join(got, " ")
 	if strings.Count(joined, "--model") != 1 || strings.Contains(joined, "session-2") || strings.Count(joined, "--debug-file") != 1 {
 		t.Fatalf("user flags were overridden: %#v", got)
+	}
+	got = BuildClaudeArgs([]string{"--model=gpt-5.6-luna"}, "session-3", "/run/debug.log")
+	if !slices.Contains(got, "--model=claude-sonnet-4-6[1m]") {
+		t.Fatalf("known routed model did not receive a Claude client profile: %#v", got)
+	}
+}
+
+func TestConfigureClaudeClientModelsMapsOnlyKnownRoutedModels(t *testing.T) {
+	values := map[string]string{"CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-luna"}
+	configureClaudeClientModels(values)
+	if got := values["CLAUDE_CODE_SUBAGENT_MODEL"]; got != "claude-sonnet-4-6[1m]" {
+		t.Fatalf("subagent client profile = %q", got)
+	}
+	values["CLAUDE_CODE_SUBAGENT_MODEL"] = "custom"
+	configureClaudeClientModels(values)
+	if values["CLAUDE_CODE_SUBAGENT_MODEL"] != "custom" {
+		t.Fatalf("custom subagent model was rewritten: %q", values["CLAUDE_CODE_SUBAGENT_MODEL"])
 	}
 }
 
@@ -248,6 +267,24 @@ func TestFetchClaudeModelMetadataUsesAnthropicCatalog(t *testing.T) {
 	models, errModels := FetchClaudeModelMetadata(context.Background(), server.Client(), server.URL, "secret")
 	if errModels != nil || len(models) != 1 || models[0].MaxInputTokens != 372_000 {
 		t.Fatalf("models = %+v, err = %v", models, errModels)
+	}
+}
+
+func TestWaitForClaudeModelMetadataIgnoresEarlyPartialCatalog(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			_, _ = io.WriteString(writer, `{"data":[]}`)
+			return
+		}
+		_, _ = io.WriteString(writer, `{"data":[{"id":"claude-fable-5-dd-los-6.5-tpg","max_input_tokens":372000},{"id":"claude-fable-5-dd-anul-6.5-tpg","max_input_tokens":372000}]}`)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	models, errWait := WaitForClaudeModelMetadata(ctx, server.Client(), server.URL, "", []string{"gpt-5.6-sol", "gpt-5.6-luna"})
+	if errWait != nil || len(models) != 2 || requests.Load() < 2 {
+		t.Fatalf("models=%+v requests=%d err=%v", models, requests.Load(), errWait)
 	}
 }
 

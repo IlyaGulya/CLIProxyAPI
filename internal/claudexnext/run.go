@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -46,38 +47,40 @@ type Options struct {
 }
 
 type Manifest struct {
-	Status             string                                  `json:"status"`
-	RunID              string                                  `json:"run_id"`
-	SessionID          string                                  `json:"session_id"`
-	StartedAt          time.Time                               `json:"started_at"`
-	FinishedAt         time.Time                               `json:"finished_at"`
-	WorkingDir         string                                  `json:"working_directory"`
-	ClaudeVersion      string                                  `json:"claude_version"`
-	ClaudeArgs         []string                                `json:"claude_args"`
-	RootModel          string                                  `json:"root_model"`
-	SubagentModel      string                                  `json:"subagent_model"`
-	MaxConcurrency     string                                  `json:"max_tool_use_concurrency"`
-	ProxyBinary        string                                  `json:"proxy_binary"`
-	ProxySHA256        string                                  `json:"proxy_sha256"`
-	LauncherVersion    string                                  `json:"launcher_version"`
-	LauncherCommit     string                                  `json:"launcher_commit"`
-	LauncherBuildDate  string                                  `json:"launcher_build_date"`
-	ProxyVersion       string                                  `json:"proxy_version"`
-	Generation         string                                  `json:"generation"`
-	LauncherPID        int                                     `json:"launcher_pid"`
-	ProxyPID           int                                     `json:"proxy_pid"`
-	ClaudePID          int                                     `json:"claude_pid"`
-	ProxyPort          int                                     `json:"proxy_port"`
-	ExitCode           int                                     `json:"exit_code"`
-	Stack              StackStatus                             `json:"observability_stack"`
-	ProxyReadyMS       int64                                   `json:"proxy_ready_ms"`
-	ClaudeRuntimeMS    int64                                   `json:"claude_runtime_ms"`
-	OTELFlushOK        bool                                    `json:"otel_flush_ok"`
-	OTELExport         observability.TelemetryShutdownEvidence `json:"otel_export"`
-	Telemetry          map[string]string                       `json:"telemetry_privacy"`
-	HarnessSchemaOK    bool                                    `json:"harness_schema_ok"`
-	HarnessSchemaError string                                  `json:"harness_schema_error,omitempty"`
-	ContextWindow      ClaudeContextWindowResolution           `json:"context_window"`
+	Status              string                                  `json:"status"`
+	RunID               string                                  `json:"run_id"`
+	SessionID           string                                  `json:"session_id"`
+	StartedAt           time.Time                               `json:"started_at"`
+	FinishedAt          time.Time                               `json:"finished_at"`
+	WorkingDir          string                                  `json:"working_directory"`
+	ClaudeVersion       string                                  `json:"claude_version"`
+	ClaudeArgs          []string                                `json:"claude_args"`
+	RootModel           string                                  `json:"root_model"`
+	SubagentModel       string                                  `json:"subagent_model"`
+	ClientRootModel     string                                  `json:"client_root_model"`
+	ClientSubagentModel string                                  `json:"client_subagent_model"`
+	MaxConcurrency      string                                  `json:"max_tool_use_concurrency"`
+	ProxyBinary         string                                  `json:"proxy_binary"`
+	ProxySHA256         string                                  `json:"proxy_sha256"`
+	LauncherVersion     string                                  `json:"launcher_version"`
+	LauncherCommit      string                                  `json:"launcher_commit"`
+	LauncherBuildDate   string                                  `json:"launcher_build_date"`
+	ProxyVersion        string                                  `json:"proxy_version"`
+	Generation          string                                  `json:"generation"`
+	LauncherPID         int                                     `json:"launcher_pid"`
+	ProxyPID            int                                     `json:"proxy_pid"`
+	ClaudePID           int                                     `json:"claude_pid"`
+	ProxyPort           int                                     `json:"proxy_port"`
+	ExitCode            int                                     `json:"exit_code"`
+	Stack               StackStatus                             `json:"observability_stack"`
+	ProxyReadyMS        int64                                   `json:"proxy_ready_ms"`
+	ClaudeRuntimeMS     int64                                   `json:"claude_runtime_ms"`
+	OTELFlushOK         bool                                    `json:"otel_flush_ok"`
+	OTELExport          observability.TelemetryShutdownEvidence `json:"otel_export"`
+	Telemetry           map[string]string                       `json:"telemetry_privacy"`
+	HarnessSchemaOK     bool                                    `json:"harness_schema_ok"`
+	HarnessSchemaError  string                                  `json:"harness_schema_error,omitempty"`
+	ContextWindow       ClaudeContextWindowResolution           `json:"context_window"`
 }
 
 type processOwner struct {
@@ -212,13 +215,17 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	}
 	proxyReadyMS := time.Since(proxyReadyStartedAt).Milliseconds()
 	claudeArgs := BuildClaudeArgs(opts.ClaudeArgs, sessionID, filepath.Join(runDir, "claude", "debug.log"))
-	rootModel := flagValue(claudeArgs, "--model")
-	selectedModels := []string{rootModel, values["CLAUDE_CODE_SUBAGENT_MODEL"]}
+	clientRootModel := flagValue(claudeArgs, "--model")
+	rootModel := claudecompat.RoutedModel(clientRootModel)
+	subagentModel := values["CLAUDE_CODE_SUBAGENT_MODEL"]
+	selectedModels := []string{rootModel, subagentModel}
 	modelToken := values["ANTHROPIC_AUTH_TOKEN"]
 	if strings.TrimSpace(modelToken) == "" {
 		modelToken = ConfigAPIKey(configOutput)
 	}
-	models, errModels := FetchClaudeModelMetadata(ctx, http.DefaultClient, values["ANTHROPIC_BASE_URL"], modelToken)
+	metadataCtx, cancelMetadata := context.WithTimeout(ctx, 3*time.Second)
+	models, errModels := WaitForClaudeModelMetadata(metadataCtx, http.DefaultClient, values["ANTHROPIC_BASE_URL"], modelToken, selectedModels)
+	cancelMetadata()
 	contextWindow := ResolveClaudeContextWindow(models, selectedModels)
 	if explicit := strings.TrimSpace(values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]); explicit != "" {
 		if parsed, errParse := strconv.Atoi(explicit); errParse == nil && parsed > 0 {
@@ -228,11 +235,12 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		contextWindow.Source = "registry_fallback"
 	}
 	ConfigureClaudeContextSafety(values, contextWindow)
+	configureClaudeClientModels(values)
 	proxyHash, _ := fileSHA256(opts.ProxyBin)
 	liveManifest := Manifest{
 		Status: "proxy_ready", RunID: runID, SessionID: sessionID, StartedAt: startedAt, WorkingDir: workingDir,
-		ClaudeVersion: commandVersion(opts.ClaudeBin), RootModel: rootModel,
-		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
+		ClaudeVersion: commandVersion(opts.ClaudeBin), RootModel: rootModel, ClientRootModel: clientRootModel,
+		SubagentModel: subagentModel, ClientSubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ProxyVersion: commandVersion(opts.ProxyBin),
 		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
 		Generation: buildinfo.Commit + ":" + proxyHash, LauncherPID: os.Getpid(), ProxyPID: proxyCmd.Process.Pid,
@@ -363,8 +371,8 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 
 	manifest := Manifest{
 		Status: "finished", RunID: runID, SessionID: sessionID, StartedAt: startedAt, FinishedAt: time.Now(), WorkingDir: workingDir,
-		ClaudeVersion: commandVersion(opts.ClaudeBin), ClaudeArgs: redactArgs(claudeArgs), RootModel: flagValue(claudeArgs, "--model"),
-		SubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
+		ClaudeVersion: commandVersion(opts.ClaudeBin), ClaudeArgs: redactArgs(claudeArgs), RootModel: rootModel, ClientRootModel: clientRootModel,
+		SubagentModel: subagentModel, ClientSubagentModel: values["CLAUDE_CODE_SUBAGENT_MODEL"], MaxConcurrency: values["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"],
 		ProxyBinary: opts.ProxyBin, ProxySHA256: proxyHash, ProxyPort: port, ExitCode: exitCode,
 		LauncherVersion: buildinfo.Version, LauncherCommit: buildinfo.Commit, LauncherBuildDate: buildinfo.BuildDate,
 		ProxyVersion: commandVersion(opts.ProxyBin),
@@ -373,6 +381,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 		OTELExport:      otelEvidence,
 		Telemetry:       telemetryPrivacy(values),
 		HarnessSchemaOK: harnessSchemaOK, HarnessSchemaError: harnessSchemaError,
+		ContextWindow: contextWindow,
 	}
 	if errWrite := writeJSON(filepath.Join(runDir, "manifest.json"), manifest); errWrite != nil {
 		return runDir, exitCode, errWrite

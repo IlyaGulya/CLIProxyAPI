@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/tiktoken-go/tokenizer"
 )
 
@@ -86,7 +87,12 @@ func (d *claudeRequestDocument) mutate(applied bool) bool {
 }
 
 func (d *claudeRequestDocument) normalizeModel() bool {
-	return d.mutate(rewriteClaudeDDModelRoot(d.root))
+	changed := rewriteClaudeDDModelRoot(d.root)
+	if changed {
+		d.invalidate()
+	}
+	changed = d.setModel(claudecompat.RoutedModel(d.model())) || changed
+	return changed
 }
 
 func (d *claudeRequestDocument) routeClassifier(targetModel string) bool {

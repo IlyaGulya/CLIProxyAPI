@@ -151,7 +151,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	pressure := result.Pressure
 	remainingHeadroom := pressure.EffectiveWindow - pressure.EstimatedInput - pressure.ReservedOutput - pressure.SafetyMargin
 	observability.RecordWebsocketMetric(c.Request.Context(), "context_preflight", "", "", map[string]any{
-		"model": result.Model, "input_tokens": pressure.EstimatedInput,
+		"model": result.Model, "client_model": result.ClientModel, "input_tokens": pressure.EstimatedInput,
 		"reserved_output_tokens": pressure.ReservedOutput, "effective_context_window": pressure.EffectiveWindow,
 		"context_safety_margin": pressure.SafetyMargin, "remaining_headroom_tokens": remainingHeadroom,
 		"estimation_method": pressure.Method, "metadata_source": pressure.MetadataSource, "overflow": pressure.Overflow,
@@ -159,6 +159,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	if result.Rejected {
 		observability.RecordWebsocketMetric(c.Request.Context(), "context_preflight_rejected", "", "", map[string]any{
 			"model":                     gjson.GetBytes(rawJSON, "model").String(),
+			"client_model":              result.ClientModel,
 			"input_tokens":              pressure.EstimatedInput,
 			"reserved_output_tokens":    pressure.ReservedOutput,
 			"effective_context_window":  pressure.EffectiveWindow,

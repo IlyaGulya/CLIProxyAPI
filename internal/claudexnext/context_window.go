@@ -6,10 +6,35 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type claudeModelsResponse struct {
 	Data []ClaudeModelMetadata `json:"data"`
+}
+
+// WaitForClaudeModelMetadata waits for the proxy's asynchronous credential
+// registration to publish every selected model, rather than treating an early
+// but valid empty catalog as authoritative.
+func WaitForClaudeModelMetadata(ctx context.Context, client *http.Client, baseURL, token string, selected []string) ([]ClaudeModelMetadata, error) {
+	var lastErr error
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		models, errFetch := FetchClaudeModelMetadata(ctx, client, baseURL, token)
+		if errFetch == nil && ResolveClaudeContextWindow(models, selected).Source == "proxy_model_metadata" {
+			return models, nil
+		}
+		lastErr = errFetch
+		if lastErr == nil {
+			lastErr = fmt.Errorf("selected models are not registered yet")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wait for model metadata: %w: %v", ctx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
 }
 
 func FetchClaudeModelMetadata(ctx context.Context, client *http.Client, baseURL, token string) ([]ClaudeModelMetadata, error) {
