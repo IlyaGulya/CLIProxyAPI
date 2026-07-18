@@ -70,20 +70,41 @@ func AnalyzeRun(runDir string) (RunSummary, error) {
 		ConnectionSources: make(map[string]int),
 		MetricEvents:      make(map[string]int),
 	}
-	pattern := filepath.Join(runDir, "proxy", "logs", "v1-messages-*.log")
-	paths, errGlob := filepath.Glob(pattern)
-	if errGlob != nil {
-		return summary, fmt.Errorf("find request logs: %w", errGlob)
+	journalPaths, errJournalGlob := filepath.Glob(filepath.Join(runDir, "proxy", "events", "requests.jsonl*"))
+	if errJournalGlob != nil {
+		return summary, fmt.Errorf("find event journals: %w", errJournalGlob)
 	}
-	sort.Strings(paths)
+	sort.Strings(journalPaths)
+	if len(journalPaths) > 0 {
+		requests, events, errJournal := parseEventJournals(journalPaths)
+		if errJournal != nil {
+			return summary, errJournal
+		}
+		summary.Requests = requests
+		for name, count := range events {
+			summary.MetricEvents[name] += count
+		}
+	} else {
+		pattern := filepath.Join(runDir, "proxy", "logs", "v1-messages-*.log")
+		paths, errGlob := filepath.Glob(pattern)
+		if errGlob != nil {
+			return summary, fmt.Errorf("find request logs: %w", errGlob)
+		}
+		sort.Strings(paths)
+		for _, path := range paths {
+			request, events, errParse := parseRequestLog(path)
+			if errParse != nil {
+				return summary, errParse
+			}
+			summary.Requests = append(summary.Requests, request)
+			for _, name := range events {
+				summary.MetricEvents[name]++
+			}
+		}
+	}
 	var cacheRead, input int64
 	var speculativeCandidates, speculativeHits int
-	for _, path := range paths {
-		request, events, errParse := parseRequestLog(path)
-		if errParse != nil {
-			return summary, errParse
-		}
-		summary.Requests = append(summary.Requests, request)
+	for _, request := range summary.Requests {
 		summary.Models[request.Model]++
 		summary.ConnectionSources[request.ConnectionSource]++
 		if request.Role == "child" {
@@ -97,9 +118,6 @@ func AnalyzeRun(runDir string) (RunSummary, error) {
 		}
 		cacheRead += request.CacheReadTokens
 		input += request.InputTokens
-		for _, name := range events {
-			summary.MetricEvents[name]++
-		}
 	}
 	summary.RequestCount = len(summary.Requests)
 	if speculativeCandidates > 0 {
@@ -112,6 +130,82 @@ func AnalyzeRun(runDir string) (RunSummary, error) {
 	summary.TranscriptFiles, summary.AgentTranscripts, summary.TranscriptModels = analyzeTranscripts(filepath.Join(runDir, "transcripts"))
 	summary.Claude = analyzeClaudeOutput(filepath.Join(runDir, "claude", "stdout.log"))
 	return summary, nil
+}
+
+func parseEventJournals(paths []string) ([]RequestSummary, map[string]int, error) {
+	requests := make([]RequestSummary, 0)
+	indices := make(map[string]int)
+	events := make(map[string]int)
+	for _, path := range paths {
+		file, errOpen := os.Open(path)
+		if errOpen != nil {
+			return nil, nil, fmt.Errorf("open event journal %s: %w", path, errOpen)
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 16*1024), 1<<20)
+		for scanner.Scan() {
+			var event map[string]any
+			if json.Unmarshal(scanner.Bytes(), &event) != nil {
+				continue // A crash may leave one truncated final record.
+			}
+			name := stringValue(event["name"])
+			key := stringValue(event["request_key"])
+			if name == "" {
+				continue
+			}
+			events[name]++
+			index, exists := indices[key]
+			if name == "request_prepared" && key != "" && !exists {
+				indices[key] = len(requests)
+				requests = append(requests, RequestSummary{File: filepath.Base(path), Role: "root"})
+				index, exists = len(requests)-1, true
+			}
+			if !exists {
+				continue
+			}
+			applyJournalEvent(&requests[index], name, event)
+		}
+		errScan := scanner.Err()
+		_ = file.Close()
+		if errScan != nil {
+			return nil, nil, fmt.Errorf("read event journal %s: %w", path, errScan)
+		}
+	}
+	return requests, events, nil
+}
+
+func applyJournalEvent(request *RequestSummary, name string, event map[string]any) {
+	if role := stringValue(event["role"]); role == "child" || role == "root" {
+		request.Role = role
+	}
+	switch name {
+	case "request_prepared":
+		request.Model = stringValue(event["model"])
+		request.ChainSource = stringValue(event["chain_source"])
+		request.Incremental = boolean(event["incremental"])
+		request.IncrementalReset = stringValue(event["incremental_reset_reason"])
+		request.ClientBodyBytes = int64(number(event["client_body_bytes"]))
+		request.UpstreamBodyBytes = int64(number(event["upstream_body_bytes"]))
+	case "connection_ready":
+		request.ConnectionSource = stringValue(event["connection_source"])
+		request.ConnectionReadyMS = number(event["duration_us"]) / 1000
+	case "first_upstream_event":
+		request.FirstEventMS = number(event["since_send_us"]) / 1000
+	case "first_output_text_delta":
+		request.FirstTextMS = number(event["since_send_us"]) / 1000
+	case "usage":
+		request.InputTokens = int64(number(event["input_tokens"]))
+		request.OutputTokens = int64(number(event["output_tokens"]))
+		request.CacheReadTokens = int64(number(event["cache_read_tokens"]))
+	case "request_finished":
+		request.TotalMS = number(event["elapsed_us"]) / 1000
+		request.FinishReason = stringValue(event["reason"])
+	}
+}
+
+func boolean(value any) bool {
+	result, _ := value.(bool)
+	return result
 }
 
 func analyzeClaudeOutput(path string) ClaudeSummary {

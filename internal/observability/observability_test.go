@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -259,5 +260,39 @@ func TestStartServiceWithEnvironmentRestoresProcessEnvironment(t *testing.T) {
 	}
 	if _, exists := os.LookupEnv("CLAUDEX_NEXT_RUN_ID"); exists {
 		t.Fatal("CLAUDEX_NEXT_RUN_ID leaked into process environment")
+	}
+}
+
+func TestEventJournalWritesPrivacySafeTypedRecordsWithoutOTEL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	t.Setenv("CLAUDEX_NEXT_EVENT_JOURNAL", path)
+	t.Setenv("OTEL_SDK_DISABLED", "true")
+	telemetry, errStart := StartService(context.Background(), "test")
+	if errStart != nil {
+		t.Fatal(errStart)
+	}
+	t.Cleanup(func() { _ = telemetry.Shutdown(context.Background()) })
+	RecordWebsocketEvent(context.Background(), WebsocketEvent{
+		Name: "request_prepared", RootCorrelation: "root-safe", ExecutionCorrelation: "exec-safe",
+		Attributes: WebsocketAttributes{Model: "gpt-5.6-luna", ClientBodyBytes: Some(int64(1234))},
+		Fields:     map[string]any{"role": "child", "prompt": "must-not-appear", "authorization": "secret"},
+	})
+	payload, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	text := string(payload)
+	for _, want := range []string{`"name":"request_prepared"`, `"model":"gpt-5.6-luna"`, `"role":"child"`, `"client_body_bytes":1234`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("journal missing %s: %s", want, text)
+		}
+	}
+	for _, forbidden := range []string{"must-not-appear", "secret", "authorization", "prompt"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("journal leaked %q: %s", forbidden, text)
+		}
+	}
+	if info, errStat := os.Stat(path); errStat != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("journal permissions = %v, err=%v", info.Mode().Perm(), errStat)
 	}
 }

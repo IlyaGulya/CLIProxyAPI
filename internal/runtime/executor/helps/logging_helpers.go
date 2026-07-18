@@ -443,6 +443,16 @@ func RecordAPIWebsocketMetric(ctx context.Context, cfg *config.Config, name stri
 func RecordAPIWebsocketEvent(ctx context.Context, cfg *config.Config, name string, attributes observability.WebsocketAttributes, legacyFields map[string]any) {
 	ginCtx := ginContextFrom(ctx)
 	rootCorrelation, executionCorrelation := ClaudeCodeCorrelationIDs(ctx, nil, nil)
+	if legacyFields == nil {
+		legacyFields = make(map[string]any)
+	}
+	if _, exists := legacyFields["role"]; !exists {
+		if ExtractClaudeCodeAgentID(ctx, nil) == "" {
+			legacyFields["role"] = "root"
+		} else {
+			legacyFields["role"] = "child"
+		}
+	}
 	observability.RecordWebsocketEvent(ctx, observability.WebsocketEvent{
 		Name: name, RootCorrelation: rootCorrelation, ExecutionCorrelation: executionCorrelation,
 		Attributes: attributes, Fields: legacyFields,

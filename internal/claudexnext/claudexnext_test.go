@@ -266,6 +266,35 @@ X-Claude-Code-Agent-Id: child-1
 	}
 }
 
+func TestAnalyzeRunUsesEventJournalWhenRequestLogDisabled(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	eventsDir := filepath.Join(dir, "proxy", "events")
+	if err := os.MkdirAll(eventsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journal := strings.Join([]string{
+		`{"schema":1,"name":"request_prepared","request_key":"req-1","role":"child","model":"gpt-5.6-luna","chain_source":"full_replay","client_body_bytes":1200}`,
+		`{"schema":1,"name":"connection_ready","request_key":"req-1","connection_source":"speculative","duration_us":46000}`,
+		`{"schema":1,"name":"usage","request_key":"req-1","input_tokens":5113,"output_tokens":8,"cache_read_tokens":4864}`,
+		`{"schema":1,"name":"request_finished","request_key":"req-1","elapsed_us":1100000,"reason":"completed"}`,
+		`{"schema":1,"name":"truncated"`,
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(eventsDir, "requests.jsonl"), []byte(journal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := AnalyzeRun(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RequestCount != 1 || summary.ChildRequests != 1 || summary.Models["gpt-5.6-luna"] != 1 {
+		t.Fatalf("journal summary = %+v", summary)
+	}
+	if summary.SpeculativeHitRate != 1 || summary.CacheReadRatio < .95 || summary.Requests[0].TotalMS != 1100 {
+		t.Fatalf("journal metrics = %+v", summary)
+	}
+}
+
 func TestLoadEnvFileDoesNotOverrideExistingEnvironment(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "existing")
 	t.Setenv("CLAUDE_CODE_SUBAGENT_MODEL", "user-selected-model")

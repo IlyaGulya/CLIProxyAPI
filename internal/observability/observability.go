@@ -64,6 +64,7 @@ type Telemetry struct {
 	poolDialing     atomic.Int64
 	openConnections atomic.Int64
 	links           sync.Map
+	journal         *eventJournal
 }
 
 var current atomic.Pointer[Telemetry]
@@ -93,6 +94,11 @@ func Start(ctx context.Context) (*Telemetry, error) {
 
 func StartService(ctx context.Context, serviceName string) (*Telemetry, error) {
 	telemetry := &Telemetry{runID: strings.TrimSpace(os.Getenv("CLAUDEX_NEXT_RUN_ID"))}
+	journal, errJournal := openEventJournal(os.Getenv("CLAUDEX_NEXT_EVENT_JOURNAL"))
+	if errJournal != nil {
+		return telemetry, errJournal
+	}
+	telemetry.journal = journal
 	current.Store(telemetry)
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("OTEL_SDK_DISABLED")), "true") {
 		return telemetry, nil
@@ -318,6 +324,9 @@ func RecordOpenConnection(delta int64) {
 
 func (t *Telemetry) Shutdown(ctx context.Context) error {
 	var errs []error
+	if t.journal != nil {
+		errs = append(errs, t.journal.close())
+	}
 	if t.loggerProvider != nil {
 		errs = append(errs, t.loggerProvider.ForceFlush(ctx), t.loggerProvider.Shutdown(ctx))
 	}
@@ -445,6 +454,9 @@ func RecordWebsocketEvent(ctx context.Context, event WebsocketEvent) {
 	}
 	detached := event.Detached
 	t := Current()
+	if t.journal != nil {
+		t.journal.record(event, fields)
+	}
 	if !t.Enabled {
 		return
 	}

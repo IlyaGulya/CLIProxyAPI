@@ -140,6 +140,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	ConfigureClaudeContextSafety(values)
 	values["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:" + strconv.Itoa(port)
 	values["CLAUDEX_NEXT_RUN_ID"] = runID
+	values["CLAUDEX_NEXT_EVENT_JOURNAL"] = filepath.Join(runDir, "proxy", "events", "requests.jsonl")
 	stack := StackStatus{Image: LGTMImage, Grafana: GrafanaURL, Endpoint: LGTMEndpoint}
 	explicitEndpoint := strings.TrimSpace(values["OTEL_EXPORTER_OTLP_ENDPOINT"])
 	if explicitEndpoint != "" {
@@ -164,6 +165,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	var launcherSpan trace.Span
 	if stack.Available {
 		launcherEnv := cloneEnv(values)
+		delete(launcherEnv, "CLAUDEX_NEXT_EVENT_JOURNAL")
 		launcherEnv["OTEL_SERVICE_NAME"] = "claudex-next"
 		launcherTelemetry, _ = observability.StartServiceWithEnvironment(ctx, "claudex-next", launcherEnv)
 		ctx, launcherSpan = otel.Tracer("claudex-next").Start(ctx, "claudex-next.run",
