@@ -29,6 +29,9 @@ func TestClaudeHarnessCompatibilityMatrixCoversExecutionModes(t *testing.T) {
 		if len(testCase.Args) == 0 || len(testCase.ExpectedEvents) == 0 || len(testCase.ExpectedArtifacts) == 0 || testCase.TranscriptPolicy == "" {
 			t.Errorf("case %q is incomplete: %+v", testCase.Name, testCase)
 		}
+		if testCase.NeedsAgent && !containsString(testCase.Args, "--dangerously-skip-permissions") {
+			t.Errorf("agent case %q cannot execute non-interactively: args=%v", testCase.Name, testCase.Args)
+		}
 	}
 	for _, name := range want {
 		if !seen[name] {

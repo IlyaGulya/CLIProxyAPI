@@ -56,6 +56,9 @@ func ClaudeHarnessCompatibilityMatrix(version string) ClaudeHarnessCompatibility
 		if cases[i].Name == "forward_subagent_text" || cases[i].Name == "workflow" {
 			cases[i].NeedsAgent = true
 		}
+		if cases[i].NeedsAgent {
+			cases[i].Args = append(cases[i].Args, "--dangerously-skip-permissions")
+		}
 		if cases[i].Name == "no_session_persistence" {
 			cases[i].TranscriptPolicy = "forbidden"
 		}

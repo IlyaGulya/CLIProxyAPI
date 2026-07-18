@@ -12,11 +12,11 @@ case "$case_name" in
   safe_mode) args+=(--safe-mode) ;;
   stream_json) args+=(--input-format stream-json --replay-user-messages) ;;
   partial_messages) args+=(--include-partial-messages) ;;
-  forward_subagent_text) args+=(--forward-subagent-text) ; prompt="Use one Agent subagent, then reply OK." ;;
+  forward_subagent_text) args+=(--forward-subagent-text --dangerously-skip-permissions) ; prompt="Use one Agent subagent, then reply OK." ;;
   prompt_suggestions) args+=(--prompt-suggestions true) ;;
   structured_output) args=(--print --output-format json --max-budget-usd "$budget" --max-turns 3 --json-schema '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}') ;;
-  background_agent) args+=(--background) ;;
-  workflow) prompt="Use one dynamic workflow with one leaf agent, then reply OK." ;;
+  background_agent) args+=(--background --dangerously-skip-permissions) ;;
+  workflow) args+=(--dangerously-skip-permissions) ; prompt="Use one dynamic workflow with one leaf agent, then reply OK." ;;
   fork_session)
     session_id="${CLAUDEX_NEXT_COMPAT_SESSION_ID:?set CLAUDEX_NEXT_COMPAT_SESSION_ID to a completed session}"
     args+=(--resume "$session_id" --fork-session)
