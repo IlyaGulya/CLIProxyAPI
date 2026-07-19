@@ -75,6 +75,27 @@ func TestFileBodySource_RecreatesPartDirAfterManualCleanup(t *testing.T) {
 	assertFileBodySourceCleaned(t, partPaths)
 }
 
+func TestFileBodySourceWriteToImplementsWriterToContract(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "writer-to")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = source.Cleanup() })
+	for _, part := range [][]byte{[]byte("first"), []byte("second")} {
+		if err = source.AppendPart(part); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var output bytes.Buffer
+	written, err := source.WriteTo(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "first\n\nsecond\n"; got != want || written != int64(len(want)) {
+		t.Fatalf("WriteTo = (%q, %d), want (%q, %d)", got, written, want, len(want))
+	}
+}
+
 func TestFileRequestLogger_HomeEnabled_ForwardsWhenRequestLogEnabled(t *testing.T) {
 	original := currentHomeRequestLogClient
 	defer func() {
