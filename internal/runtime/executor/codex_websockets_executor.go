@@ -199,9 +199,19 @@ type codexWebsocketRead struct {
 	err     error
 }
 
-func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
+func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) error {
 	if s == nil {
-		return
+		return fmt.Errorf("codex websocket session is nil")
+	}
+	if ch == nil {
+		s.activeMu.Lock()
+		current := s.activeCh
+		s.activeMu.Unlock()
+		s.clearActive(current)
+		return nil
+	}
+	if err := s.transitionLifecycle(codexEventRequestStarted); err != nil {
+		return err
 	}
 	s.activeMu.Lock()
 	if s.activeCancel != nil {
@@ -210,15 +220,11 @@ func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
 		s.activeDone = nil
 	}
 	s.activeCh = ch
-	if ch != nil {
-		activeCtx, activeCancel := context.WithCancel(context.Background())
-		s.activeDone = activeCtx.Done()
-		s.activeCancel = activeCancel
-	}
+	activeCtx, activeCancel := context.WithCancel(context.Background())
+	s.activeDone = activeCtx.Done()
+	s.activeCancel = activeCancel
 	s.activeMu.Unlock()
-	if ch != nil {
-		s.applyLifecycle(codexEventRequestStarted)
-	}
+	return nil
 }
 
 func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
@@ -245,22 +251,28 @@ func (s *codexWebsocketSession) clearActive(ch chan codexWebsocketRead) {
 }
 
 func (s *codexWebsocketSession) applyLifecycle(event codexSessionEvent) {
+	if err := s.transitionLifecycle(event); err != nil {
+		log.WithError(err).WithFields(log.Fields{"session_id": s.sessionID, "event": event.String()}).Error("codex websockets: lifecycle event rejected")
+	}
+}
+
+func (s *codexWebsocketSession) transitionLifecycle(event codexSessionEvent) error {
 	if s == nil {
-		return
+		return fmt.Errorf("codex websocket session is nil")
 	}
 	if s.lifecycle.state() == codexSessionClosed {
-		return
+		return nil
 	}
 	transition, errTransition := s.lifecycle.apply(event)
 	if errTransition != nil {
-		log.WithError(errTransition).WithFields(log.Fields{"session_id": s.sessionID, "event": event.String()}).Error("codex websockets: lifecycle event rejected")
-		return
+		return errTransition
 	}
 	for _, action := range transition.Actions {
 		if action == codexActionResetResponseChain {
 			s.resetCodexIncrementalState()
 		}
 	}
+	return nil
 }
 
 func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, payload []byte) error {
@@ -393,7 +405,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var readCh chan codexWebsocketRead
 	if sess != nil {
 		readCh = make(chan codexWebsocketRead, 4096)
-		sess.setActive(readCh)
+		if errActivate := sess.setActive(readCh); errActivate != nil {
+			sess.reqMu.Unlock()
+			return resp, fmt.Errorf("activate websocket reader: %w", errActivate)
+		}
 		defer sess.clearActive(readCh)
 	}
 
@@ -624,11 +639,40 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var connectionSource codexWebsocketConnectionSource
 	var overflowBaseSource codexWebsocketConnectionSource
 	var errDial error
-	if sessionOverflow {
-		conn, respHS, overflowBaseSource, errDial = e.ensureOverflowConnObserved(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
-		connectionSource = codexWebsocketConnectionOverflow
-	} else {
-		conn, respHS, connectionSource, errDial = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
+	attemptMachine := newCodexAttemptMachine(func(transition codexAttemptTransition) {
+		actions := make([]string, len(transition.Actions))
+		for i, action := range transition.Actions {
+			actions[i] = action.String()
+		}
+		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "attempt_transition", observability.WebsocketAttributes{
+			SessionID:        executionSessionID,
+			Model:            baseModel,
+			AttemptStateFrom: observability.WebsocketAttemptState(transition.From.String()),
+			AttemptStateTo:   observability.WebsocketAttemptState(transition.To.String()),
+			AttemptEvent:     observability.WebsocketAttemptEvent(transition.Event.String()),
+			AttemptActions:   strings.Join(actions, "."),
+		}, nil)
+	})
+	connecting, errAttempt := attemptMachine.apply(codexAttemptConnectRequested)
+	if errAttempt == nil {
+		errAttempt = runCodexAttemptActions(connecting.Actions, codexAttemptActionHandlers{Dial: func() error {
+			if sessionOverflow {
+				conn, respHS, overflowBaseSource, errDial = e.ensureOverflowConnObserved(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
+				connectionSource = codexWebsocketConnectionOverflow
+			} else {
+				conn, respHS, connectionSource, errDial = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
+			}
+			return errDial
+		}})
+	}
+	if errAttempt != nil && errDial == nil {
+		errDial = errAttempt
+	}
+	if errDial == nil && conn != nil {
+		_, errAttempt = attemptMachine.apply(codexAttemptConnected)
+		if errAttempt != nil {
+			errDial = errAttempt
+		}
 	}
 	connectionAge, connectionRequestCount := time.Duration(0), int64(1)
 	if errDial == nil && conn != nil && sess != nil {
@@ -678,12 +722,21 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var readCh chan codexWebsocketRead
 	if sess != nil {
 		readCh = make(chan codexWebsocketRead, 4096)
-		sess.setActive(readCh)
+		activated, errActivate := attemptMachine.apply(codexAttemptReaderActivated)
+		if errActivate == nil {
+			errActivate = runCodexAttemptActions(activated.Actions, codexAttemptActionHandlers{ActivateReader: func() error { return sess.setActive(readCh) }})
+		}
+		if errActivate != nil {
+			sess.reqMu.Unlock()
+			return nil, fmt.Errorf("activate websocket stream reader: %w", errActivate)
+		}
+	} else {
+		_, _ = attemptMachine.apply(codexAttemptReaderActivated)
 	}
 
 	transportRetries := 0
 	sendStartedAt := time.Now()
-	errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody)
+	errSend := sendCodexAttemptRequest(attemptMachine, func() error { return writeCodexWebsocketMessage(sess, conn, wsReqBody) })
 	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "request_sent", observability.WebsocketAttributes{
 		SessionID: executionSessionID, DurationUS: observability.Some(time.Since(sendStartedAt).Microseconds()),
 		ElapsedUS: observability.Some(time.Since(traceStartedAt).Microseconds()), Bytes: observability.Some(int64(len(wsReqBody))),
@@ -703,6 +756,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			reconnected, errDialRetry := e.reconnectCodexWebsocket(codexReconnectRequest{
 				ctx: ctx, auth: auth, session: sess, currentConn: conn, currentRead: readCh,
 				authID: authID, url: wsURL, headers: retryHeaders, executionID: executionSessionID,
+				attempt: attemptMachine,
 			})
 			connRetry, respHSRetry := reconnected.conn, reconnected.response
 			readCh = reconnected.read
@@ -728,7 +782,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			})
 			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			reporter.StartResponseTTFT()
-			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
+			if errSendRetry := sendCodexAttemptRequest(attemptMachine, func() error {
+				return writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry)
+			}); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(readCh)
@@ -771,6 +827,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 		defer close(out)
 		defer func() {
+			if !attemptMachine.current().terminal() {
+				attemptEvent := codexAttemptFailedEvent
+				if terminateReason == "completed" {
+					attemptEvent = codexAttemptTerminalReceived
+				} else if terminateReason == "context_done" {
+					attemptEvent = codexAttemptCancelledEvent
+				}
+				_, _ = attemptMachine.apply(attemptEvent)
+			}
 			if terminateReason == "completed" {
 				e.recordCircuitSuccess(ctx, auth, req.Model)
 			} else if terminateReason == "read_error" || terminateReason == "unexpected_binary" {
@@ -796,6 +861,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				DownstreamCommitted: observability.Some(streamSnapshot.DownstreamCommitted), TransportRetries: observability.Some(int64(transportRetries)),
 				TranslationUS: observability.Some(translationDuration.Microseconds()), DownstreamBlockedUS: observability.Some(downstreamBlockedDuration.Microseconds()),
 				TransactionalPolicy: observability.TransactionalPolicy(transactionalPolicy.name()),
+				AttemptStateTo:      observability.WebsocketAttemptState(attemptMachine.current().String()),
 			}, nil)
 			if sess != nil {
 				sess.clearActive(readCh)
@@ -899,7 +965,20 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					reconnected, errDialRetry := e.reconnectCodexWebsocket(codexReconnectRequest{
 						ctx: ctx, auth: auth, session: sess, currentConn: conn, currentRead: readCh,
 						authID: authID, url: wsURL, headers: retryHeaders, executionID: executionSessionID,
-						sessionOverflow: sessionOverflow,
+						sessionOverflow: sessionOverflow, attempt: attemptMachine,
+						discardBuffer: func() error {
+							if bufferedBytes := delivery.bufferedBytes(); bufferedBytes > 0 {
+								helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
+									SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)),
+									Bytes: observability.Some(int64(bufferedBytes)), Reason: "transport_retry", TransactionalPolicy: observability.TransactionalPolicy(transactionalPolicy.name()),
+								}, nil)
+							}
+							return delivery.resetUpstreamAttempt()
+						},
+						resetSemantics: func() error {
+							streamBridge.resetUpstreamAttempt()
+							return nil
+						},
 					})
 					connRetry, respHSRetry, retrySource := reconnected.conn, reconnected.response, reconnected.source
 					if reconnected.read != nil {
@@ -918,7 +997,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							AuthType:  authType,
 							AuthValue: authValue,
 						})
-						errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry)
+						errSendRetry := sendCodexAttemptRequest(attemptMachine, func() error {
+							return writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry)
+						})
 						if errSendRetry == nil {
 							conn = connRetry
 							connectionSource = retrySource
@@ -932,19 +1013,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							sendStartedAt = time.Now()
 							param = nil
 							closeCode = 0
-							if bufferedBytes := delivery.bufferedBytes(); bufferedBytes > 0 {
-								helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
-									SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)),
-									Bytes: observability.Some(int64(bufferedBytes)), Reason: "transport_retry", TransactionalPolicy: observability.TransactionalPolicy(transactionalPolicy.name()),
-								}, nil)
-							}
-							streamBridge.resetUpstreamAttempt()
-							if errReset := delivery.resetUpstreamAttempt(); errReset != nil {
-								terminateReason = "transaction_reset_error"
-								terminateErr = errReset
-								_ = delivery.send(cliproxyexecutor.StreamChunk{Err: errReset})
-								return
-							}
 							speculativeAgentCalls = make(map[string]struct{})
 							retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
 							retryAttributes.ConnectionSource = string(retrySource)
@@ -1086,8 +1154,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				eventType = "response.completed"
 				streamEvent.Type = eventType
 			}
-			if boundary, commit := transactionalPolicy.commitBefore(streamEvent); commit && delivery.buffering() {
-				if !delivery.flush(boundary) {
+			decision := transactionalPolicy.decide(streamEvent)
+			if decision.CommitBefore && delivery.buffering() {
+				if !delivery.flush(decision.Boundary) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					return

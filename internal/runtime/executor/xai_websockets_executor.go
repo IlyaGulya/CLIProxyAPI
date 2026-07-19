@@ -492,7 +492,10 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	var readCh chan codexWebsocketRead
 	if sess != nil {
 		readCh = make(chan codexWebsocketRead, 4096)
-		sess.setActive(readCh)
+		if errActivate := sess.setActive(readCh); errActivate != nil {
+			sess.reqMu.Unlock()
+			return nil, fmt.Errorf("activate xai websocket reader: %w", errActivate)
+		}
 	}
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
@@ -510,6 +513,12 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					return nil, xaiStatusErr(respHSRetry.StatusCode, bodyErrRetry)
 				}
 				return nil, errDialRetry
+			}
+			sess.clearActive(readCh)
+			readCh = make(chan codexWebsocketRead, 4096)
+			if errActivate := sess.setActive(readCh); errActivate != nil {
+				sess.reqMu.Unlock()
+				return nil, fmt.Errorf("activate xai websocket retry reader: %w", errActivate)
 			}
 			wsReqBodyRetry := buildXAIWebsocketRequestBody(prepared.body)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
@@ -943,6 +952,10 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	readerConn := sess.readerConn
 	sess.connMu.Unlock()
 	if conn != nil {
+		if sess.lifecycle.state() == codexSessionIdle {
+			sess.applyLifecycle(codexEventDialRequested)
+			sess.applyLifecycle(codexEventConnected)
+		}
 		if readerConn != conn {
 			sess.connMu.Lock()
 			sess.readerConn = conn
@@ -953,8 +966,10 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 		return conn, nil, nil
 	}
 
+	sess.applyLifecycle(codexEventDialRequested)
 	conn, resp, errDial := e.dialXAIWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
+		sess.applyLifecycle(codexEventTransportFailed)
 		return nil, resp, errDial
 	}
 
@@ -976,6 +991,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	configureXAIWebsocketConn(sess, conn)
 	go e.readUpstreamLoop(sess, conn)
 	logXAIWebsocketConnected(sess.sessionID, authID, wsURL)
+	sess.applyLifecycle(codexEventConnected)
 	return conn, resp, nil
 }
 

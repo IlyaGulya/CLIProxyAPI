@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -240,6 +241,30 @@ func TestCodexStreamDeliveryCompletionCommitsTransaction(t *testing.T) {
 	}
 }
 
+func TestCodexStreamDeliveryPolicyOwnsOverflowFailure(t *testing.T) {
+	t.Parallel()
+	var delivered []cliproxyexecutor.StreamChunk
+	policy := codexTransactionalStreamPolicy{
+		mode: codexTransactionalRootUntilSemanticOutput, maxBytes: 3, overflowAction: codexOverflowFail,
+	}
+	delivery, err := newCodexStreamDelivery(policy, func(chunk cliproxyexecutor.StreamChunk) bool {
+		delivered = append(delivered, chunk)
+		return true
+	}, codexStreamDeliveryHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !delivery.send(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}) || !delivery.send(cliproxyexecutor.StreamChunk{Payload: []byte("de")}) {
+		t.Fatal("delivery unexpectedly stopped")
+	}
+	if len(delivered) != 1 || delivered[0].Err == nil || len(delivered[0].Payload) != 0 {
+		t.Fatalf("delivered = %+v, want one terminal overflow error and no buffered payload", delivered)
+	}
+	if got := delivery.state(); got != codexTransactionDiscarded {
+		t.Fatalf("state = %s, want discarded", got)
+	}
+}
+
 func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 	t.Parallel()
 	if !newCodexTransactionalPolicy("claude", "agent", false).enabled() {
@@ -264,7 +289,7 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		`{"type":"response.output_item.added","item":{"type":"function_call"}}`,
 		`{"type":"response.output_item.added","item":{"type":"custom_tool_call"}}`,
 	} {
-		if boundary, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(classifyCodexStreamEvent([]byte(payload))); !ok || boundary != codexCommitSemanticOutput {
+		if decision := newCodexTransactionalPolicy("claude", "", false).decide(classifyCodexStreamEvent([]byte(payload))); !decision.CommitBefore || decision.Boundary != codexCommitSemanticOutput {
 			t.Fatalf("expected semantic output boundary: %s", payload)
 		}
 	}
@@ -274,7 +299,7 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
 		`{"type":"response.output_item.added","item":{"type":"message"}}`,
 	} {
-		if _, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(classifyCodexStreamEvent([]byte(payload))); ok {
+		if decision := newCodexTransactionalPolicy("claude", "", false).decide(classifyCodexStreamEvent([]byte(payload))); decision.CommitBefore {
 			t.Fatalf("unexpected semantic output boundary: %s", payload)
 		}
 	}
@@ -320,6 +345,98 @@ func TestClassifyCodexStreamEvent(t *testing.T) {
 				t.Fatalf("event = %+v, want kind=%d toolTransition=%d", event, test.kind, test.toolChange)
 			}
 		})
+	}
+}
+
+func TestCodexAttemptReducerHappyPathAndRecovery(t *testing.T) {
+	t.Parallel()
+	state := codexAttemptPrepared
+	steps := []struct {
+		event   codexAttemptEvent
+		want    codexAttemptState
+		actions []codexAttemptAction
+	}{
+		{codexAttemptConnectRequested, codexAttemptConnecting, []codexAttemptAction{codexAttemptDial}},
+		{codexAttemptConnected, codexAttemptReady, nil},
+		{codexAttemptReaderActivated, codexAttemptReady, []codexAttemptAction{codexAttemptActivateReader}},
+		{codexAttemptRequestSent, codexAttemptActive, []codexAttemptAction{codexAttemptSendRequest}},
+		{codexAttemptInterrupted, codexAttemptInterruptedState, []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection}},
+		{codexAttemptRetryApproved, codexAttemptRetrying, []codexAttemptAction{codexAttemptDiscardBuffer, codexAttemptResetSemantics}},
+		{codexAttemptConnectRequested, codexAttemptConnecting, []codexAttemptAction{codexAttemptDial}},
+		{codexAttemptConnected, codexAttemptReady, nil},
+		{codexAttemptReaderActivated, codexAttemptReady, []codexAttemptAction{codexAttemptActivateReader}},
+		{codexAttemptRequestSent, codexAttemptActive, []codexAttemptAction{codexAttemptSendRequest}},
+		{codexAttemptTerminalReceived, codexAttemptCompleted, nil},
+	}
+	for _, step := range steps {
+		transition, err := reduceCodexAttempt(state, step.event)
+		if err != nil {
+			t.Fatalf("reduce(%s, %s): %v", state, step.event, err)
+		}
+		if transition.To != step.want || !slices.Equal(transition.Actions, step.actions) {
+			t.Fatalf("reduce(%s, %s) = %+v, want state=%s actions=%v", state, step.event, transition, step.want, step.actions)
+		}
+		state = transition.To
+	}
+}
+
+func TestCodexAttemptReducerRejectsIllegalTransitions(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		state codexAttemptState
+		event codexAttemptEvent
+	}{
+		{codexAttemptPrepared, codexAttemptRequestSent},
+		{codexAttemptConnecting, codexAttemptTerminalReceived},
+		{codexAttemptCompleted, codexAttemptRetryApproved},
+		{codexAttemptCancelled, codexAttemptConnectRequested},
+	} {
+		if _, err := reduceCodexAttempt(test.state, test.event); !errors.Is(err, errCodexAttemptTransition) {
+			t.Fatalf("reduce(%s, %s) error = %v, want invalid transition", test.state, test.event, err)
+		}
+	}
+}
+
+func TestCodexAttemptActionRunnerPreservesReducerOrder(t *testing.T) {
+	t.Parallel()
+	var got []codexAttemptAction
+	handler := func(action codexAttemptAction) func() error {
+		return func() error {
+			got = append(got, action)
+			return nil
+		}
+	}
+	actions := []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection, codexAttemptDiscardBuffer, codexAttemptResetSemantics, codexAttemptDial, codexAttemptActivateReader, codexAttemptSendRequest}
+	err := runCodexAttemptActions(actions, codexAttemptActionHandlers{
+		Dial: handler(codexAttemptDial), ActivateReader: handler(codexAttemptActivateReader), SendRequest: handler(codexAttemptSendRequest),
+		DetachReader: handler(codexAttemptDetachReader), CloseConnection: handler(codexAttemptCloseConnection),
+		DiscardBuffer: handler(codexAttemptDiscardBuffer), ResetSemantics: handler(codexAttemptResetSemantics),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, actions) {
+		t.Fatalf("action order = %v, want %v", got, actions)
+	}
+	if err := runCodexAttemptActions([]codexAttemptAction{codexAttemptDial}, codexAttemptActionHandlers{}); err == nil {
+		t.Fatal("missing action handler should fail")
+	}
+}
+
+func TestCodexAttemptMachineObservesAcceptedTransitions(t *testing.T) {
+	t.Parallel()
+	var observed []codexAttemptTransition
+	machine := newCodexAttemptMachine(func(transition codexAttemptTransition) {
+		observed = append(observed, transition)
+	})
+	if _, err := machine.apply(codexAttemptConnectRequested); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := machine.apply(codexAttemptRequestSent); !errors.Is(err, errCodexAttemptTransition) {
+		t.Fatalf("illegal transition error = %v", err)
+	}
+	if len(observed) != 1 || observed[0].From != codexAttemptPrepared || observed[0].To != codexAttemptConnecting {
+		t.Fatalf("observed transitions = %+v", observed)
 	}
 }
 

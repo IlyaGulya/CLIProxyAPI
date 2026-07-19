@@ -190,6 +190,27 @@ func TestWebsocketAttributesPreserveExplicitFalseAndZero(t *testing.T) {
 	}
 }
 
+func TestWebsocketAttributesEncodeAttemptTransition(t *testing.T) {
+	t.Parallel()
+	fields := WebsocketAttributes{
+		AttemptStateFrom: WebsocketAttemptState("interrupted"),
+		AttemptStateTo:   WebsocketAttemptState("retrying"),
+		AttemptEvent:     WebsocketAttemptEvent("retry_approved"),
+		AttemptActions:   "discard_buffer.reset_semantics",
+	}.fields()
+	encoded := attributesString(metricAttributes(fields))
+	for _, want := range []string{
+		"attempt.state.from=interrupted",
+		"attempt.state.to=retrying",
+		"attempt.event=retry_approved",
+		"attempt.actions=discard_buffer.reset_semantics",
+	} {
+		if !strings.Contains(encoded, want) {
+			t.Fatalf("attempt transition missing %q: %s", want, encoded)
+		}
+	}
+}
+
 func BenchmarkWebsocketAttributesEncoding(b *testing.B) {
 	attributes := WebsocketAttributes{
 		Model: "gpt-5.6-sol", ConnectionSource: "session_reuse", Success: Some(true),

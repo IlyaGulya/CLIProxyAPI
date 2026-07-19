@@ -16,6 +16,9 @@ const (
 	StreamCommitBoundaryBufferLimit    StreamCommitBoundary = "buffer_limit"
 )
 
+type WebsocketAttemptState string
+type WebsocketAttemptEvent string
+
 // Optional distinguishes an explicitly reported zero value from an attribute
 // that was not measured for an event.
 type Optional[T any] struct {
@@ -47,6 +50,10 @@ type WebsocketAttributes struct {
 	PromptCacheDecision     string
 	TransactionalPolicy     TransactionalPolicy
 	CommitBoundary          StreamCommitBoundary
+	AttemptStateFrom        WebsocketAttemptState
+	AttemptStateTo          WebsocketAttemptState
+	AttemptEvent            WebsocketAttemptEvent
+	AttemptActions          string
 
 	Success             Optional[bool]
 	Reused              Optional[bool]
@@ -127,6 +134,8 @@ func (a WebsocketAttributes) fields() map[string]any {
 		"prompt_cache_scope": a.PromptCacheScope, "prompt_prefix_fingerprint": a.PromptPrefixFingerprint,
 		"prompt_cache_ttl": a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
 		"transactional_policy": string(a.TransactionalPolicy), "commit_boundary": string(a.CommitBoundary),
+		"attempt_state_from": string(a.AttemptStateFrom), "attempt_state_to": string(a.AttemptStateTo),
+		"attempt_event": string(a.AttemptEvent), "attempt_actions": a.AttemptActions,
 	} {
 		if value != "" {
 			fields[key] = value

@@ -638,6 +638,10 @@ func metricAttributes(fields map[string]any) []attribute.KeyValue {
 		"incremental_reset_reason": "incremental.reset_reason",
 		"transactional_policy":     "stream.transaction.policy",
 		"commit_boundary":          "stream.commit.boundary",
+		"attempt_state_from":       "attempt.state.from",
+		"attempt_state_to":         "attempt.state.to",
+		"attempt_event":            "attempt.event",
+		"attempt_actions":          "attempt.actions",
 	} {
 		if value := boundedEnum(text(fields[source])); value != "" {
 			out = append(out, attribute.String(target, value))

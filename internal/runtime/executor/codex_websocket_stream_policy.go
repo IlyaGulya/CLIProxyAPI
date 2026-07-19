@@ -36,8 +36,21 @@ const (
 )
 
 type codexTransactionalStreamPolicy struct {
-	mode     codexTransactionalStreamMode
-	maxBytes int
+	mode           codexTransactionalStreamMode
+	maxBytes       int
+	overflowAction codexBufferOverflowAction
+}
+
+type codexBufferOverflowAction uint8
+
+const (
+	codexOverflowPassthrough codexBufferOverflowAction = iota
+	codexOverflowFail
+)
+
+type codexTransactionDecision struct {
+	CommitBefore bool
+	Boundary     codexStreamCommitBoundary
 }
 
 func newCodexTransactionalPolicy(source, agentID string, downstreamWebsocket bool) codexTransactionalStreamPolicy {
@@ -45,9 +58,9 @@ func newCodexTransactionalPolicy(source, agentID string, downstreamWebsocket boo
 		return codexTransactionalStreamPolicy{mode: codexTransactionalStreamDisabled}
 	}
 	if strings.TrimSpace(agentID) == "" {
-		return codexTransactionalStreamPolicy{mode: codexTransactionalRootUntilSemanticOutput, maxBytes: codexTransactionalRootMaxBytes}
+		return codexTransactionalStreamPolicy{mode: codexTransactionalRootUntilSemanticOutput, maxBytes: codexTransactionalRootMaxBytes, overflowAction: codexOverflowPassthrough}
 	}
-	return codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: codexTransactionalChildMaxBytes}
+	return codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: codexTransactionalChildMaxBytes, overflowAction: codexOverflowPassthrough}
 }
 
 func (p codexTransactionalStreamPolicy) enabled() bool {
@@ -65,17 +78,17 @@ func (p codexTransactionalStreamPolicy) name() string {
 	}
 }
 
-func (p codexTransactionalStreamPolicy) commitBefore(event codexStreamEvent) (codexStreamCommitBoundary, bool) {
+func (p codexTransactionalStreamPolicy) decide(event codexStreamEvent) codexTransactionDecision {
 	if p.mode != codexTransactionalRootUntilSemanticOutput {
-		return "", false
+		return codexTransactionDecision{}
 	}
 	if event.Kind == codexStreamText && event.HasTextDelta {
-		return codexCommitSemanticOutput, true
+		return codexTransactionDecision{CommitBefore: true, Boundary: codexCommitSemanticOutput}
 	}
 	if event.Kind == codexStreamTool && event.ToolTransition == codexToolStarted {
-		return codexCommitSemanticOutput, true
+		return codexTransactionDecision{CommitBefore: true, Boundary: codexCommitSemanticOutput}
 	}
-	return "", false
+	return codexTransactionDecision{}
 }
 
 func isCodexCompletionEvent(eventType string) bool {

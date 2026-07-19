@@ -150,8 +150,7 @@ func TestCodexWebsocketsExecutor_DoesNotEvictActiveSessionAtCapacity(t *testing.
 	if active == nil {
 		t.Fatal("expected active session fixture")
 	}
-	active.setActive(make(chan codexWebsocketRead))
-	t.Cleanup(func() { active.setActive(nil) })
+	activateSessionFixture(t, active)
 
 	if overflow := exec.getOrCreateSession("claude-code:overflow"); overflow != nil {
 		t.Fatalf("expected one-shot fallback at active capacity, got %#v", overflow)
@@ -274,14 +273,9 @@ func TestCodexWebsocketsExecutor_RejectsOverflowAcrossFourHundredAgentSessions(t
 		if sess == nil {
 			t.Fatalf("active session %d was rejected below capacity", index)
 		}
-		sess.setActive(make(chan codexWebsocketRead))
+		activateSessionFixture(t, sess)
 		active = append(active, sess)
 	}
-	t.Cleanup(func() {
-		for _, sess := range active {
-			sess.setActive(nil)
-		}
-	})
 
 	var accepted atomic.Int32
 	var wg sync.WaitGroup
@@ -304,4 +298,14 @@ func TestCodexWebsocketsExecutor_RejectsOverflowAcrossFourHundredAgentSessions(t
 	if count != maxSessions {
 		t.Fatalf("stored sessions = %d, want %d", count, maxSessions)
 	}
+}
+
+func activateSessionFixture(t *testing.T, session *codexWebsocketSession) {
+	t.Helper()
+	session.applyLifecycle(codexEventDialRequested)
+	session.applyLifecycle(codexEventConnected)
+	if err := session.setActive(make(chan codexWebsocketRead)); err != nil {
+		t.Fatalf("activate session fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = session.setActive(nil) })
 }

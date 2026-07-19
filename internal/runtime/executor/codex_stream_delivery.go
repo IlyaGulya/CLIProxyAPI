@@ -182,6 +182,7 @@ type codexStreamDeliveryHooks struct {
 type codexStreamDelivery struct {
 	deliver     func(cliproxyexecutor.StreamChunk) bool
 	hooks       codexStreamDeliveryHooks
+	policy      codexTransactionalStreamPolicy
 	transaction codexTransactionalStream
 }
 
@@ -190,7 +191,7 @@ func newCodexStreamDelivery(policy codexTransactionalStreamPolicy, deliver func(
 		return nil, errCodexStreamDelivererRequired
 	}
 	return &codexStreamDelivery{
-		deliver: deliver, hooks: hooks,
+		deliver: deliver, hooks: hooks, policy: policy,
 		transaction: newCodexTransactionalStream(policy),
 	}, nil
 }
@@ -238,6 +239,9 @@ func (d *codexStreamDelivery) send(chunk cliproxyexecutor.StreamChunk) bool {
 	case codexStageOverflow:
 		if d.hooks.Overflowed != nil {
 			d.hooks.Overflowed(d.transaction.bytes + len(chunk.Payload))
+		}
+		if d.policy.overflowAction == codexOverflowFail {
+			return d.send(cliproxyexecutor.StreamChunk{Err: fmt.Errorf("codex transactional stream exceeded %d-byte buffer", d.transaction.maxBytes)})
 		}
 		if !d.apply(codexTransactionOverflow) {
 			return false
