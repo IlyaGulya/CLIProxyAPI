@@ -702,38 +702,25 @@ func TestCodexWebsocketsExecuteStreamRecoversChildDisconnectBeforeTransactionalC
 }
 
 func TestCodexWebsocketsExecuteStreamRecoversRootDisconnectBeforeSemanticOutput(t *testing.T) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	var connections atomic.Int32
 	releaseRecoveredConnection := make(chan struct{})
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseRecoveredConnection) }) })
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
-		if errUpgrade != nil {
-			t.Errorf("upgrade websocket: %v", errUpgrade)
-			return
-		}
-		connection := connections.Add(1)
-		defer func() { _ = conn.Close() }()
-		if _, _, errRead := conn.ReadMessage(); errRead != nil {
-			t.Errorf("read websocket request: %v", errRead)
-			return
-		}
-		if connection == 1 {
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-interrupted","model":"gpt-5.6-sol"}}`))
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.reasoning_summary_text.delta","item_id":"rs-interrupted","output_index":0,"summary_index":0,"delta":"unfinished reasoning"}`))
-			_ = conn.UnderlyingConn().Close()
-			return
-		}
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-sol"}}`))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","item_id":"msg-recovered","output_index":0,"content_index":0,"delta":"recovered answer"}`))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-sol","output":[{"id":"msg-recovered","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"recovered answer","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
-		<-releaseRecoveredConnection
-	}))
-	defer server.Close()
+	upstream := newCodexScriptedUpstream(t,
+		[]codexWebsocketScriptStep{
+			codexSend(`{"type":"response.created","response":{"id":"resp-interrupted","model":"gpt-5.6-sol"}}`),
+			codexSend(`{"type":"response.reasoning_summary_text.delta","item_id":"rs-interrupted","output_index":0,"summary_index":0,"delta":"unfinished reasoning"}`),
+			codexDisconnect1006(),
+		},
+		[]codexWebsocketScriptStep{
+			codexSend(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-sol"}}`),
+			codexSend(`{"type":"response.output_text.delta","item_id":"msg-recovered","output_index":0,"content_index":0,"delta":"recovered answer"}`),
+			codexSend(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-sol","output":[{"id":"msg-recovered","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"recovered answer","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`),
+			codexWait(releaseRecoveredConnection),
+		},
+	)
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll, RequestLog: true}})
-	auth := &cliproxyauth.Auth{ID: "auth-root-recovery", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	auth := &cliproxyauth.Auth{ID: "auth-root-recovery", Attributes: map[string]string{"api_key": "sk-test", "base_url": upstream.URL()}}
 	payload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"recover root"}],"max_tokens":128,"stream":true}`)
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
@@ -753,7 +740,7 @@ func TestCodexWebsocketsExecuteStreamRecoversRootDisconnectBeforeSemanticOutput(
 		}
 		downstream.Write(chunk.Payload)
 	}
-	if got := connections.Load(); got != 2 {
+	if got := upstream.Connections(); got != 2 {
 		t.Fatalf("connections = %d, want one fresh connection for recovery", got)
 	}
 	if got := strings.Count(downstream.String(), `event: message_start`); got != 1 {

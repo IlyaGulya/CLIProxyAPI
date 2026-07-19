@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gorilla/websocket"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -437,6 +438,27 @@ func TestCodexAttemptMachineObservesAcceptedTransitions(t *testing.T) {
 	}
 	if len(observed) != 1 || observed[0].From != codexAttemptPrepared || observed[0].To != codexAttemptConnecting {
 		t.Fatalf("observed transitions = %+v", observed)
+	}
+}
+
+func TestConnectCodexStreamAttemptOwnsDialStateTransitions(t *testing.T) {
+	t.Parallel()
+	machine := newCodexAttemptMachine()
+	result, err := connectCodexStreamAttempt(machine, func(result *codexAttemptConnection) error {
+		result.conn = &websocket.Conn{}
+		result.source = codexWebsocketConnectionCold
+		return nil
+	})
+	if err != nil || result.conn == nil || machine.current() != codexAttemptReady {
+		t.Fatalf("connection = %+v, state = %s, error = %v", result, machine.current(), err)
+	}
+
+	failed := newCodexAttemptMachine()
+	if _, err = connectCodexStreamAttempt(failed, func(*codexAttemptConnection) error { return errors.New("dial failed") }); err == nil {
+		t.Fatal("dial failure was accepted")
+	}
+	if failed.current() != codexAttemptFailed {
+		t.Fatalf("failed state = %s", failed.current())
 	}
 }
 

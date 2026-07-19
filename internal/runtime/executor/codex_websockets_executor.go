@@ -638,42 +638,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var respHS *http.Response
 	var connectionSource codexWebsocketConnectionSource
 	var overflowBaseSource codexWebsocketConnectionSource
-	var errDial error
-	attemptMachine := newCodexAttemptMachine(func(transition codexAttemptTransition) {
-		actions := make([]string, len(transition.Actions))
-		for i, action := range transition.Actions {
-			actions[i] = action.String()
+	attemptMachine := e.newObservedCodexAttempt(ctx, executionSessionID, baseModel)
+	attemptConnection, errDial := connectCodexStreamAttempt(attemptMachine, func(result *codexAttemptConnection) error {
+		var err error
+		if sessionOverflow {
+			result.conn, respHS, result.overflowBaseSource, err = e.ensureOverflowConnObserved(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
+			result.source = codexWebsocketConnectionOverflow
+		} else {
+			result.conn, respHS, result.source, err = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
 		}
-		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "attempt_transition", observability.WebsocketAttributes{
-			SessionID:        executionSessionID,
-			Model:            baseModel,
-			AttemptStateFrom: observability.WebsocketAttemptState(transition.From.String()),
-			AttemptStateTo:   observability.WebsocketAttemptState(transition.To.String()),
-			AttemptEvent:     observability.WebsocketAttemptEvent(transition.Event.String()),
-			AttemptActions:   strings.Join(actions, "."),
-		}, nil)
+		return err
 	})
-	connecting, errAttempt := attemptMachine.apply(codexAttemptConnectRequested)
-	if errAttempt == nil {
-		errAttempt = runCodexAttemptActions(connecting.Actions, codexAttemptActionHandlers{Dial: func() error {
-			if sessionOverflow {
-				conn, respHS, overflowBaseSource, errDial = e.ensureOverflowConnObserved(ctx, auth, authID, wsURL, wsHeaders, executionSessionID)
-				connectionSource = codexWebsocketConnectionOverflow
-			} else {
-				conn, respHS, connectionSource, errDial = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, wsHeaders)
-			}
-			return errDial
-		}})
-	}
-	if errAttempt != nil && errDial == nil {
-		errDial = errAttempt
-	}
-	if errDial == nil && conn != nil {
-		_, errAttempt = attemptMachine.apply(codexAttemptConnected)
-		if errAttempt != nil {
-			errDial = errAttempt
-		}
-	}
+	conn, connectionSource, overflowBaseSource = attemptConnection.conn, attemptConnection.source, attemptConnection.overflowBaseSource
 	connectionAge, connectionRequestCount := time.Duration(0), int64(1)
 	if errDial == nil && conn != nil && sess != nil {
 		connectionAge, connectionRequestCount = sess.observeConnectionUse(conn)
@@ -719,19 +695,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 	}
 
-	var readCh chan codexWebsocketRead
-	if sess != nil {
-		readCh = make(chan codexWebsocketRead, 4096)
-		activated, errActivate := attemptMachine.apply(codexAttemptReaderActivated)
-		if errActivate == nil {
-			errActivate = runCodexAttemptActions(activated.Actions, codexAttemptActionHandlers{ActivateReader: func() error { return sess.setActive(readCh) }})
-		}
-		if errActivate != nil {
+	readCh, errActivate := activateCodexStreamReader(attemptMachine, sess)
+	if errActivate != nil {
+		if sess != nil {
 			sess.reqMu.Unlock()
-			return nil, fmt.Errorf("activate websocket stream reader: %w", errActivate)
 		}
-	} else {
-		_, _ = attemptMachine.apply(codexAttemptReaderActivated)
+		return nil, fmt.Errorf("activate websocket stream reader: %w", errActivate)
 	}
 
 	transportRetries := 0
