@@ -590,7 +590,7 @@ func TestCodexWebsocketsExecuteStreamRetriesReadDisconnectBeforeDownstreamOutput
 	exec.CloseExecutionSession("claude-code:read-retry")
 }
 
-func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOutput(t *testing.T) {
+func TestCodexWebsocketsExecuteStreamRecoversChildDisconnectBeforeTransactionalCommit(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var connections atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -599,10 +599,22 @@ func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOu
 			t.Errorf("upgrade websocket: %v", errUpgrade)
 			return
 		}
-		connections.Add(1)
+		connection := connections.Add(1)
 		defer func() { _ = conn.Close() }()
 		if _, _, errRead := conn.ReadMessage(); errRead != nil {
 			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		if connection == 2 {
+			created := []byte(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-luna"}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, created); errWrite != nil {
+				t.Errorf("write recovered created: %v", errWrite)
+				return
+			}
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-luna","output":[{"id":"fc-recovered","type":"function_call","call_id":"call-recovered","name":"Edit","arguments":"{\"file_path\":\"README.md\"}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				t.Errorf("write recovered completion: %v", errWrite)
+			}
 			return
 		}
 		created := []byte(`{"type":"response.created","response":{"id":"resp-partial","model":"gpt-5.6-luna"}}`)
@@ -643,24 +655,27 @@ func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOu
 	if errExecute != nil {
 		t.Fatalf("ExecuteStream() error = %v", errExecute)
 	}
-	payloadChunks := 0
+	var downstream strings.Builder
 	errorChunks := 0
 	for chunk := range result.Chunks {
 		if len(chunk.Payload) > 0 {
-			payloadChunks++
+			downstream.Write(chunk.Payload)
 		}
 		if chunk.Err != nil {
 			errorChunks++
 		}
 	}
-	if payloadChunks == 0 {
-		t.Fatal("expected downstream output before disconnect")
+	if errorChunks != 0 {
+		t.Fatalf("error chunks = %d, want recovery without a downstream error", errorChunks)
 	}
-	if errorChunks != 1 {
-		t.Fatalf("error chunks = %d, want exactly one", errorChunks)
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("connections = %d, want one fresh connection for recovery", got)
 	}
-	if got := connections.Load(); got != 1 {
-		t.Fatalf("connections = %d, want no replay after downstream output", got)
+	if got := strings.Count(downstream.String(), `event: message_start`); got != 1 {
+		t.Fatalf("message_start count = %d, want exactly one; stream=%s", got, downstream.String())
+	}
+	if !strings.Contains(downstream.String(), `"type":"message_stop"`) {
+		t.Fatalf("recovered stream did not complete: %s", downstream.String())
 	}
 	timelineValue, exists := ginCtx.Get("API_WEBSOCKET_TIMELINE")
 	if !exists {
@@ -668,17 +683,14 @@ func TestCodexWebsocketsExecuteStreamDoesNotRetryReadDisconnectAfterDownstreamOu
 	}
 	timeline := string(timelineValue.([]byte))
 	for _, want := range []string{
+		`"name":"transactional_stream_discarded"`,
+		`"reason":"transport_retry"`,
+		`"name":"transactional_stream_committed"`,
 		`"name":"request_finished"`,
-		`"reason":"read_error"`,
-		`"close_code":1006`,
-		`"last_event_type":"response.function_call_arguments.delta"`,
-		`"tool_call_started":true`,
-		`"tool_call_completed":false`,
-		`"tool_call_in_progress":true`,
-		`"tool_calls_started":1`,
-		`"tool_calls_completed":0`,
-		`"tool_calls_incomplete":1`,
+		`"reason":"completed"`,
+		`"tool_calls_incomplete":0`,
 		`"downstream_committed":true`,
+		`"transport_retries":1`,
 		`"connection_request_count":1`,
 	} {
 		if !strings.Contains(timeline, want) {
@@ -704,6 +716,62 @@ func TestCodexWebsocketConnectionObservationTracksReuse(t *testing.T) {
 	if resetCount != 1 {
 		t.Fatalf("new connection count = %d, want 1", resetCount)
 	}
+}
+
+func TestCodexWebsocketsExecuteStreamDiscardsTransactionalPayloadWhenRecoveryFails(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-doomed","model":"gpt-5.6-luna"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}`))
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-transaction-fails", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"fail safely"}],"max_tokens":128,"stream":true}`)
+	headers := http.Header{helps.ClaudeCodeSessionHeader: []string{"failed-root"}, helps.ClaudeCodeAgentHeader: []string{"failed-agent"}}
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload, Headers: headers,
+		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:transaction-fails"},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	payloadChunks, errorChunks := 0, 0
+	var terminalErr error
+	for chunk := range result.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloadChunks++
+		}
+		if chunk.Err != nil {
+			errorChunks++
+			terminalErr = chunk.Err
+		}
+	}
+	if payloadChunks != 0 || errorChunks != 1 {
+		t.Fatalf("payload/error chunks = %d/%d, want 0/1", payloadChunks, errorChunks)
+	}
+	statusCarrier, ok := terminalErr.(interface{ StatusCode() int })
+	if !ok || statusCarrier.StatusCode() != http.StatusServiceUnavailable || gjson.Get(terminalErr.Error(), "error.code").String() != "partial_response_interrupted" {
+		t.Fatalf("terminal error = %T %v, want structured retryable partial-response error", terminalErr, terminalErr)
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("connections = %d, want initial plus one bounded recovery attempt", got)
+	}
+	exec.CloseExecutionSession("claude-code:transaction-fails")
 }
 
 func TestCodexWebsocketsExecuteStreamStopsAfterOnePreOutputReadRetry(t *testing.T) {
