@@ -128,14 +128,14 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 		return result, errTransition
 	}
 	if _, err := request.attempt.dispatch(codexAttemptConnectRequested, handlers); err != nil {
-		_, _ = request.attempt.apply(codexAttemptFailedEvent)
+		_, _ = request.attempt.commitEvent(codexAttemptFailedEvent)
 		return result, err
 	}
 	if result.conn == nil {
-		_, _ = request.attempt.apply(codexAttemptFailedEvent)
+		_, _ = request.attempt.commitEvent(codexAttemptFailedEvent)
 		return result, fmt.Errorf("codex websocket retry dial returned nil connection")
 	}
-	if _, err := request.attempt.apply(codexAttemptConnected); err != nil {
+	if _, err := request.attempt.commitEvent(codexAttemptConnected); err != nil {
 		return result, err
 	}
 	if _, err := request.attempt.dispatch(codexAttemptRecoveryPrepared, handlers); err != nil {

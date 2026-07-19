@@ -34,5 +34,5 @@ func (s *codexStreamExecution) finalizeAttempt() {
 	} else if s.reason == "context_done" {
 		event = codexAttemptCancelledEvent
 	}
-	_, _ = s.attempt.apply(event)
+	_, _ = s.attempt.commitEvent(event)
 }

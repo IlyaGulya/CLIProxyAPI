@@ -119,13 +119,11 @@ func reduceCodexAttempt(state codexAttemptState, event codexAttemptEvent) (codex
 	case codexAttemptFailedEvent:
 		if !state.terminal() {
 			transition.To = codexAttemptFailed
-			transition.Actions = cleanupCodexAttemptActions(state)
 			return transition, nil
 		}
 	case codexAttemptCancelledEvent:
 		if !state.terminal() {
 			transition.To = codexAttemptCancelled
-			transition.Actions = cleanupCodexAttemptActions(state)
 			return transition, nil
 		}
 	}
@@ -134,13 +132,6 @@ func reduceCodexAttempt(state codexAttemptState, event codexAttemptEvent) (codex
 
 func (s codexAttemptState) terminal() bool {
 	return s == codexAttemptCompleted || s == codexAttemptFailed || s == codexAttemptCancelled
-}
-
-func cleanupCodexAttemptActions(state codexAttemptState) []codexAttemptAction {
-	if state == codexAttemptActive || state == codexAttemptReaderReady || state == codexAttemptInterruptedState {
-		return []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection, codexAttemptDiscardBuffer}
-	}
-	return []codexAttemptAction{codexAttemptDiscardBuffer}
 }
 
 type codexAttemptMachine struct {
@@ -157,10 +148,13 @@ func newCodexAttemptMachine(observers ...func(codexAttemptTransition)) *codexAtt
 	return &codexAttemptMachine{state: codexAttemptPrepared, observer: observer}
 }
 
-func (m *codexAttemptMachine) apply(event codexAttemptEvent) (codexAttemptTransition, error) {
+func (m *codexAttemptMachine) commitEvent(event codexAttemptEvent) (codexAttemptTransition, error) {
 	transition, err := m.plan(event)
 	if err != nil {
 		return transition, err
+	}
+	if len(transition.Actions) != 0 {
+		return transition, fmt.Errorf("%w: event %s requires action dispatch", errCodexAttemptTransition, event)
 	}
 	return transition, m.commit(transition)
 }
@@ -224,30 +218,44 @@ type codexAttemptActionHandlers struct {
 	ResetSemantics  func() error
 }
 
-func runCodexAttemptActions(actions []codexAttemptAction, handlers codexAttemptActionHandlers) error {
+type codexAttemptActionExecutor interface {
+	ExecuteCodexAttemptAction(codexAttemptAction) error
+}
+
+func (h codexAttemptActionHandlers) ExecuteCodexAttemptAction(action codexAttemptAction) error {
+	var handler func() error
+	switch action {
+	case codexAttemptDial:
+		handler = h.Dial
+	case codexAttemptActivateReader:
+		handler = h.ActivateReader
+	case codexAttemptSendRequest:
+		handler = h.SendRequest
+	case codexAttemptDetachReader:
+		handler = h.DetachReader
+	case codexAttemptCloseConnection:
+		handler = h.CloseConnection
+	case codexAttemptDiscardBuffer:
+		handler = h.DiscardBuffer
+	case codexAttemptResetSemantics:
+		handler = h.ResetSemantics
+	}
+	if handler == nil {
+		return fmt.Errorf("codex attempt action %s has no handler", action)
+	}
+	if err := handler(); err != nil {
+		return fmt.Errorf("codex attempt action %s: %w", action, err)
+	}
+	return nil
+}
+
+func runCodexAttemptActions(actions []codexAttemptAction, executor codexAttemptActionExecutor) error {
+	if executor == nil {
+		return fmt.Errorf("codex attempt action executor is nil")
+	}
 	for _, action := range actions {
-		var handler func() error
-		switch action {
-		case codexAttemptDial:
-			handler = handlers.Dial
-		case codexAttemptActivateReader:
-			handler = handlers.ActivateReader
-		case codexAttemptSendRequest:
-			handler = handlers.SendRequest
-		case codexAttemptDetachReader:
-			handler = handlers.DetachReader
-		case codexAttemptCloseConnection:
-			handler = handlers.CloseConnection
-		case codexAttemptDiscardBuffer:
-			handler = handlers.DiscardBuffer
-		case codexAttemptResetSemantics:
-			handler = handlers.ResetSemantics
-		}
-		if handler == nil {
-			return fmt.Errorf("codex attempt action %s has no handler", action)
-		}
-		if err := handler(); err != nil {
-			return fmt.Errorf("codex attempt action %s: %w", action, err)
+		if err := executor.ExecuteCodexAttemptAction(action); err != nil {
+			return err
 		}
 	}
 	return nil

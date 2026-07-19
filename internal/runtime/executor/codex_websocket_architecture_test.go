@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -431,14 +432,25 @@ func TestCodexAttemptMachineObservesAcceptedTransitions(t *testing.T) {
 	machine := newCodexAttemptMachine(func(transition codexAttemptTransition) {
 		observed = append(observed, transition)
 	})
-	if _, err := machine.apply(codexAttemptConnectRequested); err != nil {
+	if _, err := machine.dispatch(codexAttemptConnectRequested, codexAttemptActionHandlers{Dial: func() error { return nil }}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := machine.apply(codexAttemptRequestSent); !errors.Is(err, errCodexAttemptTransition) {
+	if _, err := machine.commitEvent(codexAttemptRequestSent); !errors.Is(err, errCodexAttemptTransition) {
 		t.Fatalf("illegal transition error = %v", err)
 	}
 	if len(observed) != 1 || observed[0].From != codexAttemptPrepared || observed[0].To != codexAttemptConnecting {
 		t.Fatalf("observed transitions = %+v", observed)
+	}
+}
+
+func TestCodexAttemptCommitEventRejectsActionfulTransition(t *testing.T) {
+	t.Parallel()
+	machine := newCodexAttemptMachine()
+	if _, err := machine.commitEvent(codexAttemptConnectRequested); !errors.Is(err, errCodexAttemptTransition) {
+		t.Fatalf("commitEvent actionful error = %v", err)
+	}
+	if machine.current() != codexAttemptPrepared {
+		t.Fatalf("state = %s", machine.current())
 	}
 }
 
@@ -458,6 +470,21 @@ func TestConnectCodexStreamAttemptOwnsDialStateTransitions(t *testing.T) {
 	}
 	if failed.current() != codexAttemptFailed {
 		t.Fatalf("failed state = %s", failed.current())
+	}
+}
+
+func TestCodexConnectionLeaseValidatesAndTransfersHandshakeOwnership(t *testing.T) {
+	t.Parallel()
+	response := &http.Response{StatusCode: http.StatusSwitchingProtocols}
+	lease := codexConnectionLease{conn: &websocket.Conn{}, response: response, source: codexWebsocketConnectionCold}
+	if err := lease.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := lease.takeHandshakeResponse(); got != response || lease.response != nil {
+		t.Fatalf("handshake transfer = %p, retained=%p", got, lease.response)
+	}
+	if err := (codexConnectionLease{}).validate(); err == nil {
+		t.Fatal("invalid lease was accepted")
 	}
 }
 
@@ -520,8 +547,9 @@ func TestCodexSessionReaderActivationIsExplicitAndNilFree(t *testing.T) {
 	if err := session.activateReader(nil); err == nil {
 		t.Fatal("nil reader activation was accepted")
 	}
-	if session.activeCh != nil || session.lifecycle.state() != codexSessionIdle {
-		t.Fatalf("nil activation mutated session: channel=%v state=%s", session.activeCh, session.lifecycle.state())
+	reader, _ := session.activeReaderSnapshot()
+	if reader != nil || session.lifecycle.state() != codexSessionIdle {
+		t.Fatalf("nil activation mutated session: channel=%v state=%s", reader, session.lifecycle.state())
 	}
 }
 
@@ -553,6 +581,38 @@ func TestCodexReaderActivationProjectsAttemptIntoBusySession(t *testing.T) {
 	session.deactivateReader(read)
 	if session.lifecycle.state() != codexSessionReady {
 		t.Fatalf("session after deactivation = %s", session.lifecycle.state())
+	}
+}
+
+func TestCodexLifecycleProjectionRejectsDivergence(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		attempt codexAttemptState
+		session codexSessionState
+		reader  bool
+		valid   bool
+	}{
+		{codexAttemptReady, codexSessionReady, false, true},
+		{codexAttemptReaderReady, codexSessionBusy, true, true},
+		{codexAttemptActive, codexSessionReady, true, false},
+		{codexAttemptReady, codexSessionBusy, false, false},
+		{codexAttemptInterruptedState, codexSessionReady, false, true},
+	} {
+		if got := codexLifecycleProjectionValid(test.attempt, test.session, test.reader); got != test.valid {
+			t.Fatalf("projection(%s,%s,%t)=%t", test.attempt, test.session, test.reader, got)
+		}
+	}
+}
+
+func TestProcessCodexStreamEventClassifiesTerminalAndError(t *testing.T) {
+	t.Parallel()
+	completed := processCodexStreamEvent([]byte(`{"type":"response.completed"}`))
+	if !completed.terminal || completed.err != nil || completed.event.Kind != codexStreamTerminal {
+		t.Fatalf("completed = %+v", completed)
+	}
+	failed := processCodexStreamEvent([]byte(`{"type":"error","status":500,"error":{"message":"boom"}}`))
+	if !failed.terminal || failed.err == nil {
+		t.Fatalf("failed = %+v", failed)
 	}
 }
 

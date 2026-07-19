@@ -1049,10 +1049,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 	for {
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			sess.activeMu.Lock()
-			ch := sess.activeCh
-			done := sess.activeDone
-			sess.activeMu.Unlock()
+			ch, done := sess.activeReaderSnapshot()
 			if ch != nil {
 				select {
 				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
@@ -1069,10 +1066,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				errBinary := fmt.Errorf("xai websockets executor: unexpected binary message")
-				sess.activeMu.Lock()
-				ch := sess.activeCh
-				done := sess.activeDone
-				sess.activeMu.Unlock()
+				ch, done := sess.activeReaderSnapshot()
 				if ch != nil {
 					select {
 					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
@@ -1088,10 +1082,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 			continue
 		}
 
-		sess.activeMu.Lock()
-		ch := sess.activeCh
-		done := sess.activeDone
-		sess.activeMu.Unlock()
+		ch, done := sess.activeReaderSnapshot()
 		if ch == nil {
 			continue
 		}

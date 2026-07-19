@@ -163,10 +163,24 @@ func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Cont
 }
 
 func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForFanout(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, toolName string) {
-	e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, warmupTemplate, "fanout_tool", toolName)
+	e.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: ctx, auth: auth, authID: authID, url: wsURL, headers: headers, sessionID: sessionID, warmupTemplate: warmupTemplate, trigger: "fanout_tool", toolName: toolName})
 }
 
-func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForTrigger(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, trigger string, toolName string) {
+type codexPreconnectRequest struct {
+	ctx            context.Context
+	auth           *cliproxyauth.Auth
+	authID         string
+	url            string
+	headers        http.Header
+	sessionID      string
+	warmupTemplate []byte
+	trigger        string
+	toolName       string
+}
+
+func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectRequest(request codexPreconnectRequest) {
+	ctx, auth, authID, wsURL, headers := request.ctx, request.auth, request.authID, request.url, request.headers
+	sessionID, warmupTemplate, trigger, toolName := request.sessionID, request.warmupTemplate, request.trigger, request.toolName
 	enabled, maxIdle, ttl := e.speculativePreconnectSettings()
 	if !enabled || auth == nil || strings.TrimSpace(authID) == "" || strings.TrimSpace(wsURL) == "" {
 		return
@@ -332,7 +346,7 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 		PoolIdle: observability.Some(int64(take.observation.idle)), PoolDialing: observability.Some(int64(take.observation.dialing)),
 	}, nil)
 	if e.cfg != nil && e.cfg.CodexWebsocketPreconnectReplenish {
-		e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, nil, "lease_replenish", "")
+		e.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: ctx, auth: auth, authID: authID, url: wsURL, headers: headers, sessionID: sessionID, trigger: "lease_replenish"})
 	}
 	return take.conn
 }

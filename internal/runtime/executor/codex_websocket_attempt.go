@@ -25,6 +25,12 @@ func (e *CodexWebsocketsExecutor) newObservedCodexAttempt(ctx context.Context, s
 			AttemptEvent:     observability.WebsocketAttemptEvent(transition.Event.String()),
 			AttemptActions:   strings.Join(actions, "."),
 		}, nil)
+		for _, action := range transition.Actions {
+			helps.RecordAPIWebsocketEvent(ctx, e.cfg, "attempt_action", observability.WebsocketAttributes{
+				SessionID: sessionID, Model: model, Reason: action.String(),
+				AttemptEvent: observability.WebsocketAttemptEvent(transition.Event.String()),
+			}, nil)
+		}
 	})
 }
 
@@ -35,6 +41,25 @@ type codexConnectionLease struct {
 	overflowBaseSource codexWebsocketConnectionSource
 }
 
+func (l codexConnectionLease) validate() error {
+	if l.conn == nil {
+		return fmt.Errorf("codex websocket connection lease has no connection")
+	}
+	if l.source == "" {
+		return fmt.Errorf("codex websocket connection lease has no source")
+	}
+	return nil
+}
+
+func (l *codexConnectionLease) takeHandshakeResponse() *http.Response {
+	if l == nil {
+		return nil
+	}
+	response := l.response
+	l.response = nil
+	return response
+}
+
 func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func() (codexConnectionLease, error)) (codexConnectionLease, error) {
 	result := codexConnectionLease{}
 	_, err := attempt.dispatch(codexAttemptConnectRequested, codexAttemptActionHandlers{Dial: func() error {
@@ -42,14 +67,14 @@ func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func() (codexC
 		result, errDial = dial()
 		return errDial
 	}})
-	if err == nil && result.conn == nil {
-		err = fmt.Errorf("codex websocket dial returned nil connection")
+	if err == nil {
+		err = result.validate()
 	}
 	if err != nil {
-		_, _ = attempt.apply(codexAttemptFailedEvent)
+		_, _ = attempt.commitEvent(codexAttemptFailedEvent)
 		return result, err
 	}
-	if _, err = attempt.apply(codexAttemptConnected); err != nil {
+	if _, err = attempt.commitEvent(codexAttemptConnected); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -78,15 +103,30 @@ func validateCodexReaderLifecycle(attempt *codexAttemptMachine, session *codexWe
 	if attempt == nil || session == nil {
 		return nil
 	}
-	state := attempt.current()
-	if state != codexAttemptReaderReady && state != codexAttemptActive {
-		return nil
-	}
-	session.activeMu.Lock()
-	hasReader := session.activeCh != nil
-	session.activeMu.Unlock()
-	if !hasReader || session.lifecycle.state() != codexSessionBusy {
-		return fmt.Errorf("codex lifecycle invariant: attempt=%s session=%s active_reader=%t", state, session.lifecycle.state(), hasReader)
+	reader, _ := session.activeReaderSnapshot()
+	hasReader := reader != nil
+	state, sessionState := attempt.current(), session.lifecycle.state()
+	if !codexLifecycleProjectionValid(state, sessionState, hasReader) {
+		return fmt.Errorf("codex lifecycle invariant: attempt=%s session=%s active_reader=%t", state, sessionState, hasReader)
 	}
 	return nil
+}
+
+func codexLifecycleProjectionValid(attempt codexAttemptState, session codexSessionState, hasReader bool) bool {
+	switch attempt {
+	case codexAttemptPrepared:
+		return !hasReader && (session == codexSessionIdle || session == codexSessionReady)
+	case codexAttemptConnecting:
+		return !hasReader && (session == codexSessionIdle || session == codexSessionDialing || session == codexSessionReady)
+	case codexAttemptReady:
+		return !hasReader && session == codexSessionReady
+	case codexAttemptReaderReady, codexAttemptActive, codexAttemptCompleted:
+		return hasReader && session == codexSessionBusy
+	case codexAttemptInterruptedState, codexAttemptRetrying:
+		return !hasReader && (session == codexSessionIdle || session == codexSessionReady)
+	case codexAttemptFailed, codexAttemptCancelled:
+		return true
+	default:
+		return false
+	}
 }
