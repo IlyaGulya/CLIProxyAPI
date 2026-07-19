@@ -96,7 +96,7 @@ func reduceCodexAttempt(state codexAttemptState, event codexAttemptEvent) (codex
 			return transition, nil
 		}
 	case codexAttemptInterrupted:
-		if state == codexAttemptActive {
+		if state == codexAttemptActive || state == codexAttemptReaderReady {
 			transition.To = codexAttemptInterruptedState
 			transition.Actions = []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection}
 			return transition, nil
@@ -137,7 +137,7 @@ func (s codexAttemptState) terminal() bool {
 }
 
 func cleanupCodexAttemptActions(state codexAttemptState) []codexAttemptAction {
-	if state == codexAttemptActive || state == codexAttemptInterruptedState {
+	if state == codexAttemptActive || state == codexAttemptReaderReady || state == codexAttemptInterruptedState {
 		return []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection, codexAttemptDiscardBuffer}
 	}
 	return []codexAttemptAction{codexAttemptDiscardBuffer}

@@ -495,6 +495,25 @@ func TestCodexAttemptDispatchCommitsOnlyAfterActionsSucceed(t *testing.T) {
 	}
 }
 
+func TestCodexAttemptCanRecoverAfterRequestWriteFails(t *testing.T) {
+	t.Parallel()
+	state := codexAttemptReaderReady
+	for _, step := range []struct {
+		event codexAttemptEvent
+		want  codexAttemptState
+	}{
+		{codexAttemptInterrupted, codexAttemptInterruptedState},
+		{codexAttemptRetryApproved, codexAttemptRetrying},
+		{codexAttemptConnectRequested, codexAttemptConnecting},
+	} {
+		transition, err := reduceCodexAttempt(state, step.event)
+		if err != nil || transition.To != step.want {
+			t.Fatalf("reduce(%s, %s) = %+v, %v", state, step.event, transition, err)
+		}
+		state = transition.To
+	}
+}
+
 func TestCodexSessionReaderActivationIsExplicitAndNilFree(t *testing.T) {
 	t.Parallel()
 	session := &codexWebsocketSession{lifecycle: *newCodexSessionStateMachine()}
@@ -534,6 +553,41 @@ func TestCodexReaderActivationProjectsAttemptIntoBusySession(t *testing.T) {
 	session.deactivateReader(read)
 	if session.lifecycle.state() != codexSessionReady {
 		t.Fatalf("session after deactivation = %s", session.lifecycle.state())
+	}
+}
+
+func TestCodexStreamExecutionClassifiesFinalAttemptState(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		reason string
+		want   codexAttemptState
+	}{
+		{name: "success", reason: "completed", want: codexAttemptCompleted},
+		{name: "cancel", reason: "context_done", want: codexAttemptCancelled},
+		{name: "failure", reason: "read_error", want: codexAttemptFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempt := newCodexAttemptMachine()
+			for _, event := range []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected, codexAttemptReaderActivated, codexAttemptRequestSent} {
+				transition, err := attempt.plan(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = attempt.commit(transition); err != nil {
+					t.Fatal(err)
+				}
+			}
+			execution := newCodexStreamExecution(attempt)
+			execution.fail(test.reason, errors.New(test.reason))
+			if test.reason == "completed" {
+				execution.err = nil
+			}
+			execution.finalizeAttempt()
+			if got := attempt.current(); got != test.want {
+				t.Fatalf("final state = %s, want %s", got, test.want)
+			}
+		})
 	}
 }
 
