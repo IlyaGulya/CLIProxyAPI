@@ -761,15 +761,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var translatedChunks int64
 		var translationDuration time.Duration
 		var downstreamBlockedDuration time.Duration
-		streamBridge := newCodexWebsocketStreamBridge()
 		closeCode := 0
 		speculativeAgentCalls := make(map[string]struct{})
-		transactionalChildStream := from.String() == "claude" &&
-			helps.ExtractClaudeCodeAgentID(ctx, opts.Headers) != "" &&
-			!cliproxyexecutor.DownstreamWebsocket(ctx)
-		bufferedChunks := make([]cliproxyexecutor.StreamChunk, 0, 64)
-		bufferedBytes := 0
-		transactionStartedAt := time.Now()
+		transactionalChildStream := shouldUseCodexTransactionalStream(
+			from.String(), helps.ExtractClaudeCodeAgentID(ctx, opts.Headers), cliproxyexecutor.DownstreamWebsocket(ctx),
+		)
+		streamBridge := newCodexWebsocketStreamBridge(transactionalChildStream)
 
 		defer close(out)
 		defer func() {
@@ -829,53 +826,45 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 		}
 		flushBuffered := func() bool {
-			committedBytes := bufferedBytes
-			for i := range bufferedChunks {
-				if !deliver(bufferedChunks[i]) {
+			drain := streamBridge.drain()
+			for i := range drain.Chunks {
+				if !deliver(drain.Chunks[i]) {
 					return false
 				}
 			}
-			bufferedChunks = bufferedChunks[:0]
-			bufferedBytes = 0
-			if transactionalChildStream && committedBytes > 0 {
+			if transactionalChildStream && drain.Bytes > 0 {
 				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_committed", observability.WebsocketAttributes{
-					SessionID: executionSessionID, Bytes: observability.Some(int64(committedBytes)),
-					DurationUS: observability.Some(time.Since(transactionStartedAt).Microseconds()), Success: observability.Some(true),
+					SessionID: executionSessionID, Bytes: observability.Some(int64(drain.Bytes)),
+					DurationUS: observability.Some(drain.Duration.Microseconds()), Success: observability.Some(true),
 				}, nil)
 			}
 			return true
 		}
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
-			if !transactionalChildStream {
-				return deliver(chunk)
-			}
 			if chunk.Err != nil {
-				if bufferedBytes > 0 {
+				if discardedBytes := streamBridge.discardTransaction(); discardedBytes > 0 {
 					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
-						SessionID: executionSessionID, Bytes: observability.Some(int64(bufferedBytes)), Reason: "terminal_error",
+						SessionID: executionSessionID, Bytes: observability.Some(int64(discardedBytes)), Reason: "terminal_error",
 					}, nil)
 				}
-				bufferedChunks = bufferedChunks[:0]
-				bufferedBytes = 0
 				return deliver(chunk)
 			}
-			if len(chunk.Payload) == 0 {
+			stage := streamBridge.stage(chunk)
+			if stage.Buffered {
 				return true
 			}
-			if bufferedBytes+len(chunk.Payload) > codexTransactionalChildStreamMaxBytes {
+			if stage.Overflow {
+				bufferedBytes := streamBridge.bufferedBytes()
 				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_overflow", observability.WebsocketAttributes{
 					SessionID: executionSessionID, Bytes: observability.Some(int64(bufferedBytes + len(chunk.Payload))), Reason: "buffer_limit",
 				}, nil)
 				if !flushBuffered() {
 					return false
 				}
-				transactionalChildStream = false
+				streamBridge.disableTransaction()
 				return deliver(chunk)
 			}
-			chunk.Payload = bytes.Clone(chunk.Payload)
-			bufferedChunks = append(bufferedChunks, chunk)
-			bufferedBytes += len(chunk.Payload)
-			return true
+			return deliver(chunk)
 		}
 
 		var param any
@@ -963,16 +952,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							sendStartedAt = time.Now()
 							param = nil
 							closeCode = 0
-							streamBridge.resetUpstreamAttempt()
-							if bufferedBytes > 0 {
+							if bufferedBytes := streamBridge.bufferedBytes(); bufferedBytes > 0 {
 								helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
 									SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)),
 									Bytes: observability.Some(int64(bufferedBytes)), Reason: "transport_retry",
 								}, nil)
 							}
-							bufferedChunks = bufferedChunks[:0]
-							bufferedBytes = 0
-							transactionStartedAt = time.Now()
+							streamBridge.resetUpstreamAttempt()
 							speculativeAgentCalls = make(map[string]struct{})
 							retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
 							retryAttributes.ConnectionSource = string(retrySource)
@@ -1009,8 +995,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						DownstreamCommitted: observability.Some(streamBridge.snapshot().DownstreamCommitted),
 					}, nil)
 				}
-				if transactionalChildStream && bufferedBytes > 0 {
-					mappedErr = statusErr{code: http.StatusServiceUnavailable, msg: `{"error":{"message":"upstream transport interrupted before the workflow response committed; retry the workflow turn","type":"server_error","code":"partial_response_interrupted"}}`}
+				if streamBridge.transactionEnabled() && streamBridge.bufferedBytes() > 0 {
+					mappedErr = codexPartialResponseInterruptedError()
 				}
 				terminateReason = "read_error"
 				terminateErr = mappedErr
@@ -1088,10 +1074,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					SinceSendUS: observability.Some(firstOutputTextDeltaAt.Sub(sendStartedAt).Microseconds()),
 				}, nil)
 			}
-			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
+			isTerminalEvent := isCodexCompletionEvent(eventType) || eventType == "error"
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
-				if eventType == "response.completed" || eventType == "response.done" {
+				if isCodexCompletionEvent(eventType) {
 					if detail, ok := helps.ParseCodexUsage(payload); ok {
 						recordCodexWebsocketUsageMetric(ctx, e.cfg, executionSessionID, detail)
 						reporter.Publish(ctx, detail)
@@ -1110,7 +1096,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType = gjson.GetBytes(payload, "type").String()
-			if eventType == "response.completed" || eventType == "response.done" {
+			if isCodexCompletionEvent(eventType) {
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					recordCodexWebsocketUsageMetric(ctx, e.cfg, executionSessionID, detail)
 					reporter.Publish(ctx, detail)
@@ -1121,7 +1107,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
-			if sess != nil && (eventType == "response.completed" || eventType == "response.done") {
+			if sess != nil && isCodexCompletionEvent(eventType) {
 				sess.completeCodexIncrementalRequest(clientPayload)
 			}
 			translateStartedAt := time.Now()
@@ -1136,7 +1122,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					return
 				}
 			}
-			if eventType == "response.completed" || eventType == "response.done" {
+			if isCodexCompletionEvent(eventType) {
 				if !flushBuffered() {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()

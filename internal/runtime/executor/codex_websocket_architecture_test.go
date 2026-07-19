@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func TestCodexSessionStateMachineLegalLifecycle(t *testing.T) {
@@ -104,7 +106,7 @@ func TestCodexRetryPolicyMatrix(t *testing.T) {
 
 func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
 	t.Parallel()
-	bridge := newCodexWebsocketStreamBridge()
+	bridge := newCodexWebsocketStreamBridge(false)
 	bridge.observe([]byte(`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1"}}`))
 	if got := bridge.snapshot(); got.DownstreamCommitted || got.IncompleteToolCalls != 1 {
 		t.Fatalf("before commit snapshot = %+v", got)
@@ -119,6 +121,51 @@ func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
 	got = bridge.snapshot()
 	if !got.DownstreamCommitted || got.ToolCallsStarted != 0 {
 		t.Fatalf("reset erased commit boundary or retained attempt semantics: %+v", got)
+	}
+}
+
+func TestCodexStreamBridgeTransactionalLifecycle(t *testing.T) {
+	t.Parallel()
+	bridge := newCodexWebsocketStreamBridge(true)
+	bridge.transaction.maxBytes = 5
+
+	if staged := bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}); !staged.Buffered || staged.Overflow {
+		t.Fatalf("first stage = %+v, want buffered", staged)
+	}
+	if staged := bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("def")}); staged.Buffered || !staged.Overflow {
+		t.Fatalf("overflow stage = %+v, want overflow without mutation", staged)
+	}
+	if got := bridge.bufferedBytes(); got != 3 {
+		t.Fatalf("buffered bytes = %d, want 3", got)
+	}
+	drain := bridge.drain()
+	if drain.Bytes != 3 || len(drain.Chunks) != 1 || string(drain.Chunks[0].Payload) != "abc" {
+		t.Fatalf("drain = %+v", drain)
+	}
+	bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("xy")})
+	bridge.resetUpstreamAttempt()
+	if bridge.bufferedBytes() != 0 || !bridge.transactionEnabled() {
+		t.Fatal("retry reset must discard the attempt while retaining transactional policy")
+	}
+}
+
+func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
+	t.Parallel()
+	if !shouldUseCodexTransactionalStream("claude", "agent", false) {
+		t.Fatal("Claude child SSE stream should be transactional")
+	}
+	for _, input := range []struct {
+		source, agent string
+		downstream    bool
+	}{{"claude", "", false}, {"claude", "agent", true}, {"openai", "agent", false}} {
+		if shouldUseCodexTransactionalStream(input.source, input.agent, input.downstream) {
+			t.Fatalf("unexpected transactional policy for %+v", input)
+		}
+	}
+	for _, eventType := range []string{"response.completed", "response.done", "response.incomplete"} {
+		if !isCodexCompletionEvent(eventType) {
+			t.Fatalf("%s must terminate and commit the transaction", eventType)
+		}
 	}
 }
 
