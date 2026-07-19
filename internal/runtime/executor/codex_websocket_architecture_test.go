@@ -107,7 +107,7 @@ func TestCodexRetryPolicyMatrix(t *testing.T) {
 
 func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
 	t.Parallel()
-	bridge := newCodexWebsocketStreamBridge(false)
+	bridge := newCodexWebsocketStreamBridge()
 	bridge.observe([]byte(`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1"}}`))
 	if got := bridge.snapshot(); got.DownstreamCommitted || got.IncompleteToolCalls != 1 {
 		t.Fatalf("before commit snapshot = %+v", got)
@@ -125,129 +125,89 @@ func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
 	}
 }
 
-func TestCodexStreamBridgeTransactionalLifecycle(t *testing.T) {
+func TestCodexTransactionalStreamBufferLifecycle(t *testing.T) {
 	t.Parallel()
-	bridge := newCodexWebsocketStreamBridge(true)
-	bridge.transaction.maxBytes = 5
+	transaction := newCodexTransactionalStream(true)
+	transaction.maxBytes = 5
 
-	if staged := bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}); !staged.Buffered || staged.Overflow {
-		t.Fatalf("first stage = %+v, want buffered", staged)
+	if staged := transaction.stage(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}); staged != codexStageBuffered {
+		t.Fatalf("first stage = %v, want buffered", staged)
 	}
-	if staged := bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("def")}); staged.Buffered || !staged.Overflow {
-		t.Fatalf("overflow stage = %+v, want overflow without mutation", staged)
+	if staged := transaction.stage(cliproxyexecutor.StreamChunk{Payload: []byte("def")}); staged != codexStageOverflow {
+		t.Fatalf("overflow stage = %v, want overflow without mutation", staged)
 	}
-	if got := bridge.bufferedBytes(); got != 3 {
+	if got := transaction.bytes; got != 3 {
 		t.Fatalf("buffered bytes = %d, want 3", got)
 	}
-	drain := bridge.drain()
+	drain := transaction.drain()
 	if drain.Bytes != 3 || len(drain.Chunks) != 1 || string(drain.Chunks[0].Payload) != "abc" {
 		t.Fatalf("drain = %+v", drain)
-	}
-	bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("xy")})
-	bridge.resetUpstreamAttempt()
-	if bridge.bufferedBytes() != 0 || !bridge.transactionEnabled() {
-		t.Fatal("retry reset must discard the attempt while retaining transactional policy")
-	}
-}
-
-func TestCodexTransactionalStreamStateTransitions(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name       string
-		transition func(*codexWebsocketStreamBridge)
-		wantState  codexTransactionalState
-		wantStage  codexTransactionalStage
-	}{
-		{
-			name: "commit is terminal",
-			transition: func(bridge *codexWebsocketStreamBridge) {
-				bridge.commitTransaction()
-			},
-			wantState: codexTransactionCommitted,
-		},
-		{
-			name: "discard is terminal",
-			transition: func(bridge *codexWebsocketStreamBridge) {
-				bridge.discardTransaction()
-			},
-			wantState: codexTransactionDiscarded,
-		},
-		{
-			name: "overflow enters passthrough",
-			transition: func(bridge *codexWebsocketStreamBridge) {
-				bridge.transaction.maxBytes = 2
-				if got := bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}); !got.Overflow {
-					t.Fatalf("stage = %+v, want overflow", got)
-				}
-				bridge.enterPassthrough()
-			},
-			wantState: codexTransactionPassthrough,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			bridge := newCodexWebsocketStreamBridge(true)
-			test.transition(bridge)
-			if got := bridge.transactionState(); got != test.wantState {
-				t.Fatalf("state = %q, want %q", got, test.wantState)
-			}
-			if got := bridge.stage(cliproxyexecutor.StreamChunk{Payload: []byte("late")}); got != test.wantStage {
-				t.Fatalf("stage after terminal transition = %+v, want %+v", got, test.wantStage)
-			}
-		})
 	}
 }
 
 func TestCodexTransactionalRetryResetPreservesOnlyBufferingState(t *testing.T) {
 	t.Parallel()
-	buffering := newCodexWebsocketStreamBridge(true)
-	buffering.stage(cliproxyexecutor.StreamChunk{Payload: []byte("attempt")})
-	buffering.resetUpstreamAttempt()
-	if got := buffering.transactionState(); got != codexTransactionBuffering || buffering.bufferedBytes() != 0 {
-		t.Fatalf("buffering retry reset = %q/%d", got, buffering.bufferedBytes())
+	buffering, err := newCodexStreamDelivery(true, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffering.send(cliproxyexecutor.StreamChunk{Payload: []byte("attempt")})
+	if err = buffering.resetUpstreamAttempt(); err != nil {
+		t.Fatal(err)
+	}
+	if got := buffering.state(); got != codexTransactionBuffering || buffering.bufferedBytes() != 0 {
+		t.Fatalf("buffering retry reset = %s/%d", got, buffering.bufferedBytes())
 	}
 
-	passthrough := newCodexWebsocketStreamBridge(true)
-	passthrough.enterPassthrough()
-	passthrough.resetUpstreamAttempt()
-	if got := passthrough.transactionState(); got != codexTransactionPassthrough {
-		t.Fatalf("passthrough retry reset = %q, want passthrough", got)
+	passthrough, err := newCodexStreamDelivery(true, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = passthrough.transaction.apply(codexTransactionOverflow); err != nil {
+		t.Fatal(err)
+	}
+	if err = passthrough.resetUpstreamAttempt(); err != nil {
+		t.Fatal(err)
+	}
+	if got := passthrough.state(); got != codexTransactionPassthrough {
+		t.Fatalf("passthrough retry reset = %s, want passthrough", got)
 	}
 }
 
 func TestCodexNonTransactionalTerminalErrorDoesNotInventTransactionState(t *testing.T) {
 	t.Parallel()
-	bridge := newCodexWebsocketStreamBridge(false)
-	delivery := newCodexStreamDelivery(bridge, codexStreamDeliveryHooks{
-		Deliver: func(cliproxyexecutor.StreamChunk) bool { return true },
-	})
+	delivery, err := newCodexStreamDelivery(false, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !delivery.send(cliproxyexecutor.StreamChunk{Err: errors.New("terminal")}) {
 		t.Fatal("delivery unexpectedly stopped")
 	}
-	if got := bridge.transactionState(); got != codexTransactionDisabled {
-		t.Fatalf("state = %q, want disabled", got)
+	if got := delivery.state(); got != codexTransactionDisabled {
+		t.Fatalf("state = %s, want disabled", got)
 	}
 }
 
 func TestCodexStreamDeliveryOverflowOrdering(t *testing.T) {
 	t.Parallel()
-	bridge := newCodexWebsocketStreamBridge(true)
-	bridge.transaction.maxBytes = 3
 	var delivered []string
 	var overflowBytes int
-	delivery := newCodexStreamDelivery(bridge, codexStreamDeliveryHooks{
-		Deliver: func(chunk cliproxyexecutor.StreamChunk) bool {
-			delivered = append(delivered, string(chunk.Payload))
-			return true
-		},
+	delivery, err := newCodexStreamDelivery(true, func(chunk cliproxyexecutor.StreamChunk) bool {
+		delivered = append(delivered, string(chunk.Payload))
+		return true
+	}, codexStreamDeliveryHooks{
 		Overflowed: func(bytes int) { overflowBytes = bytes },
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery.transaction.maxBytes = 3
 	if !delivery.send(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}) ||
 		!delivery.send(cliproxyexecutor.StreamChunk{Payload: []byte("de")}) {
 		t.Fatal("delivery unexpectedly stopped")
 	}
-	if got := bridge.transactionState(); got != codexTransactionPassthrough {
-		t.Fatalf("state = %q, want passthrough", got)
+	if got := delivery.state(); got != codexTransactionPassthrough {
+		t.Fatalf("state = %s, want passthrough", got)
 	}
 	if overflowBytes != 5 {
 		t.Fatalf("overflow bytes = %d, want 5", overflowBytes)
@@ -259,18 +219,19 @@ func TestCodexStreamDeliveryOverflowOrdering(t *testing.T) {
 
 func TestCodexStreamDeliveryCompletionCommitsTransaction(t *testing.T) {
 	t.Parallel()
-	bridge := newCodexWebsocketStreamBridge(true)
 	var committed codexTransactionalDrain
-	delivery := newCodexStreamDelivery(bridge, codexStreamDeliveryHooks{
-		Deliver:   func(cliproxyexecutor.StreamChunk) bool { return true },
+	delivery, err := newCodexStreamDelivery(true, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{
 		Committed: func(drain codexTransactionalDrain) { committed = drain },
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	delivery.send(cliproxyexecutor.StreamChunk{Payload: []byte("done")})
 	if !delivery.flush() {
 		t.Fatal("flush unexpectedly stopped")
 	}
-	if got := bridge.transactionState(); got != codexTransactionCommitted || committed.Bytes != 4 {
-		t.Fatalf("commit = %q/%d", got, committed.Bytes)
+	if got := delivery.state(); got != codexTransactionCommitted || committed.Bytes != 4 {
+		t.Fatalf("commit = %s/%d", got, committed.Bytes)
 	}
 }
 
@@ -291,6 +252,52 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		if !isCodexCompletionEvent(eventType) {
 			t.Fatalf("%s must terminate and commit the transaction", eventType)
 		}
+	}
+}
+
+func TestReduceCodexTransactionRejectsIllegalTransitions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		state codexTransactionalState
+		event codexTransactionalEvent
+	}{
+		{codexTransactionDisabled, codexTransactionCommit},
+		{codexTransactionCommitted, codexTransactionDiscard},
+		{codexTransactionDiscarded, codexTransactionOverflow},
+		{codexTransactionPassthrough, codexTransactionCommit},
+	}
+	for _, test := range tests {
+		if _, err := reduceCodexTransaction(test.state, test.event); !errors.Is(err, errCodexTransactionalTransition) {
+			t.Fatalf("reduce(%s, %s) error = %v, want invalid transition", test.state, test.event, err)
+		}
+	}
+}
+
+func TestReduceCodexTransactionDefinesLegalTransitions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		state codexTransactionalState
+		event codexTransactionalEvent
+		want  codexTransactionalState
+	}{
+		{codexTransactionBuffering, codexTransactionCommit, codexTransactionCommitted},
+		{codexTransactionBuffering, codexTransactionDiscard, codexTransactionDiscarded},
+		{codexTransactionBuffering, codexTransactionOverflow, codexTransactionPassthrough},
+		{codexTransactionBuffering, codexTransactionRetryReset, codexTransactionBuffering},
+		{codexTransactionPassthrough, codexTransactionRetryReset, codexTransactionPassthrough},
+	}
+	for _, test := range tests {
+		got, err := reduceCodexTransaction(test.state, test.event)
+		if err != nil || got != test.want {
+			t.Fatalf("reduce(%s, %s) = %s, %v; want %s", test.state, test.event, got, err, test.want)
+		}
+	}
+}
+
+func TestNewCodexStreamDeliveryRejectsNilDeliverer(t *testing.T) {
+	t.Parallel()
+	if _, err := newCodexStreamDelivery(true, nil, codexStreamDeliveryHooks{}); !errors.Is(err, errCodexStreamDelivererRequired) {
+		t.Fatalf("error = %v, want required deliverer", err)
 	}
 }
 

@@ -1,61 +1,264 @@
 package executor
 
-import cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+)
+
+var (
+	errCodexStreamDelivererRequired = errors.New("codex stream deliverer is required")
+	errCodexTransactionalTransition = errors.New("invalid codex transactional stream event")
+)
+
+type codexTransactionalState uint8
+
+const (
+	codexTransactionDisabled codexTransactionalState = iota
+	codexTransactionBuffering
+	codexTransactionPassthrough
+	codexTransactionCommitted
+	codexTransactionDiscarded
+)
+
+func (s codexTransactionalState) String() string {
+	switch s {
+	case codexTransactionDisabled:
+		return "disabled"
+	case codexTransactionBuffering:
+		return "buffering"
+	case codexTransactionPassthrough:
+		return "passthrough"
+	case codexTransactionCommitted:
+		return "committed"
+	case codexTransactionDiscarded:
+		return "discarded"
+	default:
+		return fmt.Sprintf("transaction_state(%d)", s)
+	}
+}
+
+type codexTransactionalEvent uint8
+
+const (
+	codexTransactionCommit codexTransactionalEvent = iota
+	codexTransactionDiscard
+	codexTransactionOverflow
+	codexTransactionRetryReset
+)
+
+func (e codexTransactionalEvent) String() string {
+	switch e {
+	case codexTransactionCommit:
+		return "commit"
+	case codexTransactionDiscard:
+		return "discard"
+	case codexTransactionOverflow:
+		return "overflow"
+	case codexTransactionRetryReset:
+		return "retry_reset"
+	default:
+		return fmt.Sprintf("transaction_event(%d)", e)
+	}
+}
+
+func reduceCodexTransaction(state codexTransactionalState, event codexTransactionalEvent) (codexTransactionalState, error) {
+	switch event {
+	case codexTransactionCommit:
+		if state == codexTransactionBuffering {
+			return codexTransactionCommitted, nil
+		}
+	case codexTransactionDiscard:
+		if state == codexTransactionBuffering {
+			return codexTransactionDiscarded, nil
+		}
+	case codexTransactionOverflow:
+		if state == codexTransactionBuffering {
+			return codexTransactionPassthrough, nil
+		}
+	case codexTransactionRetryReset:
+		if state == codexTransactionDisabled || state == codexTransactionBuffering || state == codexTransactionPassthrough {
+			return state, nil
+		}
+	}
+	return state, fmt.Errorf("%w: %s + %s", errCodexTransactionalTransition, state, event)
+}
+
+type codexStageOutcome uint8
+
+const (
+	codexStagePassthrough codexStageOutcome = iota
+	codexStageBuffered
+	codexStageOverflow
+)
+
+func (o codexStageOutcome) String() string {
+	switch o {
+	case codexStagePassthrough:
+		return "passthrough"
+	case codexStageBuffered:
+		return "buffered"
+	case codexStageOverflow:
+		return "overflow"
+	default:
+		return fmt.Sprintf("stage_outcome(%d)", o)
+	}
+}
+
+type codexTransactionalDrain struct {
+	Chunks   []cliproxyexecutor.StreamChunk
+	Bytes    int
+	Duration time.Duration
+}
+
+type codexTransactionalStream struct {
+	state     codexTransactionalState
+	maxBytes  int
+	chunks    []cliproxyexecutor.StreamChunk
+	bytes     int
+	startedAt time.Time
+}
+
+func newCodexTransactionalStream(enabled bool) codexTransactionalStream {
+	state := codexTransactionDisabled
+	if enabled {
+		state = codexTransactionBuffering
+	}
+	return codexTransactionalStream{
+		state: state, maxBytes: codexTransactionalChildStreamMaxBytes,
+		chunks: make([]cliproxyexecutor.StreamChunk, 0, 64), startedAt: time.Now(),
+	}
+}
+
+func (t *codexTransactionalStream) apply(event codexTransactionalEvent) error {
+	next, err := reduceCodexTransaction(t.state, event)
+	if err != nil {
+		return err
+	}
+	t.state = next
+	return nil
+}
+
+func (t *codexTransactionalStream) stage(chunk cliproxyexecutor.StreamChunk) codexStageOutcome {
+	if t.state != codexTransactionBuffering || len(chunk.Payload) == 0 {
+		return codexStagePassthrough
+	}
+	if t.bytes+len(chunk.Payload) > t.maxBytes {
+		return codexStageOverflow
+	}
+	chunk.Payload = bytes.Clone(chunk.Payload)
+	t.chunks = append(t.chunks, chunk)
+	t.bytes += len(chunk.Payload)
+	return codexStageBuffered
+}
+
+func (t *codexTransactionalStream) drain() codexTransactionalDrain {
+	drain := codexTransactionalDrain{Chunks: t.chunks, Bytes: t.bytes, Duration: time.Since(t.startedAt)}
+	t.chunks = make([]cliproxyexecutor.StreamChunk, 0, 64)
+	t.bytes = 0
+	return drain
+}
+
+func (t *codexTransactionalStream) discardBuffer() int {
+	discardedBytes := t.bytes
+	t.chunks = t.chunks[:0]
+	t.bytes = 0
+	t.startedAt = time.Now()
+	return discardedBytes
+}
 
 type codexStreamDeliveryHooks struct {
-	Deliver    func(cliproxyexecutor.StreamChunk) bool
 	Committed  func(codexTransactionalDrain)
 	Discarded  func(int)
 	Overflowed func(int)
 }
 
-// codexStreamDelivery owns the ordering between transactional buffering and
-// irreversible downstream delivery. Observability stays outside through hooks.
+// codexStreamDelivery exclusively owns transactional buffering and the order
+// in which buffered chunks cross the irreversible downstream commit boundary.
 type codexStreamDelivery struct {
-	bridge *codexWebsocketStreamBridge
-	hooks  codexStreamDeliveryHooks
+	deliver     func(cliproxyexecutor.StreamChunk) bool
+	hooks       codexStreamDeliveryHooks
+	transaction codexTransactionalStream
 }
 
-func newCodexStreamDelivery(bridge *codexWebsocketStreamBridge, hooks codexStreamDeliveryHooks) *codexStreamDelivery {
-	return &codexStreamDelivery{bridge: bridge, hooks: hooks}
+func newCodexStreamDelivery(transactional bool, deliver func(cliproxyexecutor.StreamChunk) bool, hooks codexStreamDeliveryHooks) (*codexStreamDelivery, error) {
+	if deliver == nil {
+		return nil, errCodexStreamDelivererRequired
+	}
+	return &codexStreamDelivery{
+		deliver: deliver, hooks: hooks,
+		transaction: newCodexTransactionalStream(transactional),
+	}, nil
+}
+
+func (d *codexStreamDelivery) apply(event codexTransactionalEvent) bool {
+	if err := d.transaction.apply(event); err != nil {
+		_ = d.deliver(cliproxyexecutor.StreamChunk{Err: err})
+		return false
+	}
+	return true
 }
 
 func (d *codexStreamDelivery) flush() bool {
-	drain := d.bridge.drain()
+	drain := d.transaction.drain()
 	for i := range drain.Chunks {
-		if !d.hooks.Deliver(drain.Chunks[i]) {
+		if !d.deliver(drain.Chunks[i]) {
 			return false
 		}
 	}
 	if drain.Bytes > 0 && d.hooks.Committed != nil {
 		d.hooks.Committed(drain)
 	}
-	if d.bridge.transactionState() == codexTransactionBuffering {
-		d.bridge.commitTransaction()
+	if d.transaction.state == codexTransactionBuffering {
+		return d.apply(codexTransactionCommit)
 	}
 	return true
 }
 
 func (d *codexStreamDelivery) send(chunk cliproxyexecutor.StreamChunk) bool {
 	if chunk.Err != nil {
-		if discardedBytes := d.bridge.discardTransaction(); discardedBytes > 0 && d.hooks.Discarded != nil {
-			d.hooks.Discarded(discardedBytes)
+		if d.transaction.state == codexTransactionBuffering {
+			discardedBytes := d.transaction.discardBuffer()
+			if !d.apply(codexTransactionDiscard) {
+				return false
+			}
+			if discardedBytes > 0 && d.hooks.Discarded != nil {
+				d.hooks.Discarded(discardedBytes)
+			}
 		}
-		return d.hooks.Deliver(chunk)
+		return d.deliver(chunk)
 	}
-	stage := d.bridge.stage(chunk)
-	if stage.Buffered {
+	switch d.transaction.stage(chunk) {
+	case codexStageBuffered:
 		return true
-	}
-	if stage.Overflow {
-		bufferedBytes := d.bridge.bufferedBytes()
+	case codexStageOverflow:
 		if d.hooks.Overflowed != nil {
-			d.hooks.Overflowed(bufferedBytes + len(chunk.Payload))
+			d.hooks.Overflowed(d.transaction.bytes + len(chunk.Payload))
 		}
-		d.bridge.enterPassthrough()
+		if !d.apply(codexTransactionOverflow) {
+			return false
+		}
 		if !d.flush() {
 			return false
 		}
 	}
-	return d.hooks.Deliver(chunk)
+	return d.deliver(chunk)
 }
+
+func (d *codexStreamDelivery) resetUpstreamAttempt() error {
+	if d.transaction.state == codexTransactionBuffering {
+		d.transaction.discardBuffer()
+	}
+	return d.transaction.apply(codexTransactionRetryReset)
+}
+
+func (d *codexStreamDelivery) state() codexTransactionalState { return d.transaction.state }
+
+func (d *codexStreamDelivery) buffering() bool {
+	return d.transaction.state == codexTransactionBuffering
+}
+
+func (d *codexStreamDelivery) bufferedBytes() int { return d.transaction.bytes }

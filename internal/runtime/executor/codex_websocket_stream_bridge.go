@@ -1,11 +1,8 @@
 package executor
 
 import (
-	"bytes"
 	"strings"
-	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
@@ -50,36 +47,6 @@ func (s codexWebsocketSemanticState) incompleteToolCalls() int64 {
 type codexWebsocketStreamBridge struct {
 	semantic            codexWebsocketSemanticState
 	downstreamCommitted bool
-	transaction         codexTransactionalStream
-}
-
-type codexTransactionalStream struct {
-	state     codexTransactionalState
-	maxBytes  int
-	chunks    []cliproxyexecutor.StreamChunk
-	bytes     int
-	startedAt time.Time
-}
-
-type codexTransactionalState uint8
-
-const (
-	codexTransactionDisabled codexTransactionalState = iota
-	codexTransactionBuffering
-	codexTransactionPassthrough
-	codexTransactionCommitted
-	codexTransactionDiscarded
-)
-
-type codexTransactionalStage struct {
-	Buffered bool
-	Overflow bool
-}
-
-type codexTransactionalDrain struct {
-	Chunks   []cliproxyexecutor.StreamChunk
-	Bytes    int
-	Duration time.Duration
 }
 
 type codexWebsocketStreamSnapshot struct {
@@ -90,17 +57,8 @@ type codexWebsocketStreamSnapshot struct {
 	IncompleteToolCalls int64
 }
 
-func newCodexWebsocketStreamBridge(transactional bool) *codexWebsocketStreamBridge {
-	state := codexTransactionDisabled
-	if transactional {
-		state = codexTransactionBuffering
-	}
-	return &codexWebsocketStreamBridge{transaction: codexTransactionalStream{
-		state:     state,
-		maxBytes:  codexTransactionalChildStreamMaxBytes,
-		chunks:    make([]cliproxyexecutor.StreamChunk, 0, 64),
-		startedAt: time.Now(),
-	}}
+func newCodexWebsocketStreamBridge() *codexWebsocketStreamBridge {
+	return &codexWebsocketStreamBridge{}
 }
 
 func (b *codexWebsocketStreamBridge) observe(payload []byte) {
@@ -118,82 +76,7 @@ func (b *codexWebsocketStreamBridge) commit(payload []byte) {
 func (b *codexWebsocketStreamBridge) resetUpstreamAttempt() {
 	if b != nil {
 		b.semantic = codexWebsocketSemanticState{}
-		b.transaction.discard()
 	}
-}
-
-func (b *codexWebsocketStreamBridge) stage(chunk cliproxyexecutor.StreamChunk) codexTransactionalStage {
-	if b == nil || b.transaction.state != codexTransactionBuffering || chunk.Err != nil || len(chunk.Payload) == 0 {
-		return codexTransactionalStage{}
-	}
-	if b.transaction.bytes+len(chunk.Payload) > b.transaction.maxBytes {
-		return codexTransactionalStage{Overflow: true}
-	}
-	chunk.Payload = bytes.Clone(chunk.Payload)
-	b.transaction.chunks = append(b.transaction.chunks, chunk)
-	b.transaction.bytes += len(chunk.Payload)
-	return codexTransactionalStage{Buffered: true}
-}
-
-func (b *codexWebsocketStreamBridge) drain() codexTransactionalDrain {
-	if b == nil {
-		return codexTransactionalDrain{}
-	}
-	return b.transaction.drain()
-}
-
-func (b *codexWebsocketStreamBridge) discardTransaction() int {
-	if b == nil || b.transaction.state != codexTransactionBuffering {
-		return 0
-	}
-	discarded := b.transaction.discard()
-	b.transaction.state = codexTransactionDiscarded
-	return discarded
-}
-
-func (b *codexWebsocketStreamBridge) enterPassthrough() {
-	if b != nil && b.transaction.state == codexTransactionBuffering {
-		b.transaction.state = codexTransactionPassthrough
-	}
-}
-
-func (b *codexWebsocketStreamBridge) commitTransaction() {
-	if b != nil && b.transaction.state == codexTransactionBuffering {
-		b.transaction.state = codexTransactionCommitted
-	}
-}
-
-func (b *codexWebsocketStreamBridge) transactionState() codexTransactionalState {
-	if b == nil {
-		return codexTransactionDisabled
-	}
-	return b.transaction.state
-}
-
-func (b *codexWebsocketStreamBridge) transactionEnabled() bool {
-	return b != nil && b.transaction.state == codexTransactionBuffering
-}
-
-func (b *codexWebsocketStreamBridge) bufferedBytes() int {
-	if b == nil {
-		return 0
-	}
-	return b.transaction.bytes
-}
-
-func (t *codexTransactionalStream) drain() codexTransactionalDrain {
-	drain := codexTransactionalDrain{Chunks: t.chunks, Bytes: t.bytes, Duration: time.Since(t.startedAt)}
-	t.chunks = make([]cliproxyexecutor.StreamChunk, 0, 64)
-	t.bytes = 0
-	return drain
-}
-
-func (t *codexTransactionalStream) discard() int {
-	discardedBytes := t.bytes
-	t.chunks = t.chunks[:0]
-	t.bytes = 0
-	t.startedAt = time.Now()
-	return discardedBytes
 }
 
 func (b *codexWebsocketStreamBridge) snapshot() codexWebsocketStreamSnapshot {

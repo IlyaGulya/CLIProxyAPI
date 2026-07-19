@@ -766,7 +766,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		transactionalChildStream := shouldUseCodexTransactionalStream(
 			from.String(), helps.ExtractClaudeCodeAgentID(ctx, opts.Headers), cliproxyexecutor.DownstreamWebsocket(ctx),
 		)
-		streamBridge := newCodexWebsocketStreamBridge(transactionalChildStream)
+		streamBridge := newCodexWebsocketStreamBridge()
 
 		defer close(out)
 		defer func() {
@@ -825,8 +825,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return false
 			}
 		}
-		delivery := newCodexStreamDelivery(streamBridge, codexStreamDeliveryHooks{
-			Deliver: deliver,
+		delivery, errDelivery := newCodexStreamDelivery(transactionalChildStream, deliver, codexStreamDeliveryHooks{
 			Committed: func(drain codexTransactionalDrain) {
 				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_committed", observability.WebsocketAttributes{
 					SessionID: executionSessionID, Bytes: observability.Some(int64(drain.Bytes)),
@@ -844,6 +843,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}, nil)
 			},
 		})
+		if errDelivery != nil {
+			terminateReason = "delivery_configuration_error"
+			terminateErr = errDelivery
+			_ = deliver(cliproxyexecutor.StreamChunk{Err: errDelivery})
+			return
+		}
 
 		var param any
 		for {
@@ -930,13 +935,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							sendStartedAt = time.Now()
 							param = nil
 							closeCode = 0
-							if bufferedBytes := streamBridge.bufferedBytes(); bufferedBytes > 0 {
+							if bufferedBytes := delivery.bufferedBytes(); bufferedBytes > 0 {
 								helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
 									SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)),
 									Bytes: observability.Some(int64(bufferedBytes)), Reason: "transport_retry",
 								}, nil)
 							}
 							streamBridge.resetUpstreamAttempt()
+							if errReset := delivery.resetUpstreamAttempt(); errReset != nil {
+								terminateReason = "transaction_reset_error"
+								terminateErr = errReset
+								_ = delivery.send(cliproxyexecutor.StreamChunk{Err: errReset})
+								return
+							}
 							speculativeAgentCalls = make(map[string]struct{})
 							retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
 							retryAttributes.ConnectionSource = string(retrySource)
@@ -973,7 +984,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						DownstreamCommitted: observability.Some(streamBridge.snapshot().DownstreamCommitted),
 					}, nil)
 				}
-				if streamBridge.transactionEnabled() && streamBridge.bufferedBytes() > 0 {
+				if delivery.buffering() && delivery.bufferedBytes() > 0 {
 					mappedErr = codexPartialResponseInterruptedError()
 				}
 				terminateReason = "read_error"
