@@ -626,24 +626,24 @@ func TestCodexWebsocketPreconnectPoolWaitsForInflightConnection(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	conn, _, observation, ok := pool.takeOrWaitObserved(ctx, key, time.Minute)
-	if !ok || conn != connections[0] {
+	take := pool.takeOrWaitObserved(ctx, key, time.Minute)
+	if !take.leased || take.conn != connections[0] {
 		t.Fatal("request did not lease the in-flight speculative connection")
 	}
-	if observation.reason != "leased" || observation.wait < 15*time.Millisecond {
-		t.Fatalf("observation = %+v, want leased wait >= 15ms", observation)
+	if take.observation.reason != "leased" || take.observation.wait < 15*time.Millisecond {
+		t.Fatalf("observation = %+v, want leased wait >= 15ms", take.observation)
 	}
 }
 
 func TestCodexWebsocketPreconnectPoolReportsImmediateMiss(t *testing.T) {
 	pool := newCodexWebsocketPreconnectTestPool()
 	key := codexWebsocketPreconnectKey{authID: "auth-miss", wsURL: "wss://example.test/responses"}
-	conn, _, observation, ok := pool.takeOrWaitObserved(context.Background(), key, time.Minute)
-	if ok || conn != nil {
+	take := pool.takeOrWaitObserved(context.Background(), key, time.Minute)
+	if take.leased || take.conn != nil {
 		t.Fatal("empty pool unexpectedly returned a connection")
 	}
-	if observation.reason != "no_idle" || observation.idle != 0 || observation.dialing != 0 {
-		t.Fatalf("observation = %+v, want no_idle with empty pool", observation)
+	if take.observation.reason != "no_idle" || take.observation.idle != 0 || take.observation.dialing != 0 {
+		t.Fatalf("observation = %+v, want no_idle with empty pool", take.observation)
 	}
 }
 

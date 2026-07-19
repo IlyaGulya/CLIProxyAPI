@@ -313,28 +313,28 @@ func (e *CodexWebsocketsExecutor) takeSpeculativePreconnect(ctx context.Context,
 	}
 	key := codexWebsocketPreconnectKey{authID: strings.TrimSpace(authID), wsURL: strings.TrimSpace(wsURL)}
 	route := codexAdaptivePreconnectRoute{AuthID: authID, Model: codexAdaptiveModel(ctx)}
-	conn, age, observation, ok := e.sessions.pool.takeOrWaitObserved(ctx, key, ttl)
-	if !ok {
+	take := e.sessions.pool.takeOrWaitObserved(ctx, key, ttl)
+	if !take.leased {
 		if e.adaptivePreconnect != nil {
 			e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Miss: true})
 		}
 		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_missed", observability.WebsocketAttributes{
-			SessionID: sessionID, WaitUS: observability.Some(observation.wait.Microseconds()), Reason: observation.reason,
-			PoolIdle: observability.Some(int64(observation.idle)), PoolDialing: observability.Some(int64(observation.dialing)),
+			SessionID: sessionID, WaitUS: observability.Some(take.observation.wait.Microseconds()), Reason: take.observation.reason,
+			PoolIdle: observability.Some(int64(take.observation.idle)), PoolDialing: observability.Some(int64(take.observation.dialing)),
 		}, nil)
 		return nil
 	}
 	if e.adaptivePreconnect != nil {
-		e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Hit: true, Lifetime: age})
+		e.adaptivePreconnect.observe(route, codexAdaptivePreconnectObservation{Hit: true, Lifetime: take.age})
 	}
 	helps.RecordAPIWebsocketEvent(ctx, e.cfg, "speculative_preconnect_leased", observability.WebsocketAttributes{
-		SessionID: sessionID, AgeUS: observability.Some(age.Microseconds()), WaitUS: observability.Some(observation.wait.Microseconds()),
-		PoolIdle: observability.Some(int64(observation.idle)), PoolDialing: observability.Some(int64(observation.dialing)),
+		SessionID: sessionID, AgeUS: observability.Some(take.age.Microseconds()), WaitUS: observability.Some(take.observation.wait.Microseconds()),
+		PoolIdle: observability.Some(int64(take.observation.idle)), PoolDialing: observability.Some(int64(take.observation.dialing)),
 	}, nil)
 	if e.cfg != nil && e.cfg.CodexWebsocketPreconnectReplenish {
 		e.scheduleSpeculativePreconnectForTrigger(ctx, auth, authID, wsURL, headers, sessionID, nil, "lease_replenish", "")
 	}
-	return conn
+	return take.conn
 }
 
 func (p *codexWebsocketPreconnectPool) reserve(key codexWebsocketPreconnectKey, maxIdle int, now time.Time) (bool, string, uint64) {
@@ -430,9 +430,16 @@ func (p *codexWebsocketPreconnectPool) completeReservationObserved(key codexWebs
 	return true
 }
 
-func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, key codexWebsocketPreconnectKey, ttl time.Duration) (*websocket.Conn, time.Duration, codexWebsocketPreconnectObservation, bool) {
+type codexWebsocketPreconnectTake struct {
+	conn        *websocket.Conn
+	age         time.Duration
+	observation codexWebsocketPreconnectObservation
+	leased      bool
+}
+
+func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, key codexWebsocketPreconnectKey, ttl time.Duration) codexWebsocketPreconnectTake {
 	if p == nil {
-		return nil, 0, codexWebsocketPreconnectObservation{reason: "disabled"}, false
+		return codexWebsocketPreconnectTake{observation: codexWebsocketPreconnectObservation{reason: "disabled"}}
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -442,7 +449,7 @@ func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, k
 	for {
 		if conn, age, ok := p.take(key, ttl, time.Now()); ok {
 			idle, dialing := p.snapshot()
-			return conn, age, codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: "leased", idle: idle, dialing: dialing}, true
+			return codexWebsocketPreconnectTake{conn: conn, age: age, observation: codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: "leased", idle: idle, dialing: dialing}, leased: true}
 		}
 
 		p.mu.Lock()
@@ -459,7 +466,7 @@ func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, k
 			if ok {
 				reason = "leased"
 			}
-			return conn, age, codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: reason, idle: idle, dialing: dialing}, ok
+			return codexWebsocketPreconnectTake{conn: conn, age: age, observation: codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: reason, idle: idle, dialing: dialing}, leased: ok}
 		}
 		if p.changed == nil {
 			p.changed = make(map[codexWebsocketPreconnectKey]chan struct{})
@@ -475,7 +482,7 @@ func (p *codexWebsocketPreconnectPool) takeOrWaitObserved(ctx context.Context, k
 		select {
 		case <-ctx.Done():
 			idle, dialing := p.snapshot()
-			return nil, 0, codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: "context_done", idle: idle, dialing: dialing}, false
+			return codexWebsocketPreconnectTake{observation: codexWebsocketPreconnectObservation{wait: time.Since(startedAt), reason: "context_done", idle: idle, dialing: dialing}}
 		case <-changed:
 		}
 	}
