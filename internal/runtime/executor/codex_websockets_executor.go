@@ -825,54 +825,32 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return false
 			}
 		}
-		flushBuffered := func() bool {
-			drain := streamBridge.drain()
-			for i := range drain.Chunks {
-				if !deliver(drain.Chunks[i]) {
-					return false
-				}
-			}
-			if transactionalChildStream && drain.Bytes > 0 {
+		delivery := newCodexStreamDelivery(streamBridge, codexStreamDeliveryHooks{
+			Deliver: deliver,
+			Committed: func(drain codexTransactionalDrain) {
 				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_committed", observability.WebsocketAttributes{
 					SessionID: executionSessionID, Bytes: observability.Some(int64(drain.Bytes)),
 					DurationUS: observability.Some(drain.Duration.Microseconds()), Success: observability.Some(true),
 				}, nil)
-			}
-			return true
-		}
-		send := func(chunk cliproxyexecutor.StreamChunk) bool {
-			if chunk.Err != nil {
-				if discardedBytes := streamBridge.discardTransaction(); discardedBytes > 0 {
-					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
-						SessionID: executionSessionID, Bytes: observability.Some(int64(discardedBytes)), Reason: "terminal_error",
-					}, nil)
-				}
-				return deliver(chunk)
-			}
-			stage := streamBridge.stage(chunk)
-			if stage.Buffered {
-				return true
-			}
-			if stage.Overflow {
-				bufferedBytes := streamBridge.bufferedBytes()
-				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_overflow", observability.WebsocketAttributes{
-					SessionID: executionSessionID, Bytes: observability.Some(int64(bufferedBytes + len(chunk.Payload))), Reason: "buffer_limit",
+			},
+			Discarded: func(discardedBytes int) {
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
+					SessionID: executionSessionID, Bytes: observability.Some(int64(discardedBytes)), Reason: "terminal_error",
 				}, nil)
-				if !flushBuffered() {
-					return false
-				}
-				streamBridge.disableTransaction()
-				return deliver(chunk)
-			}
-			return deliver(chunk)
-		}
+			},
+			Overflowed: func(overflowBytes int) {
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_overflow", observability.WebsocketAttributes{
+					SessionID: executionSessionID, Bytes: observability.Some(int64(overflowBytes)), Reason: "buffer_limit",
+				}, nil)
+			},
+		})
 
 		var param any
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
 				terminateErr = ctx.Err()
-				_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
+				_ = delivery.send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 				return
 			}
 			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh, codexWebsocketIdleTimeout(e.cfg))
@@ -880,7 +858,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if sess != nil && ctx != nil && ctx.Err() != nil {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
-					_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
+					_ = delivery.send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 					return
 				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
@@ -1002,7 +980,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateErr = mappedErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 				reporter.PublishFailure(ctx, mappedErr)
-				_ = send(cliproxyexecutor.StreamChunk{Err: mappedErr})
+				_ = delivery.send(cliproxyexecutor.StreamChunk{Err: mappedErr})
 				return
 			}
 			if msgType != websocket.TextMessage {
@@ -1015,7 +993,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					if sess != nil {
 						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
 					}
-					_ = send(cliproxyexecutor.StreamChunk{Err: err})
+					_ = delivery.send(cliproxyexecutor.StreamChunk{Err: err})
 					return
 				}
 				continue
@@ -1047,7 +1025,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 				}
-				_ = send(cliproxyexecutor.StreamChunk{Err: wsErr})
+				_ = delivery.send(cliproxyexecutor.StreamChunk{Err: wsErr})
 				return
 			}
 
@@ -1083,7 +1061,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						reporter.Publish(ctx, detail)
 					}
 				}
-				if !send(cliproxyexecutor.StreamChunk{Payload: clientPayload}) {
+				if !delivery.send(cliproxyexecutor.StreamChunk{Payload: clientPayload}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					return
@@ -1116,14 +1094,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			translationDuration += time.Since(translateStartedAt)
 			translatedChunks += int64(len(chunks))
 			for i := range chunks {
-				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+				if !delivery.send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					return
 				}
 			}
 			if isCodexCompletionEvent(eventType) {
-				if !flushBuffered() {
+				if !delivery.flush() {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 				}
