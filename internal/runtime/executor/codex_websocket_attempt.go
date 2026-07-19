@@ -67,5 +67,26 @@ func activateCodexStreamReader(attempt *codexAttemptMachine, session *codexWebso
 	if err != nil {
 		return nil, err
 	}
+	if err = validateCodexReaderLifecycle(attempt, session); err != nil {
+		session.deactivateReader(read)
+		return nil, err
+	}
 	return read, nil
+}
+
+func validateCodexReaderLifecycle(attempt *codexAttemptMachine, session *codexWebsocketSession) error {
+	if attempt == nil || session == nil {
+		return nil
+	}
+	state := attempt.current()
+	if state != codexAttemptReaderReady && state != codexAttemptActive {
+		return nil
+	}
+	session.activeMu.Lock()
+	hasReader := session.activeCh != nil
+	session.activeMu.Unlock()
+	if !hasReader || session.lifecycle.state() != codexSessionBusy {
+		return fmt.Errorf("codex lifecycle invariant: attempt=%s session=%s active_reader=%t", state, session.lifecycle.state(), hasReader)
+	}
+	return nil
 }

@@ -10,20 +10,56 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type codexReconnectRoute struct {
+	ctx         context.Context
+	auth        *cliproxyauth.Auth
+	session     *codexWebsocketSession
+	authID      string
+	url         string
+	headers     http.Header
+	executionID string
+	overflow    bool
+}
+
+type codexPreviousAttempt struct {
+	conn *websocket.Conn
+	read chan codexWebsocketRead
+}
+
+type codexRecoveryState interface {
+	discardBuffer() error
+	resetSemantics() error
+}
+
+type codexNoopRecoveryState struct{}
+
+func (codexNoopRecoveryState) discardBuffer() error  { return nil }
+func (codexNoopRecoveryState) resetSemantics() error { return nil }
+
+type codexTransactionalRecoveryState struct {
+	discard func() error
+	reset   func() error
+}
+
+func (r codexTransactionalRecoveryState) discardBuffer() error {
+	if r.discard == nil {
+		return fmt.Errorf("codex recovery discard collaborator is nil")
+	}
+	return r.discard()
+}
+
+func (r codexTransactionalRecoveryState) resetSemantics() error {
+	if r.reset == nil {
+		return fmt.Errorf("codex recovery semantic reset collaborator is nil")
+	}
+	return r.reset()
+}
+
 type codexReconnectRequest struct {
-	ctx             context.Context
-	auth            *cliproxyauth.Auth
-	session         *codexWebsocketSession
-	currentConn     *websocket.Conn
-	currentRead     chan codexWebsocketRead
-	authID          string
-	url             string
-	headers         http.Header
-	executionID     string
-	sessionOverflow bool
-	attempt         *codexAttemptMachine
-	discardBuffer   func() error
-	resetSemantics  func() error
+	route    codexReconnectRoute
+	previous codexPreviousAttempt
+	attempt  *codexAttemptMachine
+	recovery codexRecoveryState
 }
 
 type codexReconnectResult struct {
@@ -36,54 +72,51 @@ type codexReconnectResult struct {
 // the new reader active. Requests must not be sent before activation succeeds.
 func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnectRequest) (codexReconnectResult, error) {
 	result := codexReconnectResult{}
+	if request.recovery == nil {
+		return result, fmt.Errorf("codex reconnect recovery state is nil")
+	}
 	handlers := codexAttemptActionHandlers{
 		DetachReader: func() error {
-			if request.session != nil {
-				request.session.deactivateReader(request.currentRead)
+			if request.route.session != nil {
+				request.route.session.deactivateReader(request.previous.read)
 				result.read = make(chan codexWebsocketRead, 4096)
 			}
 			return nil
 		},
 		CloseConnection: func() error {
-			if request.session == nil && request.currentConn != nil {
-				if errClose := e.closeCodexConnection(request.currentConn); errClose != nil {
+			if request.route.session == nil && request.previous.conn != nil {
+				if errClose := e.closeCodexConnection(request.previous.conn); errClose != nil {
 					log.Errorf("codex websockets executor: close websocket before retry error: %v", errClose)
 				}
 			}
 			return nil
 		},
 		DiscardBuffer: func() error {
-			if request.discardBuffer != nil {
-				return request.discardBuffer()
-			}
-			return nil
+			return request.recovery.discardBuffer()
 		},
 		ResetSemantics: func() error {
-			if request.resetSemantics != nil {
-				return request.resetSemantics()
-			}
-			return nil
+			return request.recovery.resetSemantics()
 		},
 		Dial: func() error {
 			var lease codexConnectionLease
 			var errDial error
-			if request.sessionOverflow {
+			if request.route.overflow {
 				lease, errDial = e.ensureOverflowConnObserved(
-					request.ctx, request.auth, request.authID, request.url, request.headers, request.executionID,
+					request.route.ctx, request.route.auth, request.route.authID, request.route.url, request.route.headers, request.route.executionID,
 				)
 				lease.overflowBaseSource = lease.source
 				lease.source = codexWebsocketConnectionOverflow
 			} else {
 				lease, errDial = e.ensureUpstreamConnObserved(
-					request.ctx, request.auth, request.session, request.authID, request.url, request.headers,
+					request.route.ctx, request.route.auth, request.route.session, request.route.authID, request.route.url, request.route.headers,
 				)
 			}
 			result.codexConnectionLease = lease
 			return errDial
 		},
 		ActivateReader: func() error {
-			if request.session != nil {
-				return request.session.activateReader(result.read)
+			if request.route.session != nil {
+				return request.route.session.activateReader(result.read)
 			}
 			return nil
 		},

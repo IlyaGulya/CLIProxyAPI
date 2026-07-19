@@ -725,9 +725,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			retryHeaders := retryWSHeaders.Clone()
 			applyCodexIdentityConfuseHeaders(retryHeaders, &retryIdentityState)
 			reconnected, errDialRetry := e.reconnectCodexWebsocket(codexReconnectRequest{
-				ctx: ctx, auth: auth, session: sess, currentConn: conn, currentRead: readCh,
-				authID: authID, url: wsURL, headers: retryHeaders, executionID: executionSessionID,
-				attempt: attemptMachine,
+				route: codexReconnectRoute{
+					ctx: ctx, auth: auth, session: sess, authID: authID, url: wsURL,
+					headers: retryHeaders, executionID: executionSessionID,
+				},
+				previous: codexPreviousAttempt{conn: conn, read: readCh},
+				attempt:  attemptMachine,
+				recovery: codexNoopRecoveryState{},
 			})
 			connRetry, respHSRetry := reconnected.conn, reconnected.response
 			readCh = reconnected.read
@@ -934,10 +938,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 					retryStartedAt := time.Now()
 					reconnected, errDialRetry := e.reconnectCodexWebsocket(codexReconnectRequest{
-						ctx: ctx, auth: auth, session: sess, currentConn: conn, currentRead: readCh,
-						authID: authID, url: wsURL, headers: retryHeaders, executionID: executionSessionID,
-						sessionOverflow: sessionOverflow, attempt: attemptMachine,
-						discardBuffer: func() error {
+						route: codexReconnectRoute{
+							ctx: ctx, auth: auth, session: sess, authID: authID, url: wsURL,
+							headers: retryHeaders, executionID: executionSessionID, overflow: sessionOverflow,
+						},
+						previous: codexPreviousAttempt{conn: conn, read: readCh},
+						attempt:  attemptMachine,
+						recovery: codexTransactionalRecoveryState{discard: func() error {
 							if bufferedBytes := delivery.bufferedBytes(); bufferedBytes > 0 {
 								helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_discarded", observability.WebsocketAttributes{
 									SessionID: executionSessionID, Attempt: observability.Some(int64(transportRetries)),
@@ -945,11 +952,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 								}, nil)
 							}
 							return delivery.resetUpstreamAttempt()
-						},
-						resetSemantics: func() error {
+						}, reset: func() error {
 							streamBridge.resetUpstreamAttempt()
 							return nil
-						},
+						}},
 					})
 					connRetry, respHSRetry, retrySource := reconnected.conn, reconnected.response, reconnected.source
 					if reconnected.read != nil {

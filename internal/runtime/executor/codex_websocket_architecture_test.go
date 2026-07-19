@@ -506,6 +506,37 @@ func TestCodexSessionReaderActivationIsExplicitAndNilFree(t *testing.T) {
 	}
 }
 
+func TestCodexReaderActivationProjectsAttemptIntoBusySession(t *testing.T) {
+	t.Parallel()
+	session := &codexWebsocketSession{lifecycle: *newCodexSessionStateMachine()}
+	for _, event := range []codexSessionEvent{codexEventDialRequested, codexEventConnected} {
+		if err := session.transitionLifecycle(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attempt := newCodexAttemptMachine()
+	for _, event := range []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected} {
+		transition, err := attempt.plan(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = attempt.commit(transition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read, err := activateCodexStreamReader(attempt, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.current() != codexAttemptReaderReady || session.lifecycle.state() != codexSessionBusy {
+		t.Fatalf("attempt=%s session=%s", attempt.current(), session.lifecycle.state())
+	}
+	session.deactivateReader(read)
+	if session.lifecycle.state() != codexSessionReady {
+		t.Fatalf("session after deactivation = %s", session.lifecycle.state())
+	}
+}
+
 func TestReduceCodexTransactionRejectsIllegalTransitions(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
