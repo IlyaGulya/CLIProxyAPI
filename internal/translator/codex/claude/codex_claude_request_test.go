@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/base64"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -144,12 +145,25 @@ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 		wantParallelToolCalls bool
 	}{
 		{
-			name: "Default to true when tool_choice.disable_parallel_tool_use is absent",
+			name: "Default to true without mutating tools when tool_choice.disable_parallel_tool_use is absent",
 			inputJSON: `{
 				"model": "claude-3-opus",
+				"tools": [{"name":"Read","input_schema":{"type":"object"}}],
 				"messages": [{"role": "user", "content": "hello"}]
 			}`,
 			wantParallelToolCalls: true,
+		},
+		{
+			name: "Serialize mutating tools when tool_choice.disable_parallel_tool_use is absent",
+			inputJSON: `{
+				"model": "claude-3-opus",
+				"tools": [
+					{"name":"Read","input_schema":{"type":"object"}},
+					{"name":"Edit","input_schema":{"type":"object"}}
+				],
+				"messages": [{"role": "user", "content": "hello"}]
+			}`,
+			wantParallelToolCalls: false,
 		},
 		{
 			name: "Disable parallel tool calls when client opts out",
@@ -164,6 +178,7 @@ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 			name: "Keep parallel tool calls enabled when client explicitly allows them",
 			inputJSON: `{
 				"model": "claude-3-opus",
+				"tools": [{"name":"Edit","input_schema":{"type":"object"}}],
 				"tool_choice": {"disable_parallel_tool_use": false},
 				"messages": [{"role": "user", "content": "hello"}]
 			}`,
@@ -178,6 +193,22 @@ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 
 			if got := resultJSON.Get("parallel_tool_calls").Bool(); got != tt.wantParallelToolCalls {
 				t.Fatalf("parallel_tool_calls = %v, want %v. Output: %s", got, tt.wantParallelToolCalls, string(result))
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_SerializesEveryFileMutationTool(t *testing.T) {
+	for _, toolName := range []string{"Edit", "MultiEdit", "NotebookEdit", "Write"} {
+		t.Run(toolName, func(t *testing.T) {
+			input := []byte(`{
+				"model":"claude-3-opus",
+				"tools":[{"name":` + strconv.Quote(toolName) + `,"input_schema":{"type":"object"}}],
+				"messages":[{"role":"user","content":"hello"}]
+			}`)
+			result := ConvertClaudeRequestToCodex("test-model", input, false)
+			if gjson.GetBytes(result, "parallel_tool_calls").Bool() {
+				t.Fatalf("parallel_tool_calls = true for mutating tool %q: %s", toolName, result)
 			}
 		})
 	}
