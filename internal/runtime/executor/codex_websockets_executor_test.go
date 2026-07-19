@@ -1408,15 +1408,15 @@ func TestCodexWebsocketsEnsureUpstreamConnReportsColdAndSessionReuse(t *testing.
 	exec := NewCodexWebsocketsExecutor(&config.Config{})
 	sess := exec.getOrCreateSession("connection-source")
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	first, _, firstSource, errFirst := exec.ensureUpstreamConnObserved(context.Background(), nil, sess, "auth-source", wsURL, http.Header{})
-	if errFirst != nil || firstSource != codexWebsocketConnectionCold {
-		t.Fatalf("first connection = (%v, %q), want cold success", errFirst, firstSource)
+	first, errFirst := exec.ensureUpstreamConnObserved(context.Background(), nil, sess, "auth-source", wsURL, http.Header{})
+	if errFirst != nil || first.source != codexWebsocketConnectionCold {
+		t.Fatalf("first connection = (%v, %q), want cold success", errFirst, first.source)
 	}
-	second, _, secondSource, errSecond := exec.ensureUpstreamConnObserved(context.Background(), nil, sess, "auth-source", wsURL, http.Header{})
-	if errSecond != nil || secondSource != codexWebsocketConnectionSessionReuse {
-		t.Fatalf("second connection = (%v, %q), want session reuse", errSecond, secondSource)
+	second, errSecond := exec.ensureUpstreamConnObserved(context.Background(), nil, sess, "auth-source", wsURL, http.Header{})
+	if errSecond != nil || second.source != codexWebsocketConnectionSessionReuse {
+		t.Fatalf("second connection = (%v, %q), want session reuse", errSecond, second.source)
 	}
-	if first != second {
+	if first.conn != second.conn {
 		t.Fatal("session reuse returned a different websocket")
 	}
 	exec.CloseExecutionSession("connection-source")

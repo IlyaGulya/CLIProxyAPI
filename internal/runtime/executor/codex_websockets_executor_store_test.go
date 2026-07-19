@@ -304,8 +304,8 @@ func activateSessionFixture(t *testing.T, session *codexWebsocketSession) {
 	t.Helper()
 	session.applyLifecycle(codexEventDialRequested)
 	session.applyLifecycle(codexEventConnected)
-	if err := session.setActive(make(chan codexWebsocketRead)); err != nil {
+	if err := session.activateReader(make(chan codexWebsocketRead)); err != nil {
 		t.Fatalf("activate session fixture: %v", err)
 	}
-	t.Cleanup(func() { _ = session.setActive(nil) })
+	t.Cleanup(session.deactivateCurrentReader)
 }

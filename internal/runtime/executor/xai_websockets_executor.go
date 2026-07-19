@@ -492,7 +492,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	var readCh chan codexWebsocketRead
 	if sess != nil {
 		readCh = make(chan codexWebsocketRead, 4096)
-		if errActivate := sess.setActive(readCh); errActivate != nil {
+		if errActivate := sess.activateReader(readCh); errActivate != nil {
 			sess.reqMu.Unlock()
 			return nil, fmt.Errorf("activate xai websocket reader: %w", errActivate)
 		}
@@ -507,16 +507,16 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				bodyErrRetry := websocketHandshakeBody(respHSRetry)
 				closeHTTPResponseBody(respHSRetry, "xai websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
-				sess.clearActive(readCh)
+				sess.deactivateReader(readCh)
 				sess.reqMu.Unlock()
 				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
 					return nil, xaiStatusErr(respHSRetry.StatusCode, bodyErrRetry)
 				}
 				return nil, errDialRetry
 			}
-			sess.clearActive(readCh)
+			sess.deactivateReader(readCh)
 			readCh = make(chan codexWebsocketRead, 4096)
-			if errActivate := sess.setActive(readCh); errActivate != nil {
+			if errActivate := sess.activateReader(readCh); errActivate != nil {
 				sess.reqMu.Unlock()
 				return nil, fmt.Errorf("activate xai websocket retry reader: %w", errActivate)
 			}
@@ -538,7 +538,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
-				sess.clearActive(readCh)
+				sess.deactivateReader(readCh)
 				sess.reqMu.Unlock()
 				return nil, errSendRetry
 			}
@@ -561,7 +561,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		defer close(out)
 		defer func() {
 			if sess != nil {
-				sess.clearActive(readCh)
+				sess.deactivateReader(readCh)
 				sess.reqMu.Unlock()
 				return
 			}
@@ -1059,7 +1059,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 				case <-done:
 				default:
 				}
-				sess.clearActive(ch)
+				sess.deactivateReader(ch)
 				close(ch)
 			}
 			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
@@ -1079,7 +1079,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 					case <-done:
 					default:
 					}
-					sess.clearActive(ch)
+					sess.deactivateReader(ch)
 					close(ch)
 				}
 				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)

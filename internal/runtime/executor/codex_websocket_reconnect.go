@@ -27,10 +27,8 @@ type codexReconnectRequest struct {
 }
 
 type codexReconnectResult struct {
-	conn     *websocket.Conn
-	response *http.Response
-	source   codexWebsocketConnectionSource
-	read     chan codexWebsocketRead
+	codexConnectionLease
+	read chan codexWebsocketRead
 }
 
 // reconnectCodexWebsocket owns the lifecycle-sensitive ordering shared by all
@@ -38,14 +36,10 @@ type codexReconnectResult struct {
 // the new reader active. Requests must not be sent before activation succeeds.
 func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnectRequest) (codexReconnectResult, error) {
 	result := codexReconnectResult{}
-	interrupted, errTransition := request.attempt.apply(codexAttemptInterrupted)
-	if errTransition != nil {
-		return result, errTransition
-	}
 	handlers := codexAttemptActionHandlers{
 		DetachReader: func() error {
 			if request.session != nil {
-				request.session.clearActive(request.currentRead)
+				request.session.deactivateReader(request.currentRead)
 				result.read = make(chan codexWebsocketRead, 4096)
 			}
 			return nil
@@ -71,38 +65,36 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 			return nil
 		},
 		Dial: func() error {
+			var lease codexConnectionLease
 			var errDial error
 			if request.sessionOverflow {
-				result.conn, result.response, _, errDial = e.ensureOverflowConnObserved(
+				lease, errDial = e.ensureOverflowConnObserved(
 					request.ctx, request.auth, request.authID, request.url, request.headers, request.executionID,
 				)
-				result.source = codexWebsocketConnectionOverflow
+				lease.overflowBaseSource = lease.source
+				lease.source = codexWebsocketConnectionOverflow
 			} else {
-				result.conn, result.response, result.source, errDial = e.ensureUpstreamConnObserved(
+				lease, errDial = e.ensureUpstreamConnObserved(
 					request.ctx, request.auth, request.session, request.authID, request.url, request.headers,
 				)
 			}
+			result.codexConnectionLease = lease
 			return errDial
 		},
 		ActivateReader: func() error {
 			if request.session != nil {
-				return request.session.setActive(result.read)
+				return request.session.activateReader(result.read)
 			}
 			return nil
 		},
 	}
-	if err := runCodexAttemptActions(interrupted.Actions, handlers); err != nil {
+	if _, err := request.attempt.dispatch(codexAttemptInterrupted, handlers); err != nil {
 		return result, err
 	}
-	retrying, errTransition := request.attempt.apply(codexAttemptRetryApproved)
-	if errTransition != nil {
+	if _, errTransition := request.attempt.dispatch(codexAttemptRetryApproved, handlers); errTransition != nil {
 		return result, errTransition
 	}
-	connecting, errTransition := request.attempt.apply(codexAttemptConnectRequested)
-	if errTransition != nil {
-		return result, errTransition
-	}
-	if err := runCodexAttemptActions(connecting.Actions, handlers); err != nil {
+	if _, err := request.attempt.dispatch(codexAttemptConnectRequested, handlers); err != nil {
 		_, _ = request.attempt.apply(codexAttemptFailedEvent)
 		return result, err
 	}
@@ -110,26 +102,19 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 		_, _ = request.attempt.apply(codexAttemptFailedEvent)
 		return result, fmt.Errorf("codex websocket retry dial returned nil connection")
 	}
-	if _, errTransition = request.attempt.apply(codexAttemptConnected); errTransition != nil {
-		return result, errTransition
-	}
-	if err := runCodexAttemptActions(retrying.Actions, handlers); err != nil {
+	if _, err := request.attempt.apply(codexAttemptConnected); err != nil {
 		return result, err
 	}
-	activated, errTransition := request.attempt.apply(codexAttemptReaderActivated)
-	if errTransition != nil {
-		return result, errTransition
+	if _, err := request.attempt.dispatch(codexAttemptRecoveryPrepared, handlers); err != nil {
+		return result, err
 	}
-	if err := runCodexAttemptActions(activated.Actions, handlers); err != nil {
+	if _, err := request.attempt.dispatch(codexAttemptReaderActivated, handlers); err != nil {
 		return result, err
 	}
 	return result, nil
 }
 
 func sendCodexAttemptRequest(attempt *codexAttemptMachine, send func() error) error {
-	transition, errTransition := attempt.apply(codexAttemptRequestSent)
-	if errTransition != nil {
-		return errTransition
-	}
-	return runCodexAttemptActions(transition.Actions, codexAttemptActionHandlers{SendRequest: send})
+	_, err := attempt.dispatch(codexAttemptRequestSent, codexAttemptActionHandlers{SendRequest: send})
+	return err
 }

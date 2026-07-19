@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/gorilla/websocket"
@@ -27,18 +28,20 @@ func (e *CodexWebsocketsExecutor) newObservedCodexAttempt(ctx context.Context, s
 	})
 }
 
-type codexAttemptConnection struct {
+type codexConnectionLease struct {
 	conn               *websocket.Conn
+	response           *http.Response
 	source             codexWebsocketConnectionSource
 	overflowBaseSource codexWebsocketConnectionSource
 }
 
-func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func(*codexAttemptConnection) error) (codexAttemptConnection, error) {
-	result := codexAttemptConnection{}
-	transition, err := attempt.apply(codexAttemptConnectRequested)
-	if err == nil {
-		err = runCodexAttemptActions(transition.Actions, codexAttemptActionHandlers{Dial: func() error { return dial(&result) }})
-	}
+func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func() (codexConnectionLease, error)) (codexConnectionLease, error) {
+	result := codexConnectionLease{}
+	_, err := attempt.dispatch(codexAttemptConnectRequested, codexAttemptActionHandlers{Dial: func() error {
+		var errDial error
+		result, errDial = dial()
+		return errDial
+	}})
 	if err == nil && result.conn == nil {
 		err = fmt.Errorf("codex websocket dial returned nil connection")
 	}
@@ -53,16 +56,13 @@ func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func(*codexAtt
 }
 
 func activateCodexStreamReader(attempt *codexAttemptMachine, session *codexWebsocketSession) (chan codexWebsocketRead, error) {
-	transition, err := attempt.apply(codexAttemptReaderActivated)
-	if err != nil {
+	if session == nil {
+		_, err := attempt.dispatch(codexAttemptReaderActivated, codexAttemptActionHandlers{ActivateReader: func() error { return nil }})
 		return nil, err
 	}
-	if session == nil {
-		return nil, nil
-	}
 	read := make(chan codexWebsocketRead, 4096)
-	err = runCodexAttemptActions(transition.Actions, codexAttemptActionHandlers{
-		ActivateReader: func() error { return session.setActive(read) },
+	_, err := attempt.dispatch(codexAttemptReaderActivated, codexAttemptActionHandlers{
+		ActivateReader: func() error { return session.activateReader(read) },
 	})
 	if err != nil {
 		return nil, err

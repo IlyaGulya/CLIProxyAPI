@@ -12,6 +12,7 @@ const (
 	codexAttemptPrepared codexAttemptState = iota
 	codexAttemptConnecting
 	codexAttemptReady
+	codexAttemptReaderReady
 	codexAttemptActive
 	codexAttemptInterruptedState
 	codexAttemptRetrying
@@ -21,7 +22,7 @@ const (
 )
 
 func (s codexAttemptState) String() string {
-	return [...]string{"prepared", "connecting", "ready", "active", "interrupted", "retrying", "completed", "failed", "cancelled"}[min(int(s), 8)]
+	return [...]string{"prepared", "connecting", "ready", "reader_ready", "active", "interrupted", "retrying", "completed", "failed", "cancelled"}[min(int(s), 9)]
 }
 
 type codexAttemptEvent uint8
@@ -33,13 +34,14 @@ const (
 	codexAttemptRequestSent
 	codexAttemptInterrupted
 	codexAttemptRetryApproved
+	codexAttemptRecoveryPrepared
 	codexAttemptTerminalReceived
 	codexAttemptFailedEvent
 	codexAttemptCancelledEvent
 )
 
 func (e codexAttemptEvent) String() string {
-	return [...]string{"connect_requested", "connected", "reader_activated", "request_sent", "interrupted", "retry_approved", "terminal_received", "failed", "cancelled"}[min(int(e), 8)]
+	return [...]string{"connect_requested", "connected", "reader_activated", "request_sent", "interrupted", "retry_approved", "recovery_prepared", "terminal_received", "failed", "cancelled"}[min(int(e), 9)]
 }
 
 type codexAttemptAction uint8
@@ -83,11 +85,12 @@ func reduceCodexAttempt(state codexAttemptState, event codexAttemptEvent) (codex
 		}
 	case codexAttemptReaderActivated:
 		if state == codexAttemptReady {
+			transition.To = codexAttemptReaderReady
 			transition.Actions = []codexAttemptAction{codexAttemptActivateReader}
 			return transition, nil
 		}
 	case codexAttemptRequestSent:
-		if state == codexAttemptReady {
+		if state == codexAttemptReaderReady {
 			transition.To = codexAttemptActive
 			transition.Actions = []codexAttemptAction{codexAttemptSendRequest}
 			return transition, nil
@@ -101,6 +104,10 @@ func reduceCodexAttempt(state codexAttemptState, event codexAttemptEvent) (codex
 	case codexAttemptRetryApproved:
 		if state == codexAttemptInterruptedState {
 			transition.To = codexAttemptRetrying
+			return transition, nil
+		}
+	case codexAttemptRecoveryPrepared:
+		if state == codexAttemptReady {
 			transition.Actions = []codexAttemptAction{codexAttemptDiscardBuffer, codexAttemptResetSemantics}
 			return transition, nil
 		}
@@ -151,14 +158,32 @@ func newCodexAttemptMachine(observers ...func(codexAttemptTransition)) *codexAtt
 }
 
 func (m *codexAttemptMachine) apply(event codexAttemptEvent) (codexAttemptTransition, error) {
+	transition, err := m.plan(event)
+	if err != nil {
+		return transition, err
+	}
+	return transition, m.commit(transition)
+}
+
+func (m *codexAttemptMachine) plan(event codexAttemptEvent) (codexAttemptTransition, error) {
 	if m == nil {
 		return codexAttemptTransition{}, fmt.Errorf("%w: nil machine", errCodexAttemptTransition)
 	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	transition, err := reduceCodexAttempt(m.state, event)
-	if err != nil {
+	return transition, err
+}
+
+func (m *codexAttemptMachine) commit(transition codexAttemptTransition) error {
+	if m == nil {
+		return fmt.Errorf("%w: nil machine", errCodexAttemptTransition)
+	}
+	m.mu.Lock()
+	if m.state != transition.From {
+		current := m.state
 		m.mu.Unlock()
-		return transition, err
+		return fmt.Errorf("%w: stale transition from %s while current state is %s", errCodexAttemptTransition, transition.From, current)
 	}
 	m.state = transition.To
 	observer := m.observer
@@ -166,7 +191,18 @@ func (m *codexAttemptMachine) apply(event codexAttemptEvent) (codexAttemptTransi
 	if observer != nil {
 		observer(transition)
 	}
-	return transition, nil
+	return nil
+}
+
+func (m *codexAttemptMachine) dispatch(event codexAttemptEvent, handlers codexAttemptActionHandlers) (codexAttemptTransition, error) {
+	transition, err := m.plan(event)
+	if err != nil {
+		return transition, err
+	}
+	if err = runCodexAttemptActions(transition.Actions, handlers); err != nil {
+		return transition, err
+	}
+	return transition, m.commit(transition)
 }
 
 func (m *codexAttemptMachine) current() codexAttemptState {

@@ -359,13 +359,14 @@ func TestCodexAttemptReducerHappyPathAndRecovery(t *testing.T) {
 	}{
 		{codexAttemptConnectRequested, codexAttemptConnecting, []codexAttemptAction{codexAttemptDial}},
 		{codexAttemptConnected, codexAttemptReady, nil},
-		{codexAttemptReaderActivated, codexAttemptReady, []codexAttemptAction{codexAttemptActivateReader}},
+		{codexAttemptReaderActivated, codexAttemptReaderReady, []codexAttemptAction{codexAttemptActivateReader}},
 		{codexAttemptRequestSent, codexAttemptActive, []codexAttemptAction{codexAttemptSendRequest}},
 		{codexAttemptInterrupted, codexAttemptInterruptedState, []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection}},
-		{codexAttemptRetryApproved, codexAttemptRetrying, []codexAttemptAction{codexAttemptDiscardBuffer, codexAttemptResetSemantics}},
+		{codexAttemptRetryApproved, codexAttemptRetrying, nil},
 		{codexAttemptConnectRequested, codexAttemptConnecting, []codexAttemptAction{codexAttemptDial}},
 		{codexAttemptConnected, codexAttemptReady, nil},
-		{codexAttemptReaderActivated, codexAttemptReady, []codexAttemptAction{codexAttemptActivateReader}},
+		{codexAttemptRecoveryPrepared, codexAttemptReady, []codexAttemptAction{codexAttemptDiscardBuffer, codexAttemptResetSemantics}},
+		{codexAttemptReaderActivated, codexAttemptReaderReady, []codexAttemptAction{codexAttemptActivateReader}},
 		{codexAttemptRequestSent, codexAttemptActive, []codexAttemptAction{codexAttemptSendRequest}},
 		{codexAttemptTerminalReceived, codexAttemptCompleted, nil},
 	}
@@ -444,21 +445,64 @@ func TestCodexAttemptMachineObservesAcceptedTransitions(t *testing.T) {
 func TestConnectCodexStreamAttemptOwnsDialStateTransitions(t *testing.T) {
 	t.Parallel()
 	machine := newCodexAttemptMachine()
-	result, err := connectCodexStreamAttempt(machine, func(result *codexAttemptConnection) error {
-		result.conn = &websocket.Conn{}
-		result.source = codexWebsocketConnectionCold
-		return nil
+	result, err := connectCodexStreamAttempt(machine, func() (codexConnectionLease, error) {
+		return codexConnectionLease{conn: &websocket.Conn{}, source: codexWebsocketConnectionCold}, nil
 	})
 	if err != nil || result.conn == nil || machine.current() != codexAttemptReady {
 		t.Fatalf("connection = %+v, state = %s, error = %v", result, machine.current(), err)
 	}
 
 	failed := newCodexAttemptMachine()
-	if _, err = connectCodexStreamAttempt(failed, func(*codexAttemptConnection) error { return errors.New("dial failed") }); err == nil {
+	if _, err = connectCodexStreamAttempt(failed, func() (codexConnectionLease, error) { return codexConnectionLease{}, errors.New("dial failed") }); err == nil {
 		t.Fatal("dial failure was accepted")
 	}
 	if failed.current() != codexAttemptFailed {
 		t.Fatalf("failed state = %s", failed.current())
+	}
+}
+
+func TestCodexAttemptDispatchCommitsOnlyAfterActionsSucceed(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		prepare  []codexAttemptEvent
+		event    codexAttemptEvent
+		handlers codexAttemptActionHandlers
+		want     codexAttemptState
+	}{
+		{name: "dial", event: codexAttemptConnectRequested, handlers: codexAttemptActionHandlers{Dial: func() error { return errors.New("dial") }}, want: codexAttemptPrepared},
+		{name: "activate", prepare: []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected}, event: codexAttemptReaderActivated, handlers: codexAttemptActionHandlers{ActivateReader: func() error { return errors.New("activate") }}, want: codexAttemptReady},
+		{name: "send", prepare: []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected, codexAttemptReaderActivated}, event: codexAttemptRequestSent, handlers: codexAttemptActionHandlers{SendRequest: func() error { return errors.New("send") }}, want: codexAttemptReaderReady},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			machine := newCodexAttemptMachine()
+			for _, event := range test.prepare {
+				transition, err := machine.plan(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = machine.commit(transition); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := machine.dispatch(test.event, test.handlers); err == nil {
+				t.Fatal("failed action was accepted")
+			}
+			if got := machine.current(); got != test.want {
+				t.Fatalf("state after failed action = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexSessionReaderActivationIsExplicitAndNilFree(t *testing.T) {
+	t.Parallel()
+	session := &codexWebsocketSession{lifecycle: *newCodexSessionStateMachine()}
+	if err := session.activateReader(nil); err == nil {
+		t.Fatal("nil reader activation was accepted")
+	}
+	if session.activeCh != nil || session.lifecycle.state() != codexSessionIdle {
+		t.Fatalf("nil activation mutated session: channel=%v state=%s", session.activeCh, session.lifecycle.state())
 	}
 }
 
