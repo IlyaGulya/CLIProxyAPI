@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/tidwall/gjson"
 )
 
 func TestCodexSessionStateMachineLegalLifecycle(t *testing.T) {
@@ -109,12 +108,12 @@ func TestCodexRetryPolicyMatrix(t *testing.T) {
 func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
 	t.Parallel()
 	bridge := newCodexWebsocketStreamBridge()
-	bridge.observe([]byte(`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1"}}`))
+	bridge.observe(classifyCodexStreamEvent([]byte(`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1"}}`)))
 	if got := bridge.snapshot(); got.DownstreamCommitted || got.IncompleteToolCalls != 1 {
 		t.Fatalf("before commit snapshot = %+v", got)
 	}
 	bridge.commit([]byte("data: chunk\n\n"))
-	bridge.observe([]byte(`{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1"}}`))
+	bridge.observe(classifyCodexStreamEvent([]byte(`{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1"}}`)))
 	got := bridge.snapshot()
 	if !got.DownstreamCommitted || got.IncompleteToolCalls != 0 || got.ToolCallsCompleted != 1 {
 		t.Fatalf("completed snapshot = %+v", got)
@@ -265,8 +264,7 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		`{"type":"response.output_item.added","item":{"type":"function_call"}}`,
 		`{"type":"response.output_item.added","item":{"type":"custom_tool_call"}}`,
 	} {
-		eventType := gjson.Get(payload, "type").String()
-		if boundary, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(eventType, []byte(payload)); !ok || boundary != codexCommitSemanticOutput {
+		if boundary, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(classifyCodexStreamEvent([]byte(payload))); !ok || boundary != codexCommitSemanticOutput {
 			t.Fatalf("expected semantic output boundary: %s", payload)
 		}
 	}
@@ -276,8 +274,7 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
 		`{"type":"response.output_item.added","item":{"type":"message"}}`,
 	} {
-		eventType := gjson.Get(payload, "type").String()
-		if _, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(eventType, []byte(payload)); ok {
+		if _, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(classifyCodexStreamEvent([]byte(payload))); ok {
 			t.Fatalf("unexpected semantic output boundary: %s", payload)
 		}
 	}
@@ -295,6 +292,34 @@ func TestCodexTransactionDiscardReason(t *testing.T) {
 	}
 	if got := codexTransactionDiscardReason(errors.New("upstream failed")); got != "terminal_error" {
 		t.Fatalf("failure reason = %q, want terminal_error", got)
+	}
+}
+
+func TestClassifyCodexStreamEvent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		payload    string
+		kind       codexStreamEventKind
+		toolChange codexToolTransition
+	}{
+		{name: "created envelope", payload: `{"type":"response.created"}`, kind: codexStreamEnvelope},
+		{name: "reasoning", payload: `{"type":"response.reasoning_summary_text.delta","delta":"thinking"}`, kind: codexStreamReasoning},
+		{name: "text", payload: `{"type":"response.output_text.delta","delta":"answer"}`, kind: codexStreamText},
+		{name: "tool start", payload: `{"type":"response.output_item.added","item":{"type":"function_call"}}`, kind: codexStreamTool, toolChange: codexToolStarted},
+		{name: "tool completion", payload: `{"type":"response.output_item.done","item":{"type":"custom_tool_call"}}`, kind: codexStreamTool, toolChange: codexToolCompleted},
+		{name: "terminal", payload: `{"type":"response.completed"}`, kind: codexStreamTerminal},
+		{name: "error", payload: `{"type":"error"}`, kind: codexStreamError},
+		{name: "unknown", payload: `{"type":"future.event"}`, kind: codexStreamUnknown},
+		{name: "malformed", payload: `{`, kind: codexStreamUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event := classifyCodexStreamEvent([]byte(test.payload))
+			if event.Kind != test.kind || event.ToolTransition != test.toolChange {
+				t.Fatalf("event = %+v, want kind=%d toolTransition=%d", event, test.kind, test.toolChange)
+			}
+		})
 	}
 }
 

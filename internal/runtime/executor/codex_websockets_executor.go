@@ -1023,7 +1023,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
-			streamBridge.observe(payload)
+			streamEvent := classifyCodexStreamEvent(payload)
+			streamBridge.observe(streamEvent)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
@@ -1037,7 +1038,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return
 			}
 
-			eventType := gjson.GetBytes(payload, "type").String()
+			eventType := streamEvent.Type
 			if from.String() == "claude" && strings.HasPrefix(executionSessionID, helps.ClaudeCodeWebsocketSessionPrefix) {
 				if agentCallKey, toolName, ok := codexFanoutToolCall(payload); ok {
 					if _, seen := speculativeAgentCalls[agentCallKey]; !seen {
@@ -1080,9 +1081,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 
-			payload = normalizeCodexWebsocketCompletion(payload)
-			eventType = gjson.GetBytes(payload, "type").String()
-			if boundary, commit := transactionalPolicy.commitBefore(eventType, payload); commit && delivery.buffering() {
+			payload = normalizeCodexWebsocketCompletionForEvent(payload, eventType)
+			if eventType == "response.done" {
+				eventType = "response.completed"
+				streamEvent.Type = eventType
+			}
+			if boundary, commit := transactionalPolicy.commitBefore(streamEvent); commit && delivery.buffering() {
 				if !delivery.flush(boundary) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
@@ -1896,7 +1900,11 @@ func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {
 }
 
 func normalizeCodexWebsocketCompletion(payload []byte) []byte {
-	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == "response.done" {
+	return normalizeCodexWebsocketCompletionForEvent(payload, strings.TrimSpace(gjson.GetBytes(payload, "type").String()))
+}
+
+func normalizeCodexWebsocketCompletionForEvent(payload []byte, eventType string) []byte {
+	if eventType == "response.done" {
 		updated, err := sjson.SetBytes(payload, "type", "response.completed")
 		if err == nil && len(updated) > 0 {
 			return updated

@@ -5,8 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-
-	"github.com/tidwall/gjson"
 )
 
 func codexTransactionDiscardReason(err error) string {
@@ -67,19 +65,17 @@ func (p codexTransactionalStreamPolicy) name() string {
 	}
 }
 
-func (p codexTransactionalStreamPolicy) commitBefore(eventType string, payload []byte) (codexStreamCommitBoundary, bool) {
+func (p codexTransactionalStreamPolicy) commitBefore(event codexStreamEvent) (codexStreamCommitBoundary, bool) {
 	if p.mode != codexTransactionalRootUntilSemanticOutput {
 		return "", false
 	}
-	switch eventType {
-	case "response.output_text.delta":
-		return codexCommitSemanticOutput, gjson.GetBytes(payload, "delta").String() != ""
-	case "response.output_item.added":
-		itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
-		return codexCommitSemanticOutput, itemType != "" && itemType != "reasoning" && itemType != "message"
-	default:
-		return "", false
+	if event.Kind == codexStreamText && event.HasTextDelta {
+		return codexCommitSemanticOutput, true
 	}
+	if event.Kind == codexStreamTool && event.ToolTransition == codexToolStarted {
+		return codexCommitSemanticOutput, true
+	}
+	return "", false
 }
 
 func isCodexCompletionEvent(eventType string) bool {

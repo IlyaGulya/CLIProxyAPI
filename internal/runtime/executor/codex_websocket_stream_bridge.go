@@ -1,34 +1,23 @@
 package executor
 
-import (
-	"strings"
-
-	"github.com/tidwall/gjson"
-)
-
 type codexWebsocketSemanticState struct {
 	lastEventType     string
 	toolCallsStarted  int64
 	toolCallsComplete int64
 }
 
-func (s *codexWebsocketSemanticState) observe(payload []byte) {
+func (s *codexWebsocketSemanticState) observe(event codexStreamEvent) {
 	if s == nil {
 		return
 	}
-	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-	if eventType == "" {
+	if event.Type == "" {
 		return
 	}
-	s.lastEventType = eventType
-	itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
-	if itemType != "function_call" && itemType != "custom_tool_call" {
-		return
-	}
-	switch eventType {
-	case "response.output_item.added":
+	s.lastEventType = event.Type
+	switch event.ToolTransition {
+	case codexToolStarted:
 		s.toolCallsStarted++
-	case "response.output_item.done":
+	case codexToolCompleted:
 		s.toolCallsComplete++
 	}
 }
@@ -61,9 +50,9 @@ func newCodexWebsocketStreamBridge() *codexWebsocketStreamBridge {
 	return &codexWebsocketStreamBridge{}
 }
 
-func (b *codexWebsocketStreamBridge) observe(payload []byte) {
+func (b *codexWebsocketStreamBridge) observe(event codexStreamEvent) {
 	if b != nil {
-		b.semantic.observe(payload)
+		b.semantic.observe(event)
 	}
 }
 
