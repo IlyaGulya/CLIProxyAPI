@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 )
 
 func TestCodexSessionStateMachineLegalLifecycle(t *testing.T) {
@@ -127,7 +128,7 @@ func TestCodexStreamBridgeTracksCommitAndToolCompletion(t *testing.T) {
 
 func TestCodexTransactionalStreamBufferLifecycle(t *testing.T) {
 	t.Parallel()
-	transaction := newCodexTransactionalStream(true)
+	transaction := newCodexTransactionalStream(codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: 5})
 	transaction.maxBytes = 5
 
 	if staged := transaction.stage(cliproxyexecutor.StreamChunk{Payload: []byte("abc")}); staged != codexStageBuffered {
@@ -139,7 +140,7 @@ func TestCodexTransactionalStreamBufferLifecycle(t *testing.T) {
 	if got := transaction.bytes; got != 3 {
 		t.Fatalf("buffered bytes = %d, want 3", got)
 	}
-	drain := transaction.drain()
+	drain := transaction.drain(codexCommitTerminal)
 	if drain.Bytes != 3 || len(drain.Chunks) != 1 || string(drain.Chunks[0].Payload) != "abc" {
 		t.Fatalf("drain = %+v", drain)
 	}
@@ -147,7 +148,7 @@ func TestCodexTransactionalStreamBufferLifecycle(t *testing.T) {
 
 func TestCodexTransactionalRetryResetPreservesOnlyBufferingState(t *testing.T) {
 	t.Parallel()
-	buffering, err := newCodexStreamDelivery(true, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
+	buffering, err := newCodexStreamDelivery(codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: 8}, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func TestCodexTransactionalRetryResetPreservesOnlyBufferingState(t *testing.T) {
 		t.Fatalf("buffering retry reset = %s/%d", got, buffering.bufferedBytes())
 	}
 
-	passthrough, err := newCodexStreamDelivery(true, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
+	passthrough, err := newCodexStreamDelivery(codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: 3}, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +177,7 @@ func TestCodexTransactionalRetryResetPreservesOnlyBufferingState(t *testing.T) {
 
 func TestCodexNonTransactionalTerminalErrorDoesNotInventTransactionState(t *testing.T) {
 	t.Parallel()
-	delivery, err := newCodexStreamDelivery(false, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
+	delivery, err := newCodexStreamDelivery(codexTransactionalStreamPolicy{}, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,11 +193,13 @@ func TestCodexStreamDeliveryOverflowOrdering(t *testing.T) {
 	t.Parallel()
 	var delivered []string
 	var overflowBytes int
-	delivery, err := newCodexStreamDelivery(true, func(chunk cliproxyexecutor.StreamChunk) bool {
+	var committed codexTransactionalDrain
+	delivery, err := newCodexStreamDelivery(codexTransactionalStreamPolicy{mode: codexTransactionalRootUntilSemanticOutput, maxBytes: 3}, func(chunk cliproxyexecutor.StreamChunk) bool {
 		delivered = append(delivered, string(chunk.Payload))
 		return true
 	}, codexStreamDeliveryHooks{
 		Overflowed: func(bytes int) { overflowBytes = bytes },
+		Committed:  func(drain codexTransactionalDrain) { committed = drain },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -212,6 +215,9 @@ func TestCodexStreamDeliveryOverflowOrdering(t *testing.T) {
 	if overflowBytes != 5 {
 		t.Fatalf("overflow bytes = %d, want 5", overflowBytes)
 	}
+	if committed.Boundary != codexCommitBufferLimit || committed.Bytes != 3 {
+		t.Fatalf("overflow commit = %+v, want buffer-limit boundary with 3 bytes", committed)
+	}
 	if got := strings.Join(delivered, ","); got != "abc,de" {
 		t.Fatalf("delivery order = %q, want abc,de", got)
 	}
@@ -220,14 +226,14 @@ func TestCodexStreamDeliveryOverflowOrdering(t *testing.T) {
 func TestCodexStreamDeliveryCompletionCommitsTransaction(t *testing.T) {
 	t.Parallel()
 	var committed codexTransactionalDrain
-	delivery, err := newCodexStreamDelivery(true, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{
+	delivery, err := newCodexStreamDelivery(codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: 8}, func(cliproxyexecutor.StreamChunk) bool { return true }, codexStreamDeliveryHooks{
 		Committed: func(drain codexTransactionalDrain) { committed = drain },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	delivery.send(cliproxyexecutor.StreamChunk{Payload: []byte("done")})
-	if !delivery.flush() {
+	if !delivery.flush(codexCommitTerminal) {
 		t.Fatal("flush unexpectedly stopped")
 	}
 	if got := delivery.state(); got != codexTransactionCommitted || committed.Bytes != 4 {
@@ -237,20 +243,20 @@ func TestCodexStreamDeliveryCompletionCommitsTransaction(t *testing.T) {
 
 func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 	t.Parallel()
-	if !shouldUseCodexTransactionalStream("claude", "agent", false) {
+	if !newCodexTransactionalPolicy("claude", "agent", false).enabled() {
 		t.Fatal("Claude child SSE stream should be transactional")
 	}
-	if got := codexTransactionalPolicy("claude", "", false); got != codexTransactionalRootUntilSemanticOutput {
-		t.Fatalf("Claude root policy = %d, want root-until-semantic-output", got)
+	if got := newCodexTransactionalPolicy("claude", "", false); got.mode != codexTransactionalRootUntilSemanticOutput || got.name() != "root_until_semantic_output" || got.maxBytes != codexTransactionalRootMaxBytes {
+		t.Fatalf("Claude root policy = %+v, want root-until-semantic-output", got)
 	}
-	if got := codexTransactionalPolicy("claude", "agent", false); got != codexTransactionalChildUntilTerminal {
-		t.Fatalf("Claude child policy = %d, want child-until-terminal", got)
+	if got := newCodexTransactionalPolicy("claude", "agent", false); got.mode != codexTransactionalChildUntilTerminal || got.name() != "child_until_terminal" || got.maxBytes != codexTransactionalChildMaxBytes {
+		t.Fatalf("Claude child policy = %+v, want child-until-terminal", got)
 	}
 	for _, input := range []struct {
 		source, agent string
 		downstream    bool
 	}{{"claude", "agent", true}, {"openai", "agent", false}} {
-		if shouldUseCodexTransactionalStream(input.source, input.agent, input.downstream) {
+		if newCodexTransactionalPolicy(input.source, input.agent, input.downstream).enabled() {
 			t.Fatalf("unexpected transactional policy for %+v", input)
 		}
 	}
@@ -259,7 +265,8 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		`{"type":"response.output_item.added","item":{"type":"function_call"}}`,
 		`{"type":"response.output_item.added","item":{"type":"custom_tool_call"}}`,
 	} {
-		if !isCodexSemanticOutputBoundary([]byte(payload)) {
+		eventType := gjson.Get(payload, "type").String()
+		if boundary, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(eventType, []byte(payload)); !ok || boundary != codexCommitSemanticOutput {
 			t.Fatalf("expected semantic output boundary: %s", payload)
 		}
 	}
@@ -269,7 +276,8 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
 		`{"type":"response.output_item.added","item":{"type":"message"}}`,
 	} {
-		if isCodexSemanticOutputBoundary([]byte(payload)) {
+		eventType := gjson.Get(payload, "type").String()
+		if _, ok := newCodexTransactionalPolicy("claude", "", false).commitBefore(eventType, []byte(payload)); ok {
 			t.Fatalf("unexpected semantic output boundary: %s", payload)
 		}
 	}
@@ -277,6 +285,16 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 		if !isCodexCompletionEvent(eventType) {
 			t.Fatalf("%s must terminate and commit the transaction", eventType)
 		}
+	}
+}
+
+func TestCodexTransactionDiscardReason(t *testing.T) {
+	t.Parallel()
+	if got := codexTransactionDiscardReason(context.Canceled); got != "context_done" {
+		t.Fatalf("cancellation reason = %q, want context_done", got)
+	}
+	if got := codexTransactionDiscardReason(errors.New("upstream failed")); got != "terminal_error" {
+		t.Fatalf("failure reason = %q, want terminal_error", got)
 	}
 }
 
@@ -321,7 +339,7 @@ func TestReduceCodexTransactionDefinesLegalTransitions(t *testing.T) {
 
 func TestNewCodexStreamDeliveryRejectsNilDeliverer(t *testing.T) {
 	t.Parallel()
-	if _, err := newCodexStreamDelivery(true, nil, codexStreamDeliveryHooks{}); !errors.Is(err, errCodexStreamDelivererRequired) {
+	if _, err := newCodexStreamDelivery(codexTransactionalStreamPolicy{mode: codexTransactionalChildUntilTerminal, maxBytes: 8}, nil, codexStreamDeliveryHooks{}); !errors.Is(err, errCodexStreamDelivererRequired) {
 		t.Fatalf("error = %v, want required deliverer", err)
 	}
 }

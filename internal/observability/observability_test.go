@@ -37,9 +37,11 @@ func TestMetricAttributesAreBoundedAndPrivacySafe(t *testing.T) {
 		"session_id":                      "session-secret",
 		"compaction_applied":              true,
 		"compaction_retained_tokens":      1234,
+		"transactional_policy":            "root_until_semantic_output",
+		"commit_boundary":                 "semantic_output",
 	})
 	text := attributesString(got)
-	for _, want := range []string{"model=gpt-5.6-luna", "connection.source=speculative", "finish.reason=completed", "success=true", "chain.source=full_replay", "incremental.reset_reason=no_previous_response", "compaction.applied=true"} {
+	for _, want := range []string{"model=gpt-5.6-luna", "connection.source=speculative", "finish.reason=completed", "success=true", "chain.source=full_replay", "incremental.reset_reason=no_previous_response", "compaction.applied=true", "stream.transaction.policy=root_until_semantic_output", "stream.commit.boundary=semantic_output"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("attributes missing %q: %s", want, text)
 		}

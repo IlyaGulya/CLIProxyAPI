@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -703,6 +704,9 @@ func TestCodexWebsocketsExecuteStreamRecoversChildDisconnectBeforeTransactionalC
 func TestCodexWebsocketsExecuteStreamRecoversRootDisconnectBeforeSemanticOutput(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var connections atomic.Int32
+	releaseRecoveredConnection := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseRecoveredConnection) }) })
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
 		if errUpgrade != nil {
@@ -724,6 +728,7 @@ func TestCodexWebsocketsExecuteStreamRecoversRootDisconnectBeforeSemanticOutput(
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-sol"}}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","item_id":"msg-recovered","output_index":0,"content_index":0,"delta":"recovered answer"}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-sol","output":[{"id":"msg-recovered","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"recovered answer","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
+		<-releaseRecoveredConnection
 	}))
 	defer server.Close()
 
@@ -762,12 +767,154 @@ func TestCodexWebsocketsExecuteStreamRecoversRootDisconnectBeforeSemanticOutput(
 		t.Fatal("websocket timeline was not captured")
 	}
 	timeline := string(timelineValue.([]byte))
-	for _, want := range []string{`"name":"transactional_stream_discarded"`, `"reason":"transport_retry"`, `"transport_retries":1`, `"reason":"completed"`} {
+	for _, want := range []string{
+		`"name":"transactional_stream_discarded"`, `"reason":"transport_retry"`,
+		`"name":"transactional_stream_committed"`, `"reason":"semantic_output"`,
+		`"transactional_policy":"root_until_semantic_output"`, `"commit_boundary":"semantic_output"`,
+		`"transport_retries":1`, `"reason":"completed"`,
+	} {
 		if !strings.Contains(timeline, want) {
 			t.Errorf("timeline missing %q: %s", want, timeline)
 		}
 	}
+	exec.sessions.store.mu.Lock()
+	session := exec.sessions.store.sessions["claude-code:root-recovery"]
+	exec.sessions.store.mu.Unlock()
+	if session == nil {
+		t.Fatal("recovered session is missing")
+	}
+	if got := session.lifecycle.state(); got != codexSessionReady {
+		t.Fatalf("recovered session state = %s, want ready", got)
+	}
+	releaseOnce.Do(func() { close(releaseRecoveredConnection) })
 	exec.CloseExecutionSession("claude-code:root-recovery")
+}
+
+func TestCodexWebsocketsExecuteStreamDoesNotRetryRootAfterSemanticCommit(t *testing.T) {
+	tests := []struct {
+		name   string
+		event  string
+		marker string
+	}{
+		{name: "output text", event: `{"type":"response.output_text.delta","item_id":"msg-partial","output_index":0,"content_index":0,"delta":"partial answer"}`, marker: "partial answer"},
+		{name: "tool call", event: `{"type":"response.output_item.added","output_index":0,"item":{"id":"fc-partial","type":"function_call","call_id":"call-partial","name":"Edit","arguments":"","status":"in_progress"}}`, marker: `"type":"tool_use"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			var connections atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+				if errUpgrade != nil {
+					t.Errorf("upgrade websocket: %v", errUpgrade)
+					return
+				}
+				connections.Add(1)
+				defer func() { _ = conn.Close() }()
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					t.Errorf("read websocket request: %v", errRead)
+					return
+				}
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-partial","model":"gpt-5.6-sol"}}`))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(test.event))
+				_ = conn.UnderlyingConn().Close()
+			}))
+			defer server.Close()
+
+			exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll, RequestLog: true}})
+			auth := &cliproxyauth.Auth{ID: "auth-root-commit", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+			payload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"commit root"}],"max_tokens":128,"stream":true}`)
+			ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			ginCtx.Request.Header = http.Header{helps.ClaudeCodeSessionHeader: []string{"root-commit-" + test.name}}
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload,
+				Headers: ginCtx.Request.Header.Clone(), Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:root-commit-" + test.name},
+			})
+			if errExecute != nil {
+				t.Fatalf("ExecuteStream() error = %v", errExecute)
+			}
+			var downstream strings.Builder
+			var terminalErr error
+			for chunk := range result.Chunks {
+				downstream.Write(chunk.Payload)
+				if chunk.Err != nil {
+					terminalErr = chunk.Err
+				}
+			}
+			if terminalErr == nil {
+				t.Fatal("missing terminal transport error after semantic commit")
+			}
+			if got := connections.Load(); got != 1 {
+				t.Fatalf("connections = %d, want no retry after semantic commit", got)
+			}
+			if !strings.Contains(downstream.String(), test.marker) {
+				t.Fatalf("committed semantic output missing %q: %s", test.marker, downstream.String())
+			}
+			timeline := string(ginCtx.MustGet("API_WEBSOCKET_TIMELINE").([]byte))
+			for _, want := range []string{`"name":"transactional_stream_committed"`, `"reason":"semantic_output"`, `"name":"transport_retry_suppressed"`, `"boundary":"after_downstream_commit"`} {
+				if !strings.Contains(timeline, want) {
+					t.Errorf("timeline missing %q: %s", want, timeline)
+				}
+			}
+			exec.CloseExecutionSession("claude-code:root-commit-" + test.name)
+		})
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamCancelsBufferedRootWithoutLeakingPayload(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	reasoningSent := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-cancelled","model":"gpt-5.6-sol"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.reasoning_summary_text.delta","item_id":"rs-cancelled","output_index":0,"summary_index":0,"delta":"private buffered reasoning"}`))
+		close(reasoningSent)
+		<-release
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-root-cancel", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"cancel root"}],"max_tokens":128,"stream":true}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload,
+		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:root-cancel"},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	<-reasoningSent
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	payloadChunks, errorChunks := 0, 0
+	for chunk := range result.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloadChunks++
+		}
+		if chunk.Err != nil {
+			errorChunks++
+		}
+	}
+	if payloadChunks != 0 || errorChunks != 0 {
+		t.Fatalf("payload/error chunks = %d/%d, want cancellation to close cleanly without leaking buffered payload", payloadChunks, errorChunks)
+	}
+	releaseOnce.Do(func() { close(release) })
+	exec.CloseExecutionSession("claude-code:root-cancel")
 }
 
 func TestCodexWebsocketConnectionObservationTracksReuse(t *testing.T) {

@@ -1,5 +1,21 @@
 package observability
 
+type TransactionalPolicy string
+
+const (
+	TransactionalPolicyDisabled                TransactionalPolicy = "disabled"
+	TransactionalPolicyRootUntilSemanticOutput TransactionalPolicy = "root_until_semantic_output"
+	TransactionalPolicyChildUntilTerminal      TransactionalPolicy = "child_until_terminal"
+)
+
+type StreamCommitBoundary string
+
+const (
+	StreamCommitBoundarySemanticOutput StreamCommitBoundary = "semantic_output"
+	StreamCommitBoundaryTerminal       StreamCommitBoundary = "terminal"
+	StreamCommitBoundaryBufferLimit    StreamCommitBoundary = "buffer_limit"
+)
+
 // Optional distinguishes an explicitly reported zero value from an attribute
 // that was not measured for an event.
 type Optional[T any] struct {
@@ -29,6 +45,8 @@ type WebsocketAttributes struct {
 	PromptPrefixFingerprint string
 	PromptCacheTTL          string
 	PromptCacheDecision     string
+	TransactionalPolicy     TransactionalPolicy
+	CommitBoundary          StreamCommitBoundary
 
 	Success             Optional[bool]
 	Reused              Optional[bool]
@@ -108,6 +126,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 		"tool_name":          a.ToolName,
 		"prompt_cache_scope": a.PromptCacheScope, "prompt_prefix_fingerprint": a.PromptPrefixFingerprint,
 		"prompt_cache_ttl": a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
+		"transactional_policy": string(a.TransactionalPolicy), "commit_boundary": string(a.CommitBoundary),
 	} {
 		if value != "" {
 			fields[key] = value

@@ -112,6 +112,7 @@ type codexTransactionalDrain struct {
 	Chunks   []cliproxyexecutor.StreamChunk
 	Bytes    int
 	Duration time.Duration
+	Boundary codexStreamCommitBoundary
 }
 
 type codexTransactionalStream struct {
@@ -122,13 +123,13 @@ type codexTransactionalStream struct {
 	startedAt time.Time
 }
 
-func newCodexTransactionalStream(enabled bool) codexTransactionalStream {
+func newCodexTransactionalStream(policy codexTransactionalStreamPolicy) codexTransactionalStream {
 	state := codexTransactionDisabled
-	if enabled {
+	if policy.enabled() {
 		state = codexTransactionBuffering
 	}
 	return codexTransactionalStream{
-		state: state, maxBytes: codexTransactionalChildStreamMaxBytes,
+		state: state, maxBytes: policy.maxBytes,
 		chunks: make([]cliproxyexecutor.StreamChunk, 0, 64), startedAt: time.Now(),
 	}
 }
@@ -155,8 +156,8 @@ func (t *codexTransactionalStream) stage(chunk cliproxyexecutor.StreamChunk) cod
 	return codexStageBuffered
 }
 
-func (t *codexTransactionalStream) drain() codexTransactionalDrain {
-	drain := codexTransactionalDrain{Chunks: t.chunks, Bytes: t.bytes, Duration: time.Since(t.startedAt)}
+func (t *codexTransactionalStream) drain(boundary codexStreamCommitBoundary) codexTransactionalDrain {
+	drain := codexTransactionalDrain{Chunks: t.chunks, Bytes: t.bytes, Duration: time.Since(t.startedAt), Boundary: boundary}
 	t.chunks = make([]cliproxyexecutor.StreamChunk, 0, 64)
 	t.bytes = 0
 	return drain
@@ -172,7 +173,7 @@ func (t *codexTransactionalStream) discardBuffer() int {
 
 type codexStreamDeliveryHooks struct {
 	Committed  func(codexTransactionalDrain)
-	Discarded  func(int)
+	Discarded  func(int, error)
 	Overflowed func(int)
 }
 
@@ -184,13 +185,13 @@ type codexStreamDelivery struct {
 	transaction codexTransactionalStream
 }
 
-func newCodexStreamDelivery(transactional bool, deliver func(cliproxyexecutor.StreamChunk) bool, hooks codexStreamDeliveryHooks) (*codexStreamDelivery, error) {
+func newCodexStreamDelivery(policy codexTransactionalStreamPolicy, deliver func(cliproxyexecutor.StreamChunk) bool, hooks codexStreamDeliveryHooks) (*codexStreamDelivery, error) {
 	if deliver == nil {
 		return nil, errCodexStreamDelivererRequired
 	}
 	return &codexStreamDelivery{
 		deliver: deliver, hooks: hooks,
-		transaction: newCodexTransactionalStream(transactional),
+		transaction: newCodexTransactionalStream(policy),
 	}, nil
 }
 
@@ -202,8 +203,8 @@ func (d *codexStreamDelivery) apply(event codexTransactionalEvent) bool {
 	return true
 }
 
-func (d *codexStreamDelivery) flush() bool {
-	drain := d.transaction.drain()
+func (d *codexStreamDelivery) flush(boundary codexStreamCommitBoundary) bool {
+	drain := d.transaction.drain(boundary)
 	for i := range drain.Chunks {
 		if !d.deliver(drain.Chunks[i]) {
 			return false
@@ -226,7 +227,7 @@ func (d *codexStreamDelivery) send(chunk cliproxyexecutor.StreamChunk) bool {
 				return false
 			}
 			if discardedBytes > 0 && d.hooks.Discarded != nil {
-				d.hooks.Discarded(discardedBytes)
+				d.hooks.Discarded(discardedBytes, chunk.Err)
 			}
 		}
 		return d.deliver(chunk)
@@ -241,7 +242,7 @@ func (d *codexStreamDelivery) send(chunk cliproxyexecutor.StreamChunk) bool {
 		if !d.apply(codexTransactionOverflow) {
 			return false
 		}
-		if !d.flush() {
+		if !d.flush(codexCommitBufferLimit) {
 			return false
 		}
 	}
