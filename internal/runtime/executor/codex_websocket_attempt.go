@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
@@ -13,17 +12,12 @@ import (
 
 func (e *CodexWebsocketsExecutor) newObservedCodexAttempt(ctx context.Context, sessionID, model string) *codexAttemptMachine {
 	return newCodexAttemptMachine(func(transition codexAttemptTransition) {
-		actions := make([]string, len(transition.Actions))
-		for i, action := range transition.Actions {
-			actions[i] = action.String()
-		}
 		helps.RecordAPIWebsocketEvent(ctx, e.cfg, "attempt_transition", observability.WebsocketAttributes{
 			SessionID:        sessionID,
 			Model:            model,
 			AttemptStateFrom: observability.WebsocketAttemptState(transition.From.String()),
 			AttemptStateTo:   observability.WebsocketAttemptState(transition.To.String()),
 			AttemptEvent:     observability.WebsocketAttemptEvent(transition.Event.String()),
-			AttemptActions:   strings.Join(actions, "."),
 		}, nil)
 		for _, action := range transition.Actions {
 			helps.RecordAPIWebsocketEvent(ctx, e.cfg, "attempt_action", observability.WebsocketAttributes{
@@ -62,11 +56,11 @@ func (l *codexConnectionLease) takeHandshakeResponse() *http.Response {
 
 func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func() (codexConnectionLease, error)) (codexConnectionLease, error) {
 	result := codexConnectionLease{}
-	_, err := attempt.dispatch(codexAttemptConnectRequested, codexAttemptActionHandlers{Dial: func() error {
+	_, err := attempt.dispatch(codexAttemptConnectRequested, codexAttemptActionSet{bindCodexAttemptAction(codexAttemptDial, func() error {
 		var errDial error
 		result, errDial = dial()
 		return errDial
-	}})
+	})})
 	if err == nil {
 		err = result.validate()
 	}
@@ -82,13 +76,11 @@ func connectCodexStreamAttempt(attempt *codexAttemptMachine, dial func() (codexC
 
 func activateCodexStreamReader(attempt *codexAttemptMachine, session *codexWebsocketSession) (chan codexWebsocketRead, error) {
 	if session == nil {
-		_, err := attempt.dispatch(codexAttemptReaderActivated, codexAttemptActionHandlers{ActivateReader: func() error { return nil }})
+		_, err := attempt.dispatch(codexAttemptReaderActivated, codexAttemptActionSet{bindCodexAttemptAction(codexAttemptActivateReader, func() error { return nil })})
 		return nil, err
 	}
 	read := make(chan codexWebsocketRead, 4096)
-	_, err := attempt.dispatch(codexAttemptReaderActivated, codexAttemptActionHandlers{
-		ActivateReader: func() error { return session.activateReader(read) },
-	})
+	_, err := attempt.dispatch(codexAttemptReaderActivated, codexAttemptActionSet{bindCodexAttemptAction(codexAttemptActivateReader, func() error { return session.activateReader(read) })})
 	if err != nil {
 		return nil, err
 	}

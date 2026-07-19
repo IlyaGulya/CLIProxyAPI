@@ -592,53 +592,21 @@ func TestCodexWebsocketsExecuteStreamRetriesReadDisconnectBeforeDownstreamOutput
 }
 
 func TestCodexWebsocketsExecuteStreamRecoversChildDisconnectBeforeTransactionalCommit(t *testing.T) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	var connections atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
-		if errUpgrade != nil {
-			t.Errorf("upgrade websocket: %v", errUpgrade)
-			return
-		}
-		connection := connections.Add(1)
-		defer func() { _ = conn.Close() }()
-		if _, _, errRead := conn.ReadMessage(); errRead != nil {
-			t.Errorf("read websocket request: %v", errRead)
-			return
-		}
-		if connection == 2 {
-			created := []byte(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-luna"}}`)
-			if errWrite := conn.WriteMessage(websocket.TextMessage, created); errWrite != nil {
-				t.Errorf("write recovered created: %v", errWrite)
-				return
-			}
-			completed := []byte(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-luna","output":[{"id":"fc-recovered","type":"function_call","call_id":"call-recovered","name":"Edit","arguments":"{\"file_path\":\"README.md\"}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
-			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
-				t.Errorf("write recovered completion: %v", errWrite)
-			}
-			return
-		}
-		created := []byte(`{"type":"response.created","response":{"id":"resp-partial","model":"gpt-5.6-luna"}}`)
-		if errWrite := conn.WriteMessage(websocket.TextMessage, created); errWrite != nil {
-			t.Errorf("write created: %v", errWrite)
-			return
-		}
-		toolStarted := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc-partial","type":"function_call","call_id":"call-partial","name":"Edit","arguments":"","status":"in_progress"}}`)
-		if errWrite := conn.WriteMessage(websocket.TextMessage, toolStarted); errWrite != nil {
-			t.Errorf("write tool start: %v", errWrite)
-			return
-		}
-		toolDelta := []byte(`{"type":"response.function_call_arguments.delta","item_id":"fc-partial","output_index":0,"delta":"{\\"file_path\\":"}`)
-		if errWrite := conn.WriteMessage(websocket.TextMessage, toolDelta); errWrite != nil {
-			t.Errorf("write tool delta: %v", errWrite)
-			return
-		}
-		_ = conn.UnderlyingConn().Close()
-	}))
-	defer server.Close()
+	upstream := newCodexScriptedUpstream(t,
+		[]codexWebsocketScriptStep{
+			codexSend(`{"type":"response.created","response":{"id":"resp-partial","model":"gpt-5.6-luna"}}`),
+			codexSend(`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc-partial","type":"function_call","call_id":"call-partial","name":"Edit","arguments":"","status":"in_progress"}}`),
+			codexSend(`{"type":"response.function_call_arguments.delta","item_id":"fc-partial","output_index":0,"delta":"{\\"file_path\\":"}`),
+			codexDisconnect1006(),
+		},
+		[]codexWebsocketScriptStep{
+			codexSend(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-luna"}}`),
+			codexSend(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-luna","output":[{"id":"fc-recovered","type":"function_call","call_id":"call-recovered","name":"Edit","arguments":"{\"file_path\":\"README.md\"}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`),
+		},
+	)
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll, RequestLog: true}})
-	auth := &cliproxyauth.Auth{ID: "auth-partial", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	auth := &cliproxyauth.Auth{ID: "auth-partial", Attributes: map[string]string{"api_key": "sk-test", "base_url": upstream.URL()}}
 	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"partial"}],"max_tokens":128,"stream":true}`)
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
@@ -669,7 +637,7 @@ func TestCodexWebsocketsExecuteStreamRecoversChildDisconnectBeforeTransactionalC
 	if errorChunks != 0 {
 		t.Fatalf("error chunks = %d, want recovery without a downstream error", errorChunks)
 	}
-	if got := connections.Load(); got != 2 {
+	if got := upstream.Connections(); got != 2 {
 		t.Fatalf("connections = %d, want one fresh connection for recovery", got)
 	}
 	if got := strings.Count(downstream.String(), `event: message_start`); got != 1 {

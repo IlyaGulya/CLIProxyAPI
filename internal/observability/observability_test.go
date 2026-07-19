@@ -196,14 +196,12 @@ func TestWebsocketAttributesEncodeAttemptTransition(t *testing.T) {
 		AttemptStateFrom: WebsocketAttemptState("interrupted"),
 		AttemptStateTo:   WebsocketAttemptState("retrying"),
 		AttemptEvent:     WebsocketAttemptEvent("retry_approved"),
-		AttemptActions:   "discard_buffer.reset_semantics",
 	}.fields()
 	encoded := attributesString(metricAttributes(fields))
 	for _, want := range []string{
 		"attempt.state.from=interrupted",
 		"attempt.state.to=retrying",
 		"attempt.event=retry_approved",
-		"attempt.actions=discard_buffer.reset_semantics",
 	} {
 		if !strings.Contains(encoded, want) {
 			t.Fatalf("attempt transition missing %q: %s", want, encoded)

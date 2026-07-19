@@ -37,7 +37,7 @@ func (s codexTransactionalState) String() string {
 	case codexTransactionDiscarded:
 		return "discarded"
 	default:
-		return fmt.Sprintf("transaction_state(%d)", s)
+		return "unknown"
 	}
 }
 
@@ -61,7 +61,7 @@ func (e codexTransactionalEvent) String() string {
 	case codexTransactionRetryReset:
 		return "retry_reset"
 	default:
-		return fmt.Sprintf("transaction_event(%d)", e)
+		return "unknown"
 	}
 }
 
@@ -104,7 +104,7 @@ func (o codexStageOutcome) String() string {
 	case codexStageOverflow:
 		return "overflow"
 	default:
-		return fmt.Sprintf("stage_outcome(%d)", o)
+		return "unknown"
 	}
 }
 

@@ -53,7 +53,6 @@ type WebsocketAttributes struct {
 	AttemptStateFrom        WebsocketAttemptState
 	AttemptStateTo          WebsocketAttemptState
 	AttemptEvent            WebsocketAttemptEvent
-	AttemptActions          string
 
 	Success             Optional[bool]
 	Reused              Optional[bool]
@@ -135,7 +134,7 @@ func (a WebsocketAttributes) fields() map[string]any {
 		"prompt_cache_ttl": a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
 		"transactional_policy": string(a.TransactionalPolicy), "commit_boundary": string(a.CommitBoundary),
 		"attempt_state_from": string(a.AttemptStateFrom), "attempt_state_to": string(a.AttemptStateTo),
-		"attempt_event": string(a.AttemptEvent), "attempt_actions": a.AttemptActions,
+		"attempt_event": string(a.AttemptEvent),
 	} {
 		if value != "" {
 			fields[key] = value

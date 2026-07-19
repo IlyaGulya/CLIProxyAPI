@@ -228,7 +228,7 @@ func TestScheduleSpeculativePreconnectRecordsReadyMetric(t *testing.T) {
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	expectedRootCorrelation, _ := helps.ClaudeCodeCorrelationIDs(ctx, nil, nil)
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	exec.scheduleSpeculativePreconnect(ctx, &cliproxyauth.Auth{ID: authID, Provider: "codex"}, authID, wsURL, http.Header{}, "root-session", nil)
+	exec.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: ctx, auth: &cliproxyauth.Auth{ID: authID, Provider: "codex"}, authID: authID, url: wsURL, headers: http.Header{}, sessionID: "root-session", trigger: "fanout_tool", toolName: "Agent"})
 	ginCtx.Request.Header.Set(helps.ClaudeCodeSessionHeader, "reused-child-session")
 
 	select {
@@ -274,7 +274,7 @@ func TestScheduleSpeculativePreconnectRecordsRateLimitedFailureMetric(t *testing
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	exec.scheduleSpeculativePreconnect(ctx, &cliproxyauth.Auth{ID: authID, Provider: "codex"}, authID, wsURL, http.Header{}, "root-session", nil)
+	exec.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: ctx, auth: &cliproxyauth.Auth{ID: authID, Provider: "codex"}, authID: authID, url: wsURL, headers: http.Header{}, sessionID: "root-session", trigger: "fanout_tool", toolName: "Agent"})
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -322,7 +322,7 @@ func TestSuccessfulLeaseReplenishesWithinCap(t *testing.T) {
 	exec := NewCodexWebsocketsExecutor(cfg)
 	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root-session", nil)
+	exec.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: context.Background(), auth: auth, authID: authID, url: wsURL, headers: http.Header{}, sessionID: "root-session", trigger: "fanout_tool", toolName: "Agent"})
 	select {
 	case <-connected:
 	case <-time.After(time.Second):
@@ -384,7 +384,7 @@ func TestReplenishment429EntersCooldownWithoutRetryLoop(t *testing.T) {
 	exec := NewCodexWebsocketsExecutor(cfg)
 	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root", nil)
+	exec.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: context.Background(), auth: auth, authID: authID, url: wsURL, headers: http.Header{}, sessionID: "root", trigger: "fanout_tool", toolName: "Agent"})
 	select {
 	case <-connected:
 	case <-time.After(time.Second):
@@ -402,7 +402,7 @@ func TestReplenishment429EntersCooldownWithoutRetryLoop(t *testing.T) {
 	if attempts.Load() != 2 {
 		t.Fatalf("dial attempts = %d, want initial plus one replenishment", attempts.Load())
 	}
-	exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root", nil)
+	exec.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: context.Background(), auth: auth, authID: authID, url: wsURL, headers: http.Header{}, sessionID: "root", trigger: "fanout_tool", toolName: "Agent"})
 	time.Sleep(50 * time.Millisecond)
 	if attempts.Load() != 2 {
 		t.Fatalf("429 replenishment retried in a loop: attempts=%d", attempts.Load())
@@ -440,7 +440,7 @@ func TestParallelLeasesReplenishWithoutExceedingCap(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	for range 2 {
-		exec.scheduleSpeculativePreconnect(context.Background(), auth, authID, wsURL, http.Header{}, "root", nil)
+		exec.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: context.Background(), auth: auth, authID: authID, url: wsURL, headers: http.Header{}, sessionID: "root", trigger: "fanout_tool", toolName: "Agent"})
 	}
 	for range 2 {
 		select {

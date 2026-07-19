@@ -19,7 +19,7 @@ const (
 )
 
 func (s codexSessionState) String() string {
-	return [...]string{"idle", "dialing", "ready", "busy", "draining", "closed"}[min(int(s), 5)]
+	return codexEnumString(int(s), []string{"idle", "dialing", "ready", "busy", "draining", "closed"})
 }
 
 type codexSessionEvent uint8
@@ -37,7 +37,7 @@ const (
 )
 
 func (e codexSessionEvent) String() string {
-	return [...]string{"dial_requested", "connected", "request_started", "semantic_failed", "transport_failed", "request_finished", "idle_expired", "drain_requested", "closed"}[min(int(e), 8)]
+	return codexEnumString(int(e), []string{"dial_requested", "connected", "request_started", "semantic_failed", "transport_failed", "request_finished", "idle_expired", "drain_requested", "closed"})
 }
 
 type codexSessionAction uint8

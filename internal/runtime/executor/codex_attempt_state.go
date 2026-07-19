@@ -22,7 +22,7 @@ const (
 )
 
 func (s codexAttemptState) String() string {
-	return [...]string{"prepared", "connecting", "ready", "reader_ready", "active", "interrupted", "retrying", "completed", "failed", "cancelled"}[min(int(s), 9)]
+	return codexEnumString(int(s), []string{"prepared", "connecting", "ready", "reader_ready", "active", "interrupted", "retrying", "completed", "failed", "cancelled"})
 }
 
 type codexAttemptEvent uint8
@@ -41,7 +41,7 @@ const (
 )
 
 func (e codexAttemptEvent) String() string {
-	return [...]string{"connect_requested", "connected", "reader_activated", "request_sent", "interrupted", "retry_approved", "recovery_prepared", "terminal_received", "failed", "cancelled"}[min(int(e), 9)]
+	return codexEnumString(int(e), []string{"connect_requested", "connected", "reader_activated", "request_sent", "interrupted", "retry_approved", "recovery_prepared", "terminal_received", "failed", "cancelled"})
 }
 
 type codexAttemptAction uint8
@@ -57,7 +57,7 @@ const (
 )
 
 func (a codexAttemptAction) String() string {
-	return [...]string{"dial", "activate_reader", "send_request", "detach_reader", "close_connection", "discard_buffer", "reset_semantics"}[min(int(a), 6)]
+	return codexEnumString(int(a), []string{"dial", "activate_reader", "send_request", "detach_reader", "close_connection", "discard_buffer", "reset_semantics"})
 }
 
 type codexAttemptTransition struct {
@@ -188,12 +188,12 @@ func (m *codexAttemptMachine) commit(transition codexAttemptTransition) error {
 	return nil
 }
 
-func (m *codexAttemptMachine) dispatch(event codexAttemptEvent, handlers codexAttemptActionHandlers) (codexAttemptTransition, error) {
+func (m *codexAttemptMachine) dispatch(event codexAttemptEvent, executor codexAttemptActionExecutor) (codexAttemptTransition, error) {
 	transition, err := m.plan(event)
 	if err != nil {
 		return transition, err
 	}
-	if err = runCodexAttemptActions(transition.Actions, handlers); err != nil {
+	if err = runCodexAttemptActions(transition.Actions, executor); err != nil {
 		return transition, err
 	}
 	return transition, m.commit(transition)
@@ -208,45 +208,35 @@ func (m *codexAttemptMachine) current() codexAttemptState {
 	return m.state
 }
 
-type codexAttemptActionHandlers struct {
-	Dial            func() error
-	ActivateReader  func() error
-	SendRequest     func() error
-	DetachReader    func() error
-	CloseConnection func() error
-	DiscardBuffer   func() error
-	ResetSemantics  func() error
-}
-
 type codexAttemptActionExecutor interface {
 	ExecuteCodexAttemptAction(codexAttemptAction) error
 }
 
-func (h codexAttemptActionHandlers) ExecuteCodexAttemptAction(action codexAttemptAction) error {
-	var handler func() error
-	switch action {
-	case codexAttemptDial:
-		handler = h.Dial
-	case codexAttemptActivateReader:
-		handler = h.ActivateReader
-	case codexAttemptSendRequest:
-		handler = h.SendRequest
-	case codexAttemptDetachReader:
-		handler = h.DetachReader
-	case codexAttemptCloseConnection:
-		handler = h.CloseConnection
-	case codexAttemptDiscardBuffer:
-		handler = h.DiscardBuffer
-	case codexAttemptResetSemantics:
-		handler = h.ResetSemantics
+type codexAttemptActionBinding struct {
+	action codexAttemptAction
+	run    func() error
+}
+
+type codexAttemptActionSet []codexAttemptActionBinding
+
+func bindCodexAttemptAction(action codexAttemptAction, run func() error) codexAttemptActionBinding {
+	if run == nil {
+		panic("codex attempt action binding requires a function")
 	}
-	if handler == nil {
-		return fmt.Errorf("codex attempt action %s has no handler", action)
+	return codexAttemptActionBinding{action: action, run: run}
+}
+
+func (s codexAttemptActionSet) ExecuteCodexAttemptAction(action codexAttemptAction) error {
+	for _, binding := range s {
+		if binding.action != action {
+			continue
+		}
+		if err := binding.run(); err != nil {
+			return fmt.Errorf("codex attempt action %s: %w", action, err)
+		}
+		return nil
 	}
-	if err := handler(); err != nil {
-		return fmt.Errorf("codex attempt action %s: %w", action, err)
-	}
-	return nil
+	return fmt.Errorf("codex attempt action %s is not supported by this phase", action)
 }
 
 func runCodexAttemptActions(actions []codexAttemptAction, executor codexAttemptActionExecutor) error {

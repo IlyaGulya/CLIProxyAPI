@@ -410,10 +410,14 @@ func TestCodexAttemptActionRunnerPreservesReducerOrder(t *testing.T) {
 		}
 	}
 	actions := []codexAttemptAction{codexAttemptDetachReader, codexAttemptCloseConnection, codexAttemptDiscardBuffer, codexAttemptResetSemantics, codexAttemptDial, codexAttemptActivateReader, codexAttemptSendRequest}
-	err := runCodexAttemptActions(actions, codexAttemptActionHandlers{
-		Dial: handler(codexAttemptDial), ActivateReader: handler(codexAttemptActivateReader), SendRequest: handler(codexAttemptSendRequest),
-		DetachReader: handler(codexAttemptDetachReader), CloseConnection: handler(codexAttemptCloseConnection),
-		DiscardBuffer: handler(codexAttemptDiscardBuffer), ResetSemantics: handler(codexAttemptResetSemantics),
+	err := runCodexAttemptActions(actions, codexAttemptActionSet{
+		bindCodexAttemptAction(codexAttemptDial, handler(codexAttemptDial)),
+		bindCodexAttemptAction(codexAttemptActivateReader, handler(codexAttemptActivateReader)),
+		bindCodexAttemptAction(codexAttemptSendRequest, handler(codexAttemptSendRequest)),
+		bindCodexAttemptAction(codexAttemptDetachReader, handler(codexAttemptDetachReader)),
+		bindCodexAttemptAction(codexAttemptCloseConnection, handler(codexAttemptCloseConnection)),
+		bindCodexAttemptAction(codexAttemptDiscardBuffer, handler(codexAttemptDiscardBuffer)),
+		bindCodexAttemptAction(codexAttemptResetSemantics, handler(codexAttemptResetSemantics)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -421,7 +425,7 @@ func TestCodexAttemptActionRunnerPreservesReducerOrder(t *testing.T) {
 	if !slices.Equal(got, actions) {
 		t.Fatalf("action order = %v, want %v", got, actions)
 	}
-	if err := runCodexAttemptActions([]codexAttemptAction{codexAttemptDial}, codexAttemptActionHandlers{}); err == nil {
+	if err := runCodexAttemptActions([]codexAttemptAction{codexAttemptDial}, codexAttemptActionSet{}); err == nil {
 		t.Fatal("missing action handler should fail")
 	}
 }
@@ -432,7 +436,7 @@ func TestCodexAttemptMachineObservesAcceptedTransitions(t *testing.T) {
 	machine := newCodexAttemptMachine(func(transition codexAttemptTransition) {
 		observed = append(observed, transition)
 	})
-	if _, err := machine.dispatch(codexAttemptConnectRequested, codexAttemptActionHandlers{Dial: func() error { return nil }}); err != nil {
+	if _, err := machine.dispatch(codexAttemptConnectRequested, codexAttemptActionSet{bindCodexAttemptAction(codexAttemptDial, func() error { return nil })}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := machine.commitEvent(codexAttemptRequestSent); !errors.Is(err, errCodexAttemptTransition) {
@@ -451,6 +455,24 @@ func TestCodexAttemptCommitEventRejectsActionfulTransition(t *testing.T) {
 	}
 	if machine.current() != codexAttemptPrepared {
 		t.Fatalf("state = %s", machine.current())
+	}
+}
+
+func TestCodexEnumStringersReturnUnknownOutsideDomain(t *testing.T) {
+	t.Parallel()
+	for name, got := range map[string]string{
+		"attempt_state":     codexAttemptState(255).String(),
+		"attempt_event":     codexAttemptEvent(255).String(),
+		"attempt_action":    codexAttemptAction(255).String(),
+		"session_state":     codexSessionState(255).String(),
+		"session_event":     codexSessionEvent(255).String(),
+		"transaction_state": codexTransactionalState(255).String(),
+		"transaction_event": codexTransactionalEvent(255).String(),
+		"stage_outcome":     codexStageOutcome(255).String(),
+	} {
+		if got != "unknown" {
+			t.Errorf("%s = %q", name, got)
+		}
 	}
 }
 
@@ -494,12 +516,12 @@ func TestCodexAttemptDispatchCommitsOnlyAfterActionsSucceed(t *testing.T) {
 		name     string
 		prepare  []codexAttemptEvent
 		event    codexAttemptEvent
-		handlers codexAttemptActionHandlers
+		handlers codexAttemptActionSet
 		want     codexAttemptState
 	}{
-		{name: "dial", event: codexAttemptConnectRequested, handlers: codexAttemptActionHandlers{Dial: func() error { return errors.New("dial") }}, want: codexAttemptPrepared},
-		{name: "activate", prepare: []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected}, event: codexAttemptReaderActivated, handlers: codexAttemptActionHandlers{ActivateReader: func() error { return errors.New("activate") }}, want: codexAttemptReady},
-		{name: "send", prepare: []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected, codexAttemptReaderActivated}, event: codexAttemptRequestSent, handlers: codexAttemptActionHandlers{SendRequest: func() error { return errors.New("send") }}, want: codexAttemptReaderReady},
+		{name: "dial", event: codexAttemptConnectRequested, handlers: codexAttemptActionSet{bindCodexAttemptAction(codexAttemptDial, func() error { return errors.New("dial") })}, want: codexAttemptPrepared},
+		{name: "activate", prepare: []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected}, event: codexAttemptReaderActivated, handlers: codexAttemptActionSet{bindCodexAttemptAction(codexAttemptActivateReader, func() error { return errors.New("activate") })}, want: codexAttemptReady},
+		{name: "send", prepare: []codexAttemptEvent{codexAttemptConnectRequested, codexAttemptConnected, codexAttemptReaderActivated}, event: codexAttemptRequestSent, handlers: codexAttemptActionSet{bindCodexAttemptAction(codexAttemptSendRequest, func() error { return errors.New("send") })}, want: codexAttemptReaderReady},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			machine := newCodexAttemptMachine()

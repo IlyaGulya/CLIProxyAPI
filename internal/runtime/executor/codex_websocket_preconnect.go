@@ -158,14 +158,6 @@ func codexFanoutToolName(name string) bool {
 	}
 }
 
-func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnect(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte) {
-	e.scheduleSpeculativePreconnectForFanout(ctx, auth, authID, wsURL, headers, sessionID, warmupTemplate, "Agent")
-}
-
-func (e *CodexWebsocketsExecutor) scheduleSpeculativePreconnectForFanout(ctx context.Context, auth *cliproxyauth.Auth, authID string, wsURL string, headers http.Header, sessionID string, warmupTemplate []byte, toolName string) {
-	e.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: ctx, auth: auth, authID: authID, url: wsURL, headers: headers, sessionID: sessionID, warmupTemplate: warmupTemplate, trigger: "fanout_tool", toolName: toolName})
-}
-
 type codexPreconnectRequest struct {
 	ctx            context.Context
 	auth           *cliproxyauth.Auth

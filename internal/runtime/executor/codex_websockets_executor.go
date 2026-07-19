@@ -113,19 +113,17 @@ type codexWebsocketSession struct {
 
 type codexReaderLease struct {
 	channel chan codexWebsocketRead
-	done    <-chan struct{}
-	cancel  context.CancelFunc
+	done    chan struct{}
 	once    sync.Once
 }
 
 func newCodexReaderLease(channel chan codexWebsocketRead) *codexReaderLease {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &codexReaderLease{channel: channel, done: ctx.Done(), cancel: cancel}
+	return &codexReaderLease{channel: channel, done: make(chan struct{})}
 }
 
 func (l *codexReaderLease) release() {
 	if l != nil {
-		l.once.Do(l.cancel)
+		l.once.Do(func() { close(l.done) })
 	}
 }
 
@@ -1094,7 +1092,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if agentCallKey, toolName, ok := codexFanoutToolCall(payload); ok {
 					if _, seen := speculativeAgentCalls[agentCallKey]; !seen {
 						speculativeAgentCalls[agentCallKey] = struct{}{}
-						e.scheduleSpeculativePreconnectForFanout(ctx, auth, authID, wsURL, wsHeaders, executionSessionID, upstreamBody, toolName)
+						e.scheduleSpeculativePreconnectRequest(codexPreconnectRequest{ctx: ctx, auth: auth, authID: authID, url: wsURL, headers: wsHeaders, sessionID: executionSessionID, warmupTemplate: upstreamBody, trigger: "fanout_tool", toolName: toolName})
 					}
 				}
 			}
@@ -1157,21 +1155,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if sess != nil && isCodexCompletionEvent(eventType) {
 				sess.completeCodexIncrementalRequest(clientPayload)
 			}
-			translateStartedAt := time.Now()
-			line := encodeCodexWebsocketAsSSE(clientPayload)
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param)
-			translationDuration += time.Since(translateStartedAt)
-			translatedChunks += int64(len(chunks))
-			for i := range chunks {
-				if !delivery.send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
-					streamExecution.fail("context_done", ctx.Err())
-					return
-				}
+			translation := deliverCodexTranslation(codexTranslationRequest{
+				ctx: ctx, to: to, responseFormat: responseFormat, model: req.Model,
+				originalPayload: originalPayload, clientBody: clientBody, clientPayload: clientPayload,
+				parameter: &param, delivery: delivery, terminal: isCodexCompletionEvent(eventType),
+			})
+			translationDuration += translation.duration
+			translatedChunks += translation.chunks
+			if !translation.delivered {
+				streamExecution.fail("context_done", ctx.Err())
+				return
 			}
 			if isCodexCompletionEvent(eventType) {
-				if !delivery.flush(codexCommitTerminal) {
-					streamExecution.fail("context_done", ctx.Err())
-				}
 				return
 			}
 		}

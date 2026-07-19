@@ -75,29 +75,29 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 	if request.recovery == nil {
 		return result, fmt.Errorf("codex reconnect recovery state is nil")
 	}
-	handlers := codexAttemptActionHandlers{
-		DetachReader: func() error {
+	handlers := codexAttemptActionSet{
+		bindCodexAttemptAction(codexAttemptDetachReader, func() error {
 			if request.route.session != nil {
 				request.route.session.deactivateReader(request.previous.read)
 				result.read = make(chan codexWebsocketRead, 4096)
 			}
 			return nil
-		},
-		CloseConnection: func() error {
+		}),
+		bindCodexAttemptAction(codexAttemptCloseConnection, func() error {
 			if request.route.session == nil && request.previous.conn != nil {
 				if errClose := e.closeCodexConnection(request.previous.conn); errClose != nil {
 					log.Errorf("codex websockets executor: close websocket before retry error: %v", errClose)
 				}
 			}
 			return nil
-		},
-		DiscardBuffer: func() error {
+		}),
+		bindCodexAttemptAction(codexAttemptDiscardBuffer, func() error {
 			return request.recovery.discardBuffer()
-		},
-		ResetSemantics: func() error {
+		}),
+		bindCodexAttemptAction(codexAttemptResetSemantics, func() error {
 			return request.recovery.resetSemantics()
-		},
-		Dial: func() error {
+		}),
+		bindCodexAttemptAction(codexAttemptDial, func() error {
 			var lease codexConnectionLease
 			var errDial error
 			if request.route.overflow {
@@ -113,13 +113,13 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 			}
 			result.codexConnectionLease = lease
 			return errDial
-		},
-		ActivateReader: func() error {
+		}),
+		bindCodexAttemptAction(codexAttemptActivateReader, func() error {
 			if request.route.session != nil {
 				return request.route.session.activateReader(result.read)
 			}
 			return nil
-		},
+		}),
 	}
 	if _, err := request.attempt.dispatch(codexAttemptInterrupted, handlers); err != nil {
 		return result, err
@@ -148,6 +148,6 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 }
 
 func sendCodexAttemptRequest(attempt *codexAttemptMachine, send func() error) error {
-	_, err := attempt.dispatch(codexAttemptRequestSent, codexAttemptActionHandlers{SendRequest: send})
+	_, err := attempt.dispatch(codexAttemptRequestSent, codexAttemptActionSet{bindCodexAttemptAction(codexAttemptSendRequest, send)})
 	return err
 }
