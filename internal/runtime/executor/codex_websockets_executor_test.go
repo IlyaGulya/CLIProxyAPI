@@ -700,6 +700,76 @@ func TestCodexWebsocketsExecuteStreamRecoversChildDisconnectBeforeTransactionalC
 	exec.CloseExecutionSession("claude-code:post-output-disconnect")
 }
 
+func TestCodexWebsocketsExecuteStreamRecoversRootDisconnectBeforeSemanticOutput(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		connection := connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read websocket request: %v", errRead)
+			return
+		}
+		if connection == 1 {
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-interrupted","model":"gpt-5.6-sol"}}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.reasoning_summary_text.delta","item_id":"rs-interrupted","output_index":0,"summary_index":0,"delta":"unfinished reasoning"}`))
+			_ = conn.UnderlyingConn().Close()
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-recovered","model":"gpt-5.6-sol"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","item_id":"msg-recovered","output_index":0,"content_index":0,"delta":"recovered answer"}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-recovered","model":"gpt-5.6-sol","output":[{"id":"msg-recovered","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"recovered answer","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll, RequestLog: true}})
+	auth := &cliproxyauth.Auth{ID: "auth-root-recovery", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	payload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"recover root"}],"max_tokens":128,"stream":true}`)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Request.Header = http.Header{helps.ClaudeCodeSessionHeader: []string{"root-recovery"}}
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload,
+		Headers: ginCtx.Request.Header.Clone(), Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:root-recovery"},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	var downstream strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error = %v", chunk.Err)
+		}
+		downstream.Write(chunk.Payload)
+	}
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("connections = %d, want one fresh connection for recovery", got)
+	}
+	if got := strings.Count(downstream.String(), `event: message_start`); got != 1 {
+		t.Fatalf("message_start count = %d, want exactly one; stream=%s", got, downstream.String())
+	}
+	if strings.Contains(downstream.String(), "unfinished reasoning") || !strings.Contains(downstream.String(), "recovered answer") {
+		t.Fatalf("stream contains discarded attempt or misses recovery: %s", downstream.String())
+	}
+	timelineValue, exists := ginCtx.Get("API_WEBSOCKET_TIMELINE")
+	if !exists {
+		t.Fatal("websocket timeline was not captured")
+	}
+	timeline := string(timelineValue.([]byte))
+	for _, want := range []string{`"name":"transactional_stream_discarded"`, `"reason":"transport_retry"`, `"transport_retries":1`, `"reason":"completed"`} {
+		if !strings.Contains(timeline, want) {
+			t.Errorf("timeline missing %q: %s", want, timeline)
+		}
+	}
+	exec.CloseExecutionSession("claude-code:root-recovery")
+}
+
 func TestCodexWebsocketConnectionObservationTracksReuse(t *testing.T) {
 	sess := &codexWebsocketSession{}
 	conn := &websocket.Conn{}

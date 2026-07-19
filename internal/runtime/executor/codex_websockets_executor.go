@@ -697,7 +697,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			sess.clearActive(readCh)
 			readCh = make(chan codexWebsocketRead, 4096)
-			sess.setActive(readCh)
 
 			// Retry once with a new websocket connection for the same execution session.
 			transportRetries++
@@ -712,6 +711,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
+			sess.setActive(readCh)
 			identityState = retryIdentityState
 			wsReqBodyRetry := buildCodexWebsocketRequestBody(fullUpstreamBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
@@ -763,7 +763,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var downstreamBlockedDuration time.Duration
 		closeCode := 0
 		speculativeAgentCalls := make(map[string]struct{})
-		transactionalChildStream := shouldUseCodexTransactionalStream(
+		transactionalPolicy := codexTransactionalPolicy(
 			from.String(), helps.ExtractClaudeCodeAgentID(ctx, opts.Headers), cliproxyexecutor.DownstreamWebsocket(ctx),
 		)
 		streamBridge := newCodexWebsocketStreamBridge()
@@ -825,7 +825,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return false
 			}
 		}
-		delivery, errDelivery := newCodexStreamDelivery(transactionalChildStream, deliver, codexStreamDeliveryHooks{
+		delivery, errDelivery := newCodexStreamDelivery(transactionalPolicy != codexTransactionalStreamDisabled, deliver, codexStreamDeliveryHooks{
 			Committed: func(drain codexTransactionalDrain) {
 				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transactional_stream_committed", observability.WebsocketAttributes{
 					SessionID: executionSessionID, Bytes: observability.Some(int64(drain.Bytes)),
@@ -885,7 +885,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					if sess != nil {
 						sess.clearActive(readCh)
 						readCh = make(chan codexWebsocketRead, 4096)
-						sess.setActive(readCh)
 					} else if conn != nil {
 						if errClose := e.closeCodexConnection(conn); errClose != nil {
 							log.Errorf("codex websockets executor: close websocket before retry error: %v", errClose)
@@ -909,6 +908,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						connRetry, respHSRetry, retrySource, errDialRetry = e.ensureUpstreamConnObserved(ctx, auth, sess, authID, wsURL, retryHeaders)
 					}
 					if errDialRetry == nil && connRetry != nil {
+						if sess != nil {
+							sess.setActive(readCh)
+						}
 						recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 						helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 							URL:       wsURL,
@@ -1085,6 +1087,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType = gjson.GetBytes(payload, "type").String()
+			if transactionalPolicy == codexTransactionalRootUntilSemanticOutput && delivery.buffering() && isCodexSemanticOutputBoundary(payload) {
+				if !delivery.flush() {
+					terminateReason = "context_done"
+					terminateErr = ctx.Err()
+					return
+				}
+			}
 			if isCodexCompletionEvent(eventType) {
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					recordCodexWebsocketUsageMetric(ctx, e.cfg, executionSessionID, detail)

@@ -3,10 +3,42 @@ package executor
 import (
 	"net/http"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
+type codexTransactionalStreamPolicy uint8
+
+const (
+	codexTransactionalStreamDisabled codexTransactionalStreamPolicy = iota
+	codexTransactionalRootUntilSemanticOutput
+	codexTransactionalChildUntilTerminal
+)
+
+func codexTransactionalPolicy(source, agentID string, downstreamWebsocket bool) codexTransactionalStreamPolicy {
+	if source != "claude" || downstreamWebsocket {
+		return codexTransactionalStreamDisabled
+	}
+	if strings.TrimSpace(agentID) == "" {
+		return codexTransactionalRootUntilSemanticOutput
+	}
+	return codexTransactionalChildUntilTerminal
+}
+
 func shouldUseCodexTransactionalStream(source, agentID string, downstreamWebsocket bool) bool {
-	return source == "claude" && strings.TrimSpace(agentID) != "" && !downstreamWebsocket
+	return codexTransactionalPolicy(source, agentID, downstreamWebsocket) != codexTransactionalStreamDisabled
+}
+
+func isCodexSemanticOutputBoundary(payload []byte) bool {
+	switch gjson.GetBytes(payload, "type").String() {
+	case "response.output_text.delta":
+		return gjson.GetBytes(payload, "delta").String() != ""
+	case "response.output_item.added":
+		itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
+		return itemType != "" && itemType != "reasoning" && itemType != "message"
+	default:
+		return false
+	}
 }
 
 func isCodexCompletionEvent(eventType string) bool {

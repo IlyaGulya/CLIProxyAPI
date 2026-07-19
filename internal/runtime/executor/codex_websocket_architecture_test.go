@@ -240,12 +240,37 @@ func TestCodexTransactionalPolicyAndTerminalEvents(t *testing.T) {
 	if !shouldUseCodexTransactionalStream("claude", "agent", false) {
 		t.Fatal("Claude child SSE stream should be transactional")
 	}
+	if got := codexTransactionalPolicy("claude", "", false); got != codexTransactionalRootUntilSemanticOutput {
+		t.Fatalf("Claude root policy = %d, want root-until-semantic-output", got)
+	}
+	if got := codexTransactionalPolicy("claude", "agent", false); got != codexTransactionalChildUntilTerminal {
+		t.Fatalf("Claude child policy = %d, want child-until-terminal", got)
+	}
 	for _, input := range []struct {
 		source, agent string
 		downstream    bool
-	}{{"claude", "", false}, {"claude", "agent", true}, {"openai", "agent", false}} {
+	}{{"claude", "agent", true}, {"openai", "agent", false}} {
 		if shouldUseCodexTransactionalStream(input.source, input.agent, input.downstream) {
 			t.Fatalf("unexpected transactional policy for %+v", input)
+		}
+	}
+	for _, payload := range []string{
+		`{"type":"response.output_text.delta","delta":"answer"}`,
+		`{"type":"response.output_item.added","item":{"type":"function_call"}}`,
+		`{"type":"response.output_item.added","item":{"type":"custom_tool_call"}}`,
+	} {
+		if !isCodexSemanticOutputBoundary([]byte(payload)) {
+			t.Fatalf("expected semantic output boundary: %s", payload)
+		}
+	}
+	for _, payload := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"thinking"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.output_item.added","item":{"type":"message"}}`,
+	} {
+		if isCodexSemanticOutputBoundary([]byte(payload)) {
+			t.Fatalf("unexpected semantic output boundary: %s", payload)
 		}
 	}
 	for _, eventType := range []string{"response.completed", "response.done", "response.incomplete"} {
