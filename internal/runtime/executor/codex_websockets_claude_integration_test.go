@@ -451,6 +451,89 @@ func TestClaudeCodexWebsocketToolContinuationUsesOnlyFunctionOutputDelta(t *test
 	exec.CloseExecutionSession(sessionID)
 }
 
+func TestClaudeCodexWebsocketReactiveCompactReconnectsAfterPendingToolCall(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	type capturedRequest struct {
+		connection int32
+		payload    []byte
+	}
+	secondRequest := make(chan capturedRequest, 1)
+	serverErrors := make(chan error, 4)
+	var connections atomic.Int32
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrors <- fmt.Errorf("upgrade websocket: %w", errUpgrade)
+			return
+		}
+		connectionIndex := connections.Add(1)
+		defer func() { _ = conn.Close() }()
+		for {
+			_, payload, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			requestIndex := requests.Add(1)
+			if requestIndex == 2 {
+				secondRequest <- capturedRequest{connection: connectionIndex, payload: bytes.Clone(payload)}
+				if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "" {
+					serverErrors <- fmt.Errorf("reactive compact previous_response_id = %q, want empty; payload=%s", got, payload)
+					return
+				}
+			}
+
+			output := `[]`
+			if requestIndex == 1 {
+				output = `[{"id":"fc-stale","type":"function_call","name":"shell","arguments":"{\"cmd\":\"echo hi\"}","call_id":"call-stale","status":"completed"}]`
+			}
+			completed := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","model":"gpt-5.6-sol","output":%s,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`, requestIndex, output))
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				serverErrors <- fmt.Errorf("write response %d: %w", requestIndex, errWrite)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	sessionID := "claude-code:reactive-compact-boundary"
+	payloads := [][]byte{
+		[]byte(`{"model":"gpt-5.6-sol","tools":[{"name":"shell","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"run echo hi"}],"max_tokens":128,"stream":true}`),
+		[]byte(`{"model":"gpt-5.6-sol","tools":[{"name":"shell","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Your task is to create a detailed summary of the conversation so far. Before providing your final summary, wrap your analysis in <analysis> tags. Your entire response must be an <analysis> block followed by a <summary> block."}],"max_tokens":128,"stream":true}`),
+	}
+	for turn, payload := range payloads {
+		result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload,
+			Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID},
+		})
+		if errExecute != nil {
+			t.Fatalf("turn %d ExecuteStream() error = %v", turn, errExecute)
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("turn %d stream error = %v", turn, chunk.Err)
+			}
+		}
+	}
+
+	select {
+	case captured := <-secondRequest:
+		if captured.connection != 2 {
+			t.Fatalf("reactive compact used connection %d, want a fresh second connection; payload=%s", captured.connection, captured.payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for reactive compact request")
+	}
+	select {
+	case errServer := <-serverErrors:
+		t.Fatal(errServer)
+	default:
+	}
+	exec.CloseExecutionSession(sessionID)
+}
+
 func TestClaudeCodexWebsocketCancellationReconnectsBeforeNextTurn(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	firstStarted := make(chan struct{})

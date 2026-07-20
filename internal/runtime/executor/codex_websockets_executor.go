@@ -600,6 +600,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	incrementalObservation := codexIncrementalObservation{resetReason: "not_applicable"}
 	if sess != nil && from.String() == "claude" {
 		requestBody, incrementalObservation = sess.prepareCodexIncrementalRequestObserved(clientBody)
+		if incrementalObservation.requiresFreshConnection {
+			e.rotateCodexUpstreamConnection(sess, "response_chain_reset")
+		}
 	}
 	if e.compactionScheduler != nil {
 		contextTokens := int64(len(clientBody)+3) / 4
@@ -2207,9 +2210,10 @@ func (s *codexWebsocketSession) resetCodexIncrementalStateLocked() {
 }
 
 type codexIncrementalObservation struct {
-	incremental bool
-	resetReason string
-	compaction  codexCompactionV2Observation
+	incremental             bool
+	requiresFreshConnection bool
+	resetReason             string
+	compaction              codexCompactionV2Observation
 }
 
 func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullRequest []byte) ([]byte, codexIncrementalObservation) {
@@ -2227,9 +2231,14 @@ func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullReque
 	// response chain can make the provider validate stale function calls that
 	// are no longer present in the current full request.
 	if isCodexReactiveCompactRequest(fullRequest) {
+		requiresFreshConnection := s.lastResponseID != ""
 		s.resetCodexIncrementalStateLocked()
 		s.pendingRequest = bytes.Clone(fullRequest)
-		return fullRequest, codexIncrementalObservation{resetReason: "reactive_compact", compaction: compactionObservation}
+		return fullRequest, codexIncrementalObservation{
+			requiresFreshConnection: requiresFreshConnection,
+			resetReason:             "reactive_compact",
+			compaction:              compactionObservation,
+		}
 	}
 	if len(fullRequest) > codexWebsocketMaxIncrementalStateBytes {
 		s.resetCodexIncrementalStateLocked()
@@ -2255,9 +2264,28 @@ func (s *codexWebsocketSession) prepareCodexIncrementalRequestObserved(fullReque
 }
 
 func isCodexReactiveCompactRequest(request []byte) bool {
-	return bytes.Contains(request, []byte("create a detailed summary of the conversation so far")) &&
-		bytes.Contains(request, []byte("wrap your analysis in <analysis> tags")) &&
-		bytes.Contains(request, []byte("<analysis> block followed by a <summary> block"))
+	input := gjson.GetBytes(request, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		content := item.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for _, part := range content.Array() {
+			if strings.TrimSpace(part.Get("type").String()) != "input_text" {
+				continue
+			}
+			text := strings.ToLower(part.Get("text").String())
+			if strings.Contains(text, "create a detailed summary of the conversation so far") &&
+				strings.Contains(text, "wrap your analysis in <analysis> tags") &&
+				strings.Contains(text, "<analysis> block followed by a <summary> block") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *codexWebsocketSession) completeCodexIncrementalRequest(completedPayload []byte) {
@@ -2543,6 +2571,31 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	sess.applyLifecycle(event)
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	sess.notifyUpstreamDisconnect(err)
+	if errClose := e.closeCodexConnection(conn); errClose != nil {
+		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+	}
+}
+
+func (e *CodexWebsocketsExecutor) rotateCodexUpstreamConnection(sess *codexWebsocketSession, reason string) {
+	if e == nil || sess == nil {
+		return
+	}
+
+	sess.connMu.Lock()
+	conn := sess.conn
+	authID := sess.authID
+	wsURL := sess.wsURL
+	sessionID := sess.sessionID
+	sess.conn = nil
+	if sess.readerConn == conn {
+		sess.readerConn = nil
+	}
+	sess.connMu.Unlock()
+	if conn == nil {
+		return
+	}
+
+	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
 	if errClose := e.closeCodexConnection(conn); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}
