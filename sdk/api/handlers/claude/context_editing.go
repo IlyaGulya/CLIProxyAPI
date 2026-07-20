@@ -64,13 +64,6 @@ type claudeAdaptiveOutputBudgetObservation struct {
 	Method            string
 }
 
-func isClaudeReactiveCompactPrompt(text string) bool {
-	normalized := strings.ToLower(text)
-	return strings.Contains(normalized, "create a detailed summary of the conversation so far") &&
-		strings.Contains(normalized, "wrap your analysis in <analysis> tags") &&
-		strings.Contains(normalized, "<analysis> block followed by a <summary> block")
-}
-
 func claudeMessageText(content any) string {
 	if text, ok := content.(string); ok {
 		return text

@@ -3,6 +3,8 @@ package claude
 import (
 	"errors"
 	"fmt"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 )
 
 type claudePipelinePhase uint8
@@ -174,5 +176,5 @@ func isClaudeReactiveCompactDocument(document *claudeRequestDocument) bool {
 		return false
 	}
 	last, _ := messages[len(messages)-1].(map[string]any)
-	return stringValue(last["role"]) == "user" && isClaudeReactiveCompactPrompt(claudeMessageText(last["content"]))
+	return stringValue(last["role"]) == "user" && claudecompat.IsReactiveCompactPrompt(claudeMessageText(last["content"]))
 }

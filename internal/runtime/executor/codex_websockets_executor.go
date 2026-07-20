@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
@@ -2277,10 +2278,7 @@ func isCodexReactiveCompactRequest(request []byte) bool {
 			if strings.TrimSpace(part.Get("type").String()) != "input_text" {
 				continue
 			}
-			text := strings.ToLower(part.Get("text").String())
-			if strings.Contains(text, "create a detailed summary of the conversation so far") &&
-				strings.Contains(text, "wrap your analysis in <analysis> tags") &&
-				strings.Contains(text, "<analysis> block followed by a <summary> block") {
+			if claudecompat.IsReactiveCompactPrompt(part.Get("text").String()) {
 				return true
 			}
 		}
