@@ -26,10 +26,14 @@ type scheduledState int
 
 const (
 	scheduledStateReady scheduledState = iota
+	scheduledStateHalfOpenReady
+	scheduledStateHalfOpen
 	scheduledStateCooldown
 	scheduledStateBlocked
 	scheduledStateDisabled
 )
+
+const quotaProbeLease = time.Minute
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
@@ -760,6 +764,8 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	entry.nextRetryAt = time.Time{}
 	blocked, reason, next := isAuthBlockedForModel(meta.auth, m.modelKey, now)
 	switch {
+	case !blocked && authQuotaProbeDue(meta.auth, m.modelKey, now):
+		entry.state = scheduledStateHalfOpenReady
 	case !blocked:
 		entry.state = scheduledStateReady
 	case reason == blockReasonCooldown:
@@ -805,6 +811,9 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 		}
 		blocked, reason, next := isAuthBlockedForModel(entry.auth, m.modelKey, now)
 		switch {
+		case !blocked && authQuotaProbeDue(entry.auth, m.modelKey, now):
+			entry.state = scheduledStateHalfOpenReady
+			entry.nextRetryAt = time.Time{}
 		case !blocked:
 			entry.state = scheduledStateReady
 			entry.nextRetryAt = time.Time{}
@@ -892,6 +901,11 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if picked == nil || picked.auth == nil {
 		return nil
 	}
+	if picked.state == scheduledStateHalfOpenReady {
+		picked.state = scheduledStateHalfOpen
+		picked.nextRetryAt = time.Now().Add(quotaProbeLease)
+		m.rebuildIndexesLocked()
+	}
 	return picked.auth
 }
 
@@ -925,9 +939,43 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return newModelCooldownError(model, providerForError, resetIn)
+		return newModelCooldownError(model, providerForError, resetIn, m.providerResetAtLocked(predicate))
 	}
 	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+}
+
+func (m *modelScheduler) providerResetAtLocked(predicate func(*scheduledAuth) bool) time.Time {
+	var earliest time.Time
+	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		quota := quotaStateForModel(entry.auth, m.modelKey)
+		if quota == nil || quota.ProviderResetAt.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || quota.ProviderResetAt.Before(earliest) {
+			earliest = quota.ProviderResetAt
+		}
+	}
+	return earliest
+}
+
+func quotaStateForModel(auth *Auth, model string) *QuotaState {
+	if auth == nil {
+		return nil
+	}
+	if model == "" {
+		return &auth.Quota
+	}
+	state := auth.ModelStates[model]
+	if state == nil {
+		state = auth.ModelStates[canonicalModelKey(model)]
+	}
+	if state == nil {
+		return nil
+	}
+	return &state.Quota
 }
 
 // availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
@@ -946,7 +994,7 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		if entry.state != scheduledStateCooldown {
+		if entry.state != scheduledStateCooldown && entry.state != scheduledStateHalfOpen {
 			continue
 		}
 		cooldownCount++
@@ -979,10 +1027,10 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 			continue
 		}
 		switch entry.state {
-		case scheduledStateReady:
+		case scheduledStateReady, scheduledStateHalfOpenReady:
 			priority := entry.meta.priority
 			priorityBuckets[priority] = append(priorityBuckets[priority], entry)
-		case scheduledStateCooldown, scheduledStateBlocked:
+		case scheduledStateHalfOpen, scheduledStateCooldown, scheduledStateBlocked:
 			m.blocked = append(m.blocked, entry)
 		}
 	}
@@ -1018,6 +1066,20 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		}
 		return left.nextRetryAt.Before(right.nextRetryAt)
 	})
+}
+
+func authQuotaProbeDue(auth *Auth, model string, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if model != "" {
+		state := auth.ModelStates[model]
+		if state == nil {
+			state = auth.ModelStates[canonicalModelKey(model)]
+		}
+		return state != nil && state.Quota.Exceeded && !state.Quota.NextProbeAt.After(now)
+	}
+	return auth.Quota.Exceeded && !auth.Quota.NextProbeAt.After(now)
 }
 
 // buildReadyBucket prepares the general and websocket-only ready views for one priority bucket.

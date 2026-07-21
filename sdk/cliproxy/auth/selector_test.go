@@ -250,6 +250,15 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		if got, _ := rawErr["code"].(string); got != "model_cooldown" {
 			t.Fatalf("Error().error.code = %q, want %q", got, "model_cooldown")
 		}
+		if got, _ := rawErr["type"].(string); got != "usage_limit_reached" {
+			t.Fatalf("Error().error.type = %q, want %q", got, "usage_limit_reached")
+		}
+		if got, ok := rawErr["resets_at"].(float64); !ok || got <= 0 {
+			t.Fatalf("Error().error.resets_at = %v, want positive unix timestamp", rawErr["resets_at"])
+		}
+		if got, ok := rawErr["resets_in_seconds"].(float64); !ok || got <= 0 {
+			t.Fatalf("Error().error.resets_in_seconds = %v, want positive seconds", rawErr["resets_in_seconds"])
+		}
 		if _, ok := rawErr["provider"]; ok {
 			t.Fatalf("Error().error.provider exists for mixed provider: %v", rawErr["provider"])
 		}
@@ -281,6 +290,37 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 			t.Fatalf("Error().error.provider = %q, want %q", got, "gemini")
 		}
 	})
+}
+
+func TestSelectorPick_CloudflareCooldownIsNotReportedAsUsageLimit(t *testing.T) {
+	t.Parallel()
+
+	model := "test-model"
+	next := time.Now().Add(time.Minute)
+	auth := &Auth{
+		ID: "a",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "cloudflare challenge",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+
+	_, err := (&FillFirstSelector{}).Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, []*Auth{auth})
+	if err == nil {
+		t.Fatal("Pick() error = nil")
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) {
+		t.Fatalf("Pick() error = %T, must not report Cloudflare cooldown as usage limit", err)
+	}
 }
 
 func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testing.T) {

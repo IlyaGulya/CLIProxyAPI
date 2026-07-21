@@ -86,6 +86,26 @@ func TestClaudeErrorExtractsClaudeStyleUpstreamJSON(t *testing.T) {
 	}
 }
 
+func TestClaudeErrorPreservesLocalUsageLimitSignal(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"code":"model_cooldown","type":"usage_limit_reached","message":"Usage limit reached; proxy will recheck at 2026-07-21T11:15:00Z; provider reported reset at 2026-07-25T03:24:46Z","next_probe_at":1784632500,"retry_after_seconds":900,"provider_reset_at":1784949886}}`),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "usage_limit_reached" {
+		t.Fatalf("error.type = %q, want usage_limit_reached", got.Error.Type)
+	}
+	if !strings.Contains(got.Error.Message, "provider reported reset at 2026-07-25T03:24:46Z") {
+		t.Fatalf("error.message = %q, want reset deadline", got.Error.Message)
+	}
+	if got.Error.NextProbeAt != 1784632500 || got.Error.RetryAfterSeconds != 900 || got.Error.ProviderResetAt != 1784949886 {
+		t.Fatalf("quota metadata = probe:%d retry:%d provider-reset:%d", got.Error.NextProbeAt, got.Error.RetryAfterSeconds, got.Error.ProviderResetAt)
+	}
+}
+
 func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -110,6 +130,30 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+}
+
+func TestWriteClaudeErrorResponseAlwaysIncludesRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{BaseAPIHandler: &handlers.BaseAPIHandler{Cfg: &config.SDKConfig{}}}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"type":"usage_limit_reached","message":"Usage limit reached"}}`),
+		Addon: http.Header{
+			"Retry-After":  {"334534"},
+			"X-Request-Id": {"must-not-leak"},
+		},
+	}
+
+	handler.WriteErrorResponse(c, msg)
+
+	if got := recorder.Header().Get("Retry-After"); got != "334534" {
+		t.Fatalf("Retry-After = %q, want 334534", got)
+	}
+	if got := recorder.Header().Get("X-Request-Id"); got != "" {
+		t.Fatalf("X-Request-Id = %q, want empty without passthrough", got)
 	}
 }
 

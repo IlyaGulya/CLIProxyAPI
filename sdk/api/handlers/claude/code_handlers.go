@@ -694,8 +694,11 @@ func (h *ClaudeCodeAPIHandler) writeTerminalStreamError(c *gin.Context, errMsg *
 }
 
 type claudeErrorDetail struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
+	Type              string `json:"type"`
+	Message           string `json:"message"`
+	NextProbeAt       int64  `json:"next_probe_at,omitempty"`
+	RetryAfterSeconds int64  `json:"retry_after_seconds,omitempty"`
+	ProviderResetAt   int64  `json:"provider_reset_at,omitempty"`
 }
 
 type claudeErrorResponse struct {
@@ -717,13 +720,10 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 			}
 		}
 	}
-	errType, message := claudeErrorDetailFromText(status, errText)
+	detail := claudeErrorDetailFromText(status, errText)
 	return claudeErrorResponse{
-		Type: "error",
-		Error: claudeErrorDetail{
-			Type:    errType,
-			Message: message,
-		},
+		Type:  "error",
+		Error: detail,
 	}
 }
 
@@ -731,6 +731,11 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
+	}
+	if msg != nil && msg.Addon != nil {
+		if retryAfter := strings.TrimSpace(msg.Addon.Get("Retry-After")); retryAfter != "" {
+			c.Writer.Header().Set("Retry-After", retryAfter)
+		}
 	}
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
@@ -756,12 +761,13 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	_, _ = c.Writer.Write(body)
 }
 
-func claudeErrorDetailFromText(status int, errText string) (string, string) {
+func claudeErrorDetailFromText(status int, errText string) claudeErrorDetail {
 	message := strings.TrimSpace(errText)
 	if message == "" {
 		message = http.StatusText(status)
 	}
 	errType := claudeErrorTypeFromStatus(status)
+	detail := claudeErrorDetail{}
 
 	var payload map[string]any
 	if json.Valid([]byte(message)) {
@@ -775,6 +781,9 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 				} else if c, ok := e["code"].(string); ok && strings.TrimSpace(c) != "" {
 					message = strings.TrimSpace(c)
 				}
+				detail.NextProbeAt = int64JSONNumber(e["next_probe_at"])
+				detail.RetryAfterSeconds = int64JSONNumber(e["retry_after_seconds"])
+				detail.ProviderResetAt = int64JSONNumber(e["provider_reset_at"])
 			} else {
 				if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) != "" && strings.TrimSpace(t) != "error" {
 					errType = strings.TrimSpace(t)
@@ -786,7 +795,21 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 		}
 	}
 
-	return errType, message
+	detail.Type = errType
+	detail.Message = message
+	return detail
+}
+
+func int64JSONNumber(value any) int64 {
+	switch number := value.(type) {
+	case float64:
+		return int64(number)
+	case json.Number:
+		parsed, _ := number.Int64()
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func claudeErrorTypeFromStatus(status int) string {

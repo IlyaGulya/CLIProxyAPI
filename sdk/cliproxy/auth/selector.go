@@ -2,10 +2,8 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"math"
 	"net/http"
 	"regexp"
 	"sort"
@@ -42,75 +40,6 @@ const (
 	blockReasonDisabled
 	blockReasonOther
 )
-
-type modelCooldownError struct {
-	model    string
-	resetIn  time.Duration
-	provider string
-}
-
-func newModelCooldownError(model, provider string, resetIn time.Duration) *modelCooldownError {
-	if resetIn < 0 {
-		resetIn = 0
-	}
-	return &modelCooldownError{
-		model:    model,
-		provider: provider,
-		resetIn:  resetIn,
-	}
-}
-
-func (e *modelCooldownError) Error() string {
-	modelName := e.model
-	if modelName == "" {
-		modelName = "requested model"
-	}
-	message := fmt.Sprintf("All credentials for model %s are cooling down", modelName)
-	if e.provider != "" {
-		message = fmt.Sprintf("%s via provider %s", message, e.provider)
-	}
-	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
-	if resetSeconds < 0 {
-		resetSeconds = 0
-	}
-	displayDuration := e.resetIn
-	if displayDuration > 0 && displayDuration < time.Second {
-		displayDuration = time.Second
-	} else {
-		displayDuration = displayDuration.Round(time.Second)
-	}
-	errorBody := map[string]any{
-		"code":          "model_cooldown",
-		"message":       message,
-		"model":         e.model,
-		"reset_time":    displayDuration.String(),
-		"reset_seconds": resetSeconds,
-	}
-	if e.provider != "" {
-		errorBody["provider"] = e.provider
-	}
-	payload := map[string]any{"error": errorBody}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Sprintf(`{"error":{"code":"model_cooldown","message":"%s"}}`, message)
-	}
-	return string(data)
-}
-
-func (e *modelCooldownError) StatusCode() int {
-	return http.StatusTooManyRequests
-}
-
-func (e *modelCooldownError) Headers() http.Header {
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
-	if resetSeconds < 0 {
-		resetSeconds = 0
-	}
-	headers.Set("Retry-After", strconv.Itoa(resetSeconds))
-	return headers
-}
 
 func authPriority(auth *Auth) int {
 	if auth == nil || auth.Attributes == nil {
@@ -334,7 +263,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						if next.Before(now) {
 							next = now
 						}
-						if state.Quota.Exceeded {
+						if state.Quota.Exceeded && state.Quota.Reason != string(cooldownCloudflare) {
 							return true, blockReasonCooldown, next
 						}
 						return true, blockReasonOther, next
@@ -353,7 +282,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		if next.Before(now) {
 			next = now
 		}
-		if auth.Quota.Exceeded {
+		if auth.Quota.Exceeded && auth.Quota.Reason != string(cooldownCloudflare) {
 			return true, blockReasonCooldown, next
 		}
 		return true, blockReasonOther, next

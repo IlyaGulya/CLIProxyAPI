@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,6 +198,119 @@ func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	}
 	if got.ID != "cooldown-expired" {
 		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "cooldown-expired")
+	}
+}
+
+func TestSchedulerPick_QuotaProbeIsSingleFlight(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5"
+	registerSchedulerModels(t, "codex", model, "quota-probe")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{
+			ID:       "quota-probe",
+			Provider: "codex",
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: time.Now().Add(-time.Second),
+					Quota: QuotaState{
+						Exceeded:    true,
+						Phase:       QuotaPhaseOpen,
+						NextProbeAt: time.Now().Add(-time.Second),
+					},
+				},
+			},
+		},
+	)
+
+	const workers = 32
+	start := make(chan struct{})
+	var probeCount atomic.Int32
+	var nonQuotaErrors atomic.Int32
+	var waitGroup sync.WaitGroup
+	for range workers {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+			if errPick == nil && got != nil {
+				probeCount.Add(1)
+				return
+			}
+			var cooldownErr *modelCooldownError
+			if !errors.As(errPick, &cooldownErr) {
+				nonQuotaErrors.Add(1)
+			}
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	if got := probeCount.Load(); got != 1 {
+		t.Fatalf("probe count = %d, want exactly one", got)
+	}
+	if got := nonQuotaErrors.Load(); got != 0 {
+		t.Fatalf("non-quota errors = %d, want all blocked callers to receive quota cooldown", got)
+	}
+}
+
+func TestManager_QuotaProbeTransitions(t *testing.T) {
+	model := "gpt-5-probe-transition"
+	for _, test := range []struct {
+		name        string
+		probeResult Result
+		wantOpen    bool
+	}{
+		{name: "success closes circuit", probeResult: Result{Success: true}},
+		{name: "quota reopens circuit", probeResult: Result{Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "still limited"}}, wantOpen: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withQuotaCooldownEnabled(t)
+			registerSchedulerModels(t, "codex", model, "probe-auth")
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "probe-auth", Provider: "codex"}); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			hint := 24 * time.Hour
+			initial := quotaResult("probe-auth", model)
+			initial.RetryAfter = &hint
+			manager.MarkResult(context.Background(), initial)
+			auth, _ := manager.GetByID("probe-auth")
+			state := auth.ModelStates[model]
+			state.NextRetryAfter = time.Now().Add(-time.Second)
+			state.Quota.NextRecoverAt = state.NextRetryAfter
+			state.Quota.NextProbeAt = state.NextRetryAfter
+			if _, errUpdate := manager.Update(WithSkipPersist(context.Background()), auth); errUpdate != nil {
+				t.Fatalf("Update() error = %v", errUpdate)
+			}
+
+			picked, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+			if errPick != nil || picked == nil {
+				t.Fatalf("pickSingle() = (%v, %v), want probe", picked, errPick)
+			}
+			test.probeResult.AuthID = picked.ID
+			test.probeResult.Provider = "codex"
+			test.probeResult.Model = model
+			test.probeResult.StateRevision = modelStateRevision(picked, model)
+			test.probeResult.RevisionKnown = true
+			manager.MarkResult(context.Background(), test.probeResult)
+
+			updated, _ := manager.GetByID("probe-auth")
+			updatedState := updated.ModelStates[model]
+			if test.wantOpen {
+				if !updatedState.Quota.Exceeded || updatedState.Quota.Phase != QuotaPhaseOpen || updatedState.Revision <= state.Revision {
+					t.Fatalf("probe failure state = %+v, want reopened circuit", updatedState)
+				}
+				return
+			}
+			if updatedState.Quota.Exceeded || updatedState.Status != StatusActive {
+				t.Fatalf("probe success state = %+v, want ready circuit", updatedState)
+			}
+		})
 	}
 }
 

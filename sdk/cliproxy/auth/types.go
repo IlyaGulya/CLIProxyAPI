@@ -164,6 +164,12 @@ type RecentRequestBucket struct {
 	Failed  int64  `json:"failed"`
 }
 
+type QuotaPhase string
+
+const (
+	QuotaPhaseOpen QuotaPhase = "open"
+)
+
 // QuotaState contains limiter tracking data for a credential.
 type QuotaState struct {
 	// Exceeded indicates the credential recently hit a quota error.
@@ -172,12 +178,20 @@ type QuotaState struct {
 	Reason string `json:"reason,omitempty"`
 	// NextRecoverAt is when the credential may become available again.
 	NextRecoverAt time.Time `json:"next_recover_at"`
+	// NextProbeAt is when one request may revalidate an open quota circuit.
+	NextProbeAt time.Time `json:"next_probe_at,omitempty"`
+	// ProviderResetAt is the advisory reset deadline reported by the provider.
+	ProviderResetAt time.Time `json:"provider_reset_at,omitempty"`
+	// Phase records the persisted quota circuit phase. Half-open is scheduler-local.
+	Phase QuotaPhase `json:"phase,omitempty"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
 type ModelState struct {
+	// Revision increments whenever an upstream failure changes this state.
+	Revision uint64 `json:"revision,omitempty"`
 	// Status reflects the lifecycle status for this model.
 	Status Status `json:"status"`
 	// StatusMessage provides an optional short description of the status.

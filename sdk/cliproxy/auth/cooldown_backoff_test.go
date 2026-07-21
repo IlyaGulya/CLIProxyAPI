@@ -73,6 +73,156 @@ func TestMarkResultQuotaBackoffEscalatesOncePerWindow(t *testing.T) {
 	}
 }
 
+func TestMarkResultStaleSuccessDoesNotClearNewerQuota(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-stale-success",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register returned error: %v", errRegister)
+	}
+
+	requestStartedAt := time.Now().Add(-time.Second)
+	manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
+	manager.MarkResult(context.Background(), Result{
+		AuthID:    auth.ID,
+		Provider:  "codex",
+		Model:     "gpt-5",
+		Success:   true,
+		StartedAt: requestStartedAt,
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil || updated.ModelStates["gpt-5"] == nil {
+		t.Fatalf("expected model state after stale success")
+	}
+	state := updated.ModelStates["gpt-5"]
+	if !state.Unavailable || !state.Quota.Exceeded || state.NextRetryAfter.IsZero() {
+		t.Fatalf("stale success cleared newer quota state: %+v", state)
+	}
+}
+
+func TestMarkResultNewerSuccessClearsOlderQuota(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-new-success", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register returned error: %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
+	manager.MarkResult(context.Background(), Result{
+		AuthID:    auth.ID,
+		Provider:  "codex",
+		Model:     "gpt-5",
+		Success:   true,
+		StartedAt: time.Now().Add(time.Second),
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil || updated.ModelStates["gpt-5"] == nil {
+		t.Fatalf("expected model state after success")
+	}
+	state := updated.ModelStates["gpt-5"]
+	if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() {
+		t.Fatalf("newer success did not clear older quota state: %+v", state)
+	}
+}
+
+func TestMarkResultStaleSuccessDoesNotClearNewerTransientCooldown(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-stale-transient", Provider: "codex"}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register returned error: %v", errRegister)
+	}
+
+	requestStartedAt := time.Now().Add(-time.Second)
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5",
+		Error:    &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+	})
+	manager.MarkResult(context.Background(), Result{
+		AuthID:    auth.ID,
+		Provider:  "codex",
+		Model:     "gpt-5",
+		Success:   true,
+		StartedAt: requestStartedAt,
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil || updated.ModelStates["gpt-5"] == nil {
+		t.Fatalf("expected model state after stale success")
+	}
+	state := updated.ModelStates["gpt-5"]
+	if !state.Unavailable || state.Status != StatusError || state.NextRetryAfter.IsZero() {
+		t.Fatalf("stale success cleared newer transient cooldown: %+v", state)
+	}
+}
+
+func TestMarkResultLongProviderQuotaHintUsesRevalidationInterval(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-long-quota", Provider: "codex"}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register returned error: %v", errRegister)
+	}
+
+	providerRetryAfter := 96 * time.Hour
+	result := quotaResult(auth.ID, "gpt-5")
+	result.RetryAfter = &providerRetryAfter
+	before := time.Now()
+	manager.MarkResult(context.Background(), result)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil || updated.ModelStates["gpt-5"] == nil {
+		t.Fatalf("expected quota model state")
+	}
+	state := updated.ModelStates["gpt-5"]
+	wait := state.Quota.NextProbeAt.Sub(before)
+	if wait < quotaRevalidationInterval-time.Second || wait > quotaRevalidationInterval+time.Second {
+		t.Fatalf("quota revalidation wait = %v, want %v", wait, quotaRevalidationInterval)
+	}
+	providerResetWait := state.Quota.ProviderResetAt.Sub(before)
+	if providerResetWait < providerRetryAfter-time.Second || providerResetWait > providerRetryAfter+time.Second {
+		t.Fatalf("provider reset wait = %v, want %v", providerResetWait, providerRetryAfter)
+	}
+	if state.Quota.Phase != QuotaPhaseOpen {
+		t.Fatalf("quota phase = %q, want %q", state.Quota.Phase, QuotaPhaseOpen)
+	}
+}
+
+func TestMarkResultRevisionRejectsStaleSuccess(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-revision", Provider: "codex"}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register returned error: %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), quotaResult(auth.ID, "gpt-5"))
+	manager.MarkResult(context.Background(), Result{
+		AuthID:        auth.ID,
+		Provider:      "codex",
+		Model:         "gpt-5",
+		Success:       true,
+		StateRevision: 0,
+		RevisionKnown: true,
+	})
+
+	updated, _ := manager.GetByID(auth.ID)
+	state := updated.ModelStates["gpt-5"]
+	if !state.Quota.Exceeded || state.Revision == 0 {
+		t.Fatalf("stale revision cleared quota: %+v", state)
+	}
+}
+
 func TestMarkResultQuotaBackoffEscalatesAfterWindowExpiry(t *testing.T) {
 	withQuotaCooldownEnabled(t)
 

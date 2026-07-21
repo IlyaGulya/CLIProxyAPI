@@ -89,8 +89,6 @@ const (
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
 	transientErrorCooldown    = time.Minute
 )
 
@@ -172,6 +170,13 @@ type Result struct {
 	Model string
 	// Success marks whether the execution succeeded.
 	Success bool
+	// StartedAt identifies when the upstream attempt began. It prevents an older
+	// in-flight success from clearing a newer failure state.
+	StartedAt time.Time
+	// StateRevision is the model-state revision observed when the attempt began.
+	StateRevision uint64
+	// RevisionKnown distinguishes an initial revision of zero from legacy callers.
+	RevisionKnown bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
@@ -918,8 +923,11 @@ func cooldownStateRecordEqual(a, b CooldownStateRecord) bool {
 func cooldownQuotaEqual(a, b QuotaState) bool {
 	return a.Exceeded == b.Exceeded &&
 		a.Reason == b.Reason &&
+		a.Phase == b.Phase &&
 		a.BackoffLevel == b.BackoffLevel &&
-		a.NextRecoverAt.Equal(b.NextRecoverAt)
+		a.NextRecoverAt.Equal(b.NextRecoverAt) &&
+		a.NextProbeAt.Equal(b.NextProbeAt) &&
+		a.ProviderResetAt.Equal(b.ProviderResetAt)
 }
 
 func cooldownErrorEqual(a, b *Error) bool {
@@ -1814,7 +1822,7 @@ func streamBootstrapIdleTimeout(opts cliproxyexecutor.Options) time.Duration {
 	return timeout
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFunc, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFunc, auth *Auth, provider, resultModel string, startedAt time.Time, stateRevision uint64, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -1831,7 +1839,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFun
 			if chunk.Err != nil && !failed {
 				failed = true
 				rerr := resultErrorFromError(chunk.Err)
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, StartedAt: startedAt, StateRevision: stateRevision, RevisionKnown: true, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -1888,7 +1896,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFun
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, StartedAt: startedAt, StateRevision: stateRevision, RevisionKnown: true})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -1911,6 +1919,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		streamCtx, streamCancel := context.WithCancel(ctx)
+		attemptStartedAt := time.Now()
+		attemptRevision := modelStateRevision(auth, resultModel)
 		streamResult, errStream := executor.ExecuteStream(streamCtx, auth, execReq, execOpts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -1920,6 +1930,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
 				auth = refreshed
 				didRefreshOnUnauthorized = true
+				attemptStartedAt = time.Now()
+				attemptRevision = modelStateRevision(auth, resultModel)
 				streamResult, errStream = executor.ExecuteStream(streamCtx, auth, execReq, execOpts)
 				if errStream != nil {
 					if errCtx := ctx.Err(); errCtx != nil {
@@ -1932,7 +1944,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if errStream != nil {
 			streamCancel()
 			rerr := resultErrorFromError(errStream)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, StartedAt: attemptStartedAt, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -1953,6 +1965,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				auth = refreshed
 				didRefreshOnUnauthorized = true
 				streamCtx, streamCancel = context.WithCancel(ctx)
+				attemptStartedAt = time.Now()
+				attemptRevision = modelStateRevision(auth, resultModel)
 				retryStream, retryErr := executor.ExecuteStream(streamCtx, auth, execReq, execOpts)
 				if retryErr != nil {
 					if errCtx := ctx.Err(); errCtx != nil {
@@ -2009,7 +2023,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, streamCancel, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult), nil
+		return m.wrapStreamResult(ctx, streamCancel, auth.Clone(), provider, resultModel, attemptStartedAt, attemptRevision, streamResult.Headers, buffered, remaining, aliasResult), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2648,6 +2662,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			attemptStartedAt := time.Now()
+			attemptRevision := modelStateRevision(auth, resultModel)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -2656,6 +2672,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
+					attemptStartedAt = time.Now()
+					attemptRevision = modelStateRevision(auth, resultModel)
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
@@ -2664,7 +2682,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 				}
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, StartedAt: attemptStartedAt, StateRevision: attemptRevision, RevisionKnown: true}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -2761,6 +2779,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			attemptStartedAt := time.Now()
+			attemptRevision := modelStateRevision(auth, resultModel)
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -2769,6 +2789,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
+					attemptStartedAt = time.Now()
+					attemptRevision = modelStateRevision(auth, resultModel)
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
@@ -2777,7 +2799,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 				}
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, StartedAt: attemptStartedAt, StateRevision: attemptRevision, RevisionKnown: true}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -3753,11 +3775,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		return
 	}
 
-	shouldResumeModel := false
-	shouldSuspendModel := false
-	suspendReason := ""
-	clearModelQuota := false
-	setModelQuota := false
+	var modelEffects modelTransitionEffects
 	var authSnapshot *Auth
 	cooldownStateChanged := false
 
@@ -3776,134 +3794,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.Failed++
 		}
 
-		if result.Success {
-			if result.Model != "" {
+		if result.Model != "" {
+			if !isRequestScopedResultError(result.Error) {
 				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
-				updateAggregatedAvailability(auth, now)
-				if !hasModelError(auth, now) {
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
-				}
-				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
-			} else {
-				clearAuthStateOnSuccess(auth, now)
+				modelEffects = applyModelResult(auth, state, result, now, m.cooldownDisabledForAuth(auth))
 			}
+		} else if result.Success {
+			clearAuthStateOnSuccess(auth, now)
 		} else {
-			if result.Model != "" {
-				if !isRequestScopedResultError(result.Error) {
-					disableCooling := m.cooldownDisabledForAuth(auth)
-					state := ensureModelState(auth, result.Model)
-					state.Unavailable = true
-					state.Status = StatusError
-					state.UpdatedAt = now
-					if result.Error != nil {
-						state.LastError = cloneError(result.Error)
-						state.StatusMessage = result.Error.Message
-						auth.LastError = cloneError(result.Error)
-						auth.StatusMessage = result.Error.Message
-					}
-
-					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
-						next := now.Add(12 * time.Hour)
-						state.NextRetryAfter = next
-						suspendReason = "model_not_supported"
-						shouldSuspendModel = true
-					} else if isCloudflareChallengeResultError(result.Error) {
-						next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
-						state.NextRetryAfter = next
-						state.StatusMessage = "cloudflare challenge"
-						if auth.LastError != nil {
-							auth.StatusMessage = "cloudflare challenge"
-						}
-						state.Quota = QuotaState{
-							Exceeded:      true,
-							Reason:        "cloudflare challenge",
-							NextRecoverAt: next,
-							BackoffLevel:  backoffLevel,
-						}
-					} else if isInvalidGrantResultError(result.Error) {
-						if disableCooling {
-							state.NextRetryAfter = time.Time{}
-						} else {
-							state.NextRetryAfter = now.Add(30 * time.Minute)
-							suspendReason = "invalid_grant"
-							shouldSuspendModel = true
-						}
-					} else {
-						switch statusCode {
-						case 401:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "unauthorized"
-								shouldSuspendModel = true
-							}
-						case 402, 403:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "payment_required"
-								shouldSuspendModel = true
-							}
-						case 404:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(12 * time.Hour)
-								state.NextRetryAfter = next
-								suspendReason = "not_found"
-								shouldSuspendModel = true
-							}
-						case 429:
-							var next time.Time
-							backoffLevel := state.Quota.BackoffLevel
-							if !disableCooling {
-								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
-								} else {
-									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
-								}
-							}
-							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
-							}
-							if !disableCooling {
-								suspendReason = "quota"
-								shouldSuspendModel = true
-								setModelQuota = true
-							}
-						case 408, 500, 502, 503, 504:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
-							}
-						default:
-							state.NextRetryAfter = time.Time{}
-						}
-					}
-
-					auth.Status = StatusError
-					auth.UpdatedAt = now
-					updateAggregatedAvailability(auth, now)
-				}
-			} else {
-				disableCooling := m.cooldownDisabledForAuth(auth)
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
-			}
+			applyAuthFailureState(auth, result.Error, result.RetryAfter, now, m.cooldownDisabledForAuth(auth))
 		}
 
 		_ = m.persist(ctx, auth)
@@ -3921,16 +3820,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.persistCooldownStates(context.Background())
 	}
 
-	if clearModelQuota && result.Model != "" {
+	if modelEffects.clearQuota && result.Model != "" {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
 	}
-	if setModelQuota && result.Model != "" {
+	if modelEffects.setQuota && result.Model != "" {
 		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
 	}
-	if shouldResumeModel {
+	if modelEffects.resume {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
-	} else if shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	} else if modelEffects.suspend {
+		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, string(modelEffects.suspendReason))
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -3950,6 +3849,20 @@ func ensureModelState(auth *Auth, model string) *ModelState {
 	state := &ModelState{Status: StatusActive}
 	auth.ModelStates[model] = state
 	return state
+}
+
+func modelStateRevision(auth *Auth, model string) uint64 {
+	if auth == nil || model == "" || len(auth.ModelStates) == 0 {
+		return 0
+	}
+	state := auth.ModelStates[model]
+	if state == nil {
+		state = auth.ModelStates[canonicalModelKey(model)]
+	}
+	if state == nil {
+		return 0
+	}
+	return state.Revision
 }
 
 func resetModelState(state *ModelState, now time.Time) {
@@ -3975,7 +3888,7 @@ func modelStateIsClean(state *ModelState) bool {
 	if state.Unavailable || state.StatusMessage != "" || !state.NextRetryAfter.IsZero() || state.LastError != nil {
 		return false
 	}
-	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 {
+	if state.Quota.Exceeded || state.Quota.Reason != "" || state.Quota.Phase != "" || !state.Quota.NextRecoverAt.IsZero() || !state.Quota.NextProbeAt.IsZero() || !state.Quota.ProviderResetAt.IsZero() || state.Quota.BackoffLevel != 0 {
 		return false
 	}
 	return true
@@ -3993,6 +3906,8 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	earliestRetry := time.Time{}
 	quotaExceeded := false
 	quotaRecover := time.Time{}
+	quotaProbe := time.Time{}
+	providerReset := time.Time{}
 	maxBackoffLevel := 0
 	hasState := false
 	for _, state := range auth.ModelStates {
@@ -4027,6 +3942,12 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			if state.Quota.BackoffLevel > maxBackoffLevel {
 				maxBackoffLevel = state.Quota.BackoffLevel
 			}
+			if quotaProbe.IsZero() || (!state.Quota.NextProbeAt.IsZero() && state.Quota.NextProbeAt.Before(quotaProbe)) {
+				quotaProbe = state.Quota.NextProbeAt
+			}
+			if providerReset.IsZero() || (!state.Quota.ProviderResetAt.IsZero() && state.Quota.ProviderResetAt.Before(providerReset)) {
+				providerReset = state.Quota.ProviderResetAt
+			}
 		}
 	}
 	if !hasState {
@@ -4043,6 +3964,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		auth.Quota.NextRecoverAt = quotaRecover
+		auth.Quota.NextProbeAt = quotaProbe
+		auth.Quota.ProviderResetAt = providerReset
+		auth.Quota.Phase = QuotaPhaseOpen
 		auth.Quota.BackoffLevel = maxBackoffLevel
 	} else {
 		auth.Quota.Exceeded = false
@@ -4447,18 +4371,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
-		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
-		var next time.Time
-		if !disableCooling {
-			if retryAfter != nil {
-				next = now.Add(*retryAfter)
-			} else {
-				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
-			}
-		}
-		auth.Quota.NextRecoverAt = next
-		auth.NextRetryAfter = next
+		auth.Quota, auth.NextRetryAfter = openQuotaCircuit(auth.Quota, retryAfter, now, disableCooling)
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {
@@ -4471,41 +4384,6 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
-}
-
-// quotaCooldownAfterFailure returns the recovery deadline and backoff level for
-// a quota failure observed at now. Failures that land while a previous quota
-// window is still open reuse that window instead of escalating, so a burst of
-// concurrent in-flight failures advances the backoff ladder at most once per
-// window.
-func quotaCooldownAfterFailure(quota QuotaState, now time.Time) (time.Time, int) {
-	if quota.NextRecoverAt.After(now) {
-		return quota.NextRecoverAt, quota.BackoffLevel
-	}
-	cooldown, nextLevel := nextQuotaCooldown(quota.BackoffLevel, false)
-	var next time.Time
-	if cooldown > 0 {
-		next = now.Add(cooldown)
-	}
-	return next, nextLevel
-}
-
-// nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
-func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) {
-	if prevLevel < 0 {
-		prevLevel = 0
-	}
-	if disableCooling {
-		return 0, prevLevel
-	}
-	cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
-	if cooldown < quotaBackoffBase {
-		cooldown = quotaBackoffBase
-	}
-	if cooldown >= quotaBackoffMax {
-		return quotaBackoffMax, prevLevel
-	}
-	return cooldown, prevLevel + 1
 }
 
 // List returns all auth entries currently known by the manager.
@@ -5574,8 +5452,10 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			attemptStartedAt := time.Now()
+			attemptRevision := modelStateRevision(c.auth, resultModel)
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
-			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil, StartedAt: attemptStartedAt, StateRevision: attemptRevision, RevisionKnown: true}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
