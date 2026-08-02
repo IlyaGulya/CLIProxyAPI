@@ -129,8 +129,8 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	if errAuthConfig != nil {
 		return runDir, 1, errAuthConfig
 	}
-	runtimeAuthDir := filepath.Join(runDir, "private", "auth")
-	if errAuth := PrepareAuthDir(sourceAuthDir, runtimeAuthDir, home); errAuth != nil {
+	runtimeAuthDir := RuntimeAuthDir(opts.RunsDir)
+	if errAuth := PrepareRuntimeAuthDir(sourceAuthDir, runtimeAuthDir, opts.RunsDir, home); errAuth != nil {
 		return runDir, 1, errAuth
 	}
 	configOutput, errConfig := PrepareConfig(configInput, port, runtimeAuthDir)
@@ -219,7 +219,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	clientRootModel := flagValue(claudeArgs, "--model")
 	rootModel := claudecompat.RoutedModel(clientRootModel, modelMappings)
 	subagentModel := values["CLAUDE_CODE_SUBAGENT_MODEL"]
-	selectedModels := []string{rootModel, subagentModel}
+	selectedModels := ClaudeContextModels(rootModel, subagentModel, modelMappings)
 	modelToken := values["ANTHROPIC_AUTH_TOKEN"]
 	if strings.TrimSpace(modelToken) == "" {
 		modelToken = ConfigAPIKey(configOutput)
@@ -228,11 +228,7 @@ func Run(ctx context.Context, opts Options) (string, int, error) {
 	models, errModels := WaitForClaudeModelMetadata(metadataCtx, http.DefaultClient, values["ANTHROPIC_BASE_URL"], modelToken, selectedModels)
 	cancelMetadata()
 	contextWindow := ResolveClaudeContextWindow(models, selectedModels)
-	if explicit := strings.TrimSpace(values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]); explicit != "" {
-		if parsed, errParse := strconv.Atoi(explicit); errParse == nil && parsed > 0 {
-			contextWindow = ClaudeContextWindowResolution{Window: parsed, Source: "explicit_environment"}
-		}
-	} else if errModels != nil {
+	if errModels != nil {
 		contextWindow.Source = "registry_fallback"
 	}
 	ConfigureClaudeContextSafety(values, contextWindow)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/tidwall/gjson"
 )
 
@@ -131,7 +132,7 @@ func applyClaudeCompactionReplayRoot(root map[string]any, retainedTokenBudget in
 			continue
 		}
 		encoded, _ := json.Marshal(message)
-		tokens, _ := estimateClaudeGPTInputTokens(encoded)
+		tokens, _ := claudecompat.EstimateInputTokensJSON(encoded)
 		if tokens < 1 {
 			tokens = 1
 		}
@@ -188,7 +189,7 @@ func claudeRealUserMessageImages(message map[string]any) (int, bool) {
 // by Codex model metadata. It is intentionally conservative: preflight exists
 // to prevent a deterministic provider failure, never to promise exact billing.
 func claudeContextPressure(input []byte) claudeContextPressureResult {
-	estimated, method := estimateClaudeGPTInputTokens(input)
+	estimated, method := claudecompat.EstimateInputTokensJSON(input)
 	return claudeContextPressureForEstimate(input, estimated, method)
 }
 
@@ -219,42 +220,6 @@ func claudeContextOverflowMessage(pressure claudeContextPressureResult) string {
 	total := pressure.EstimatedInput + pressure.ReservedOutput + pressure.SafetyMargin
 	return fmt.Sprintf("Prompt is too long: %d tokens > %d maximum (input=%d, requested_output=%d, safety_margin=%d)",
 		total, pressure.EffectiveWindow, pressure.EstimatedInput, pressure.ReservedOutput, pressure.SafetyMargin)
-}
-
-func estimateClaudeGPTInputTokens(input []byte) (int, string) {
-	var root any
-	if json.Unmarshal(input, &root) != nil {
-		return approximateTokens(input), "bytes_fallback"
-	}
-	return estimateClaudeGPTInputTokensValue(root)
-}
-
-func sanitizeClaudeTokenInput(value any, images *int) any {
-	switch typed := value.(type) {
-	case []any:
-		out := make([]any, len(typed))
-		for index := range typed {
-			out[index] = sanitizeClaudeTokenInput(typed[index], images)
-		}
-		return out
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		isImage := strings.Contains(strings.ToLower(stringValue(typed["type"])), "image")
-		isBase64 := strings.EqualFold(stringValue(typed["type"]), "base64")
-		if isImage {
-			*images++
-		}
-		for key, child := range typed {
-			if isBase64 && key == "data" {
-				out[key] = "[image bytes omitted]"
-				continue
-			}
-			out[key] = sanitizeClaudeTokenInput(child, images)
-		}
-		return out
-	default:
-		return value
-	}
 }
 
 type toolUseLocation struct {

@@ -4,9 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
-	"github.com/tiktoken-go/tokenizer"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 )
 
 // claudeRequestDocument owns decoded request state for one handler invocation.
@@ -143,38 +142,12 @@ func (d *claudeRequestDocument) hasContextEdits() bool {
 	return len(edits) > 0
 }
 
-var (
-	requestDocumentTokenizerOnce sync.Once
-	requestDocumentTokenizer     tokenizer.Codec
-	requestDocumentTokenizerErr  error
-)
-
 func (d *claudeRequestDocument) estimateInputTokens() (int, string) {
 	if d.estimateValid {
 		return d.estimatedInput, d.estimationMethod
 	}
 	d.estimateComputations++
-	d.estimatedInput, d.estimationMethod = estimateClaudeGPTInputTokensValue(d.root)
+	d.estimatedInput, d.estimationMethod = claudecompat.EstimateInputTokensValue(d.root)
 	d.estimateValid = true
 	return d.estimatedInput, d.estimationMethod
-}
-
-func estimateClaudeGPTInputTokensValue(value any) (int, string) {
-	images := 0
-	sanitized := sanitizeClaudeTokenInput(value, &images)
-	encoded, errEncode := json.Marshal(sanitized)
-	if errEncode != nil {
-		return 0, "bytes_fallback"
-	}
-	requestDocumentTokenizerOnce.Do(func() {
-		requestDocumentTokenizer, requestDocumentTokenizerErr = tokenizer.ForModel(tokenizer.GPT5)
-	})
-	if requestDocumentTokenizerErr != nil || requestDocumentTokenizer == nil {
-		return approximateTokens(encoded) + images*85, "bytes_fallback"
-	}
-	count, errCount := requestDocumentTokenizer.Count(string(encoded))
-	if errCount != nil {
-		return approximateTokens(encoded) + images*85, "bytes_fallback"
-	}
-	return count + images*85, "gpt5_tokenizer"
 }

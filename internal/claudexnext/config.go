@@ -10,11 +10,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudecompat"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"gopkg.in/yaml.v3"
 )
+
+var authDirPrepareMu sync.Mutex
 
 // PrepareConfig creates an isolated, observable proxy configuration for one run.
 func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
@@ -39,6 +43,15 @@ func PrepareConfig(input []byte, port int, authDir ...string) ([]byte, error) {
 	}
 	if _, configured := values["logs-max-total-size-mb"]; !configured {
 		values["logs-max-total-size-mb"] = 128
+	}
+	if _, configured := values["request-retry"]; !configured {
+		values["request-retry"] = 3
+	}
+	if _, configured := values["max-retry-interval"]; !configured {
+		values["max-retry-interval"] = 30
+	}
+	if _, configured := values["transient-error-cooldown-seconds"]; !configured {
+		values["transient-error-cooldown-seconds"] = 5
 	}
 	values["codex-prefer-upstream-websockets"] = true
 	values["codex-websocket-speculative-preconnect"] = true
@@ -103,8 +116,44 @@ func ConfigAuthDir(input []byte) (string, error) {
 	return "~/.cli-proxy-api", nil
 }
 
-// PrepareAuthDir creates a private credential snapshot and enables Codex websocket capability in that snapshot only.
+// RuntimeAuthDir returns the credential store shared by all runs under runsDir.
+func RuntimeAuthDir(runsDir string) string {
+	return filepath.Join(filepath.Dir(filepath.Clean(runsDir)), "auth")
+}
+
+// PrepareRuntimeAuthDir bootstraps the shared store from the configured source
+// and any private snapshots created by older claudex-next versions.
+func PrepareRuntimeAuthDir(source, destination, runsDir, home string) error {
+	if errPrepare := PrepareAuthDir(source, destination, home); errPrepare != nil {
+		return errPrepare
+	}
+	legacyAuthDirs, errGlob := filepath.Glob(filepath.Join(runsDir, "*", "private", "auth"))
+	if errGlob != nil {
+		return fmt.Errorf("find legacy auth directories: %w", errGlob)
+	}
+	sort.Strings(legacyAuthDirs)
+	for _, legacyAuthDir := range legacyAuthDirs {
+		if filepath.Clean(legacyAuthDir) == filepath.Clean(destination) {
+			continue
+		}
+		if errPrepare := prepareAuthDir(legacyAuthDir, destination, home, true); errPrepare != nil {
+			return fmt.Errorf("migrate legacy auth directory %s: %w", legacyAuthDir, errPrepare)
+		}
+	}
+	return nil
+}
+
+// PrepareAuthDir reconciles source credentials into the shared runtime store.
+// Rotated Codex credentials are monotonic: an older source snapshot cannot
+// overwrite a newer token already persisted by another run.
 func PrepareAuthDir(source, destination, home string) error {
+	return prepareAuthDir(source, destination, home, false)
+}
+
+func prepareAuthDir(source, destination, home string, codexOnly bool) error {
+	authDirPrepareMu.Lock()
+	defer authDirPrepareMu.Unlock()
+
 	if source == "~" {
 		source = home
 	} else if strings.HasPrefix(source, "~/") {
@@ -115,7 +164,7 @@ func PrepareAuthDir(source, destination, home string) error {
 		return fmt.Errorf("read auth directory: %w", errRead)
 	}
 	if errMkdir := os.MkdirAll(destination, 0o700); errMkdir != nil {
-		return fmt.Errorf("create private auth directory: %w", errMkdir)
+		return fmt.Errorf("create runtime auth directory: %w", errMkdir)
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -126,7 +175,18 @@ func PrepareAuthDir(source, destination, home string) error {
 			return fmt.Errorf("read auth file %s: %w", entry.Name(), errFile)
 		}
 		var record map[string]any
-		if json.Unmarshal(payload, &record) == nil && strings.EqualFold(configString(record["type"]), "codex") {
+		isCodex := json.Unmarshal(payload, &record) == nil && strings.EqualFold(configString(record["type"]), "codex")
+		if codexOnly && !isCodex {
+			continue
+		}
+		if isCodex {
+			destinationPath := filepath.Join(destination, entry.Name())
+			if existing, errExisting := os.ReadFile(destinationPath); errExisting == nil {
+				var existingRecord map[string]any
+				if json.Unmarshal(existing, &existingRecord) == nil && codexCredentialNewer(existingRecord, record) {
+					record = existingRecord
+				}
+			}
 			record["websockets"] = true
 			payload, errFile = json.Marshal(record)
 			if errFile != nil {
@@ -134,11 +194,61 @@ func PrepareAuthDir(source, destination, home string) error {
 			}
 			payload = append(payload, '\n')
 		}
-		if errWrite := os.WriteFile(filepath.Join(destination, entry.Name()), payload, 0o600); errWrite != nil {
+		if errWrite := writeAuthFileAtomic(filepath.Join(destination, entry.Name()), payload); errWrite != nil {
 			return fmt.Errorf("write auth file %s: %w", entry.Name(), errWrite)
 		}
 	}
 	return nil
+}
+
+func codexCredentialNewer(candidate, baseline map[string]any) bool {
+	for _, field := range []string{"last_refresh", "expired"} {
+		candidateTime, candidateOK := credentialTime(candidate[field])
+		baselineTime, baselineOK := credentialTime(baseline[field])
+		switch {
+		case candidateOK && !baselineOK:
+			return true
+		case !candidateOK && baselineOK:
+			return false
+		case candidateOK && baselineOK && !candidateTime.Equal(baselineTime):
+			return candidateTime.After(baselineTime)
+		}
+	}
+	return false
+}
+
+func credentialTime(value any) (time.Time, bool) {
+	raw := strings.TrimSpace(configString(value))
+	if raw == "" {
+		return time.Time{}, false
+	}
+	parsed, errParse := time.Parse(time.RFC3339, raw)
+	return parsed, errParse == nil
+}
+
+func writeAuthFileAtomic(path string, payload []byte) error {
+	file, errCreate := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if errCreate != nil {
+		return errCreate
+	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if errChmod := file.Chmod(0o600); errChmod != nil {
+		_ = file.Close()
+		return errChmod
+	}
+	if _, errWrite := file.Write(payload); errWrite != nil {
+		_ = file.Close()
+		return errWrite
+	}
+	if errSync := file.Sync(); errSync != nil {
+		_ = file.Close()
+		return errSync
+	}
+	if errClose := file.Close(); errClose != nil {
+		return errClose
+	}
+	return os.Rename(tempPath, path)
 }
 
 func configString(value any) string {
@@ -293,6 +403,29 @@ type ClaudeContextWindowResolution struct {
 	Source string `json:"source"`
 }
 
+// ClaudeContextModels returns every routed model Claude Code may use for the
+// root conversation, configured subagents, or workflow phases.
+func ClaudeContextModels(rootModel, subagentModel string, mappings map[string]string) []string {
+	models := make(map[string]struct{}, len(mappings)+2)
+	add := func(model string) {
+		model = strings.TrimSpace(model)
+		if model != "" {
+			models[model] = struct{}{}
+		}
+	}
+	add(rootModel)
+	add(subagentModel)
+	for _, model := range mappings {
+		add(model)
+	}
+	out := make([]string, 0, len(models))
+	for model := range models {
+		out = append(out, model)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func ResolveClaudeContextWindow(models []ClaudeModelMetadata, selected []string) ClaudeContextWindowResolution {
 	byID := make(map[string]int, len(models))
 	for _, model := range models {
@@ -334,12 +467,16 @@ func ConfigAPIKey(input []byte) string {
 	return strings.TrimSpace(values.APIKeys[0])
 }
 
-// ConfigureClaudeContextSafety passes the full resolved model window to Claude
-// Code. Claude owns its own output reserve; explicit user settings always win.
+// ConfigureClaudeContextSafety teaches Claude Code the resolved hard limit for
+// custom routed models and leaves enough room to compact before the next tool
+// result. Explicit user settings always win.
 func ConfigureClaudeContextSafety(values map[string]string, resolutions ...ClaudeContextWindowResolution) {
 	resolution := ClaudeContextWindowResolution{Window: 200_000, Source: "registry_fallback"}
 	if len(resolutions) > 0 && resolutions[0].Window > 0 {
 		resolution = resolutions[0]
+	}
+	if _, configured := values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]; !configured {
+		values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = strconv.Itoa(resolution.Window)
 	}
 	if _, configured := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; !configured {
 		values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = strconv.Itoa(resolution.Window)

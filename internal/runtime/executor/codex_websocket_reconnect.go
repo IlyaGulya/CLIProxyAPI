@@ -24,6 +24,7 @@ type codexReconnectRoute struct {
 type codexPreviousAttempt struct {
 	conn *websocket.Conn
 	read chan codexWebsocketRead
+	err  error
 }
 
 type codexRecoveryState interface {
@@ -84,7 +85,9 @@ func (e *CodexWebsocketsExecutor) reconnectCodexWebsocket(request codexReconnect
 			return nil
 		}),
 		bindCodexAttemptAction(codexAttemptCloseConnection, func() error {
-			if request.route.session == nil && request.previous.conn != nil {
+			if request.route.session != nil && request.previous.conn != nil {
+				e.invalidateUpstreamConn(request.route.session, request.previous.conn, "transport_retry", request.previous.err)
+			} else if request.previous.conn != nil {
 				if errClose := e.closeCodexConnection(request.previous.conn); errClose != nil {
 					log.Errorf("codex websockets executor: close websocket before retry error: %v", errClose)
 				}

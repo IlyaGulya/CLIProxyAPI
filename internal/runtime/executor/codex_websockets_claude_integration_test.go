@@ -188,8 +188,16 @@ func TestClaudeCodexWebsocketSameModelTurnUsesPreviousResponseDelta(t *testing.T
 			}
 			translated.Write(chunk.Payload)
 		}
-		if got := firstSSEJSONEvent(translated.String(), "message_start").Get("message.usage.input_tokens").Int(); got <= 0 {
-			t.Fatalf("turn %d message_start input usage = %d; stream=%s", turn, got, translated.String())
+		startUsage := firstSSEJSONEvent(translated.String(), "message_start").Get("message.usage.input_tokens").Int()
+		if startUsage <= 0 {
+			t.Fatalf("turn %d message_start input usage = %d; stream=%s", turn, startUsage, translated.String())
+		}
+		terminalUsage := firstSSEJSONEvent(translated.String(), "message_delta").Get("usage")
+		terminalInput := terminalUsage.Get("input_tokens").Int() +
+			terminalUsage.Get("cache_read_input_tokens").Int() +
+			terminalUsage.Get("cache_creation_input_tokens").Int()
+		if terminalInput != startUsage {
+			t.Fatalf("turn %d terminal input usage = %d, want logical start usage %d; stream=%s", turn, terminalInput, startUsage, translated.String())
 		}
 	}
 

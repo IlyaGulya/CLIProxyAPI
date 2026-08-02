@@ -69,7 +69,7 @@ func TestConvertCodexResponseToClaude_StreamThinkingIncludesSignature(t *testing
 	}
 }
 
-func TestConvertCodexResponseToClaudeStreamReportsEstimatedUsageAtMessageStart(t *testing.T) {
+func TestConvertCodexResponseToClaudeReportsLogicalUsageThroughTerminal(t *testing.T) {
 	t.Parallel()
 	originalRequest := []byte(`{"model":"gpt-5.6-sol","system":"system instructions","messages":[{"role":"user","content":"` + strings.Repeat("workflow context ", 200) + `"}]}`)
 	var param any
@@ -80,19 +80,69 @@ func TestConvertCodexResponseToClaudeStreamReportsEstimatedUsageAtMessageStart(t
 		t.Fatalf("message_start missing estimated input usage: %q", started)
 	}
 
+	terminalResponse := []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":321,"input_tokens_details":{"cached_tokens":300},"output_tokens":45},"output":[]}}`)
 	terminal := ConvertCodexResponseToClaude(context.Background(), "gpt-5.6-sol", originalRequest, nil,
-		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":321,"input_tokens_details":{"cached_tokens":300},"output_tokens":45},"output":[]}}`), &param)
+		append([]byte("data: "), terminalResponse...), &param)
 	delta, ok := firstClaudeStreamPayloadForEvent(joinClaudeStreamChunks(terminal), "message_delta")
-	if !ok || delta.Get("usage.input_tokens").Int() != 21 || delta.Get("usage.cache_read_input_tokens").Int() != 300 || delta.Get("usage.output_tokens").Int() != 45 {
-		t.Fatalf("terminal usage must remain factual and cumulative: %q", terminal)
+	if !ok {
+		t.Fatalf("terminal usage missing: %q", terminal)
+	}
+	startInput := start.Get("message.usage.input_tokens").Int()
+	terminalInput := totalClaudeResponseInputUsage(delta.Get("usage"))
+	if terminalInput != startInput || terminalInput <= 321 {
+		t.Fatalf("stream terminal input usage = %d, want logical start usage %d above chained upstream usage; terminal=%q", terminalInput, startInput, terminal)
+	}
+	if delta.Get("usage.output_tokens").Int() != 45 {
+		t.Fatalf("stream output usage changed: %q", terminal)
+	}
+
+	nonStream := gjson.ParseBytes(ConvertCodexResponseToClaudeNonStream(context.Background(), "gpt-5.6-sol", originalRequest, nil, terminalResponse, nil))
+	if got := totalClaudeResponseInputUsage(nonStream.Get("usage")); got != startInput {
+		t.Fatalf("non-stream terminal input usage = %d, want logical usage %d: %s", got, startInput, nonStream.Raw)
 	}
 }
 
-func TestEstimateClaudeStreamInputTokensOmitsBase64Payload(t *testing.T) {
+func totalClaudeResponseInputUsage(usage gjson.Result) int64 {
+	return usage.Get("input_tokens").Int() +
+		usage.Get("cache_read_input_tokens").Int() +
+		usage.Get("cache_creation_input_tokens").Int()
+}
+
+func TestReconcileCodexClaudeUsage(t *testing.T) {
 	t.Parallel()
-	input := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"` + strings.Repeat("A", 1_000_000) + `"}}]}]}`)
-	if got := estimateClaudeStreamInputTokens(input); got <= 0 || got > 1_000 {
-		t.Fatalf("base64 payload affected live usage estimate: %d", got)
+	tests := []struct {
+		name         string
+		logicalInput int64
+		provider     string
+		wantInput    int64
+		wantRead     int64
+		wantCreation int64
+		wantOutput   int64
+	}{
+		{
+			name: "logical request exceeds chained provider context", logicalInput: 427,
+			provider:  `{"input_tokens":321,"input_tokens_details":{"cached_tokens":300},"output_tokens":45}`,
+			wantInput: 127, wantRead: 300, wantOutput: 45,
+		},
+		{
+			name: "provider context remains authoritative when larger", logicalInput: 100,
+			provider:  `{"input_tokens":321,"input_tokens_details":{"cached_tokens":300},"cache_creation_input_tokens":20,"output_tokens":45}`,
+			wantInput: 21, wantRead: 300, wantCreation: 20, wantOutput: 45,
+		},
+		{
+			name: "invalid provider counters are bounded", logicalInput: 40,
+			provider:  `{"input_tokens":10,"input_tokens_details":{"cached_tokens":99},"cache_creation_input_tokens":-3,"output_tokens":-1}`,
+			wantInput: 30, wantRead: 10,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := reconcileCodexClaudeUsage(test.logicalInput, gjson.Parse(test.provider))
+			if got.Input != test.wantInput || got.CacheRead != test.wantRead || got.CacheCreation != test.wantCreation || got.Output != test.wantOutput {
+				t.Fatalf("usage = %+v, want input=%d read=%d creation=%d output=%d", got, test.wantInput, test.wantRead, test.wantCreation, test.wantOutput)
+			}
+		})
 	}
 }
 

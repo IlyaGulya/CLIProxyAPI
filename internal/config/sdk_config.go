@@ -133,6 +133,10 @@ type StreamingConfig struct {
 	// Keep-alive comments do not reset this watchdog. <= 0 disables it.
 	IdleTimeoutSeconds int `yaml:"idle-timeout-seconds,omitempty" json:"idle-timeout-seconds,omitempty"`
 
+	// FirstProgressTimeoutSeconds bounds how long a Codex websocket request may wait for its first progress event.
+	// <= 0 uses the provider default.
+	FirstProgressTimeoutSeconds int `yaml:"first-progress-timeout-seconds,omitempty" json:"first-progress-timeout-seconds,omitempty"`
+
 	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.

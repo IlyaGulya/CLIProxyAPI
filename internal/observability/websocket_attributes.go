@@ -46,6 +46,7 @@ type WebsocketAttributes struct {
 	ToolName                string
 	PromptCacheScope        string
 	PromptPrefixFingerprint string
+	ContentFingerprint      string
 	PromptCacheTTL          string
 	PromptCacheDecision     string
 	TransactionalPolicy     TransactionalPolicy
@@ -94,6 +95,9 @@ type WebsocketAttributes struct {
 	UpstreamBytes              Optional[int64]
 	UpstreamFrames             Optional[int64]
 	TranslatedChunks           Optional[int64]
+	FrameOrdinal               Optional[int64]
+	OutputIndex                Optional[int64]
+	ContentIndex               Optional[int64]
 	InputItems                 Optional[int64]
 	InstructionsBytes          Optional[int64]
 	ToolsCount                 Optional[int64]
@@ -131,7 +135,8 @@ func (a WebsocketAttributes) fields() map[string]any {
 		"chain_source": a.ChainSource, "incremental_reset_reason": a.IncrementalResetReason, "trigger": a.Trigger,
 		"tool_name":          a.ToolName,
 		"prompt_cache_scope": a.PromptCacheScope, "prompt_prefix_fingerprint": a.PromptPrefixFingerprint,
-		"prompt_cache_ttl": a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
+		"content_fingerprint": a.ContentFingerprint,
+		"prompt_cache_ttl":    a.PromptCacheTTL, "prompt_cache_decision": a.PromptCacheDecision,
 		"transactional_policy": string(a.TransactionalPolicy), "commit_boundary": string(a.CommitBoundary),
 		"attempt_state_from": string(a.AttemptStateFrom), "attempt_state_to": string(a.AttemptStateTo),
 		"attempt_event": string(a.AttemptEvent),
@@ -178,6 +183,9 @@ func (a WebsocketAttributes) fields() map[string]any {
 	addOptional(fields, "upstream_body_bytes", a.UpstreamBodyBytes)
 	addOptional(fields, "upstream_bytes", a.UpstreamBytes)
 	addOptional(fields, "upstream_frames", a.UpstreamFrames)
+	addOptional(fields, "frame_ordinal", a.FrameOrdinal)
+	addOptional(fields, "output_index", a.OutputIndex)
+	addOptional(fields, "content_index", a.ContentIndex)
 	addOptional(fields, "translated_chunks", a.TranslatedChunks)
 	addOptional(fields, "input_items", a.InputItems)
 	addOptional(fields, "instructions_bytes", a.InstructionsBytes)

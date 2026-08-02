@@ -231,6 +231,7 @@ nonstream-keepalive-interval: 0
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
 #   idle-timeout-seconds: 300 # Default: 0 (disabled). Keep-alives do not reset it.
+#   first-progress-timeout-seconds: 30 # Codex WebSocket only. Default: 30. Metadata events do not count as progress.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).

@@ -45,6 +45,116 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketsExecuteStreamRetriesSilentUpstreamBeforeIdleTimeout(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	upstream := newCodexScriptedUpstream(t,
+		[]codexWebsocketScriptStep{codexSend(`{"type":"response.created","response":{"id":"resp-silent-1"}}`), codexWait(release)},
+		[]codexWebsocketScriptStep{codexSend(`{"type":"response.created","response":{"id":"resp-silent-2"}}`), codexWait(release)},
+	)
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{
+		DisableImageGeneration: config.DisableImageGenerationAll,
+		RequestLog:             true,
+		Streaming: config.StreamingConfig{
+			FirstProgressTimeoutSeconds: 1,
+			IdleTimeoutSeconds:          30,
+		},
+	}})
+	auth := &cliproxyauth.Auth{ID: "auth-silent", Attributes: map[string]string{"api_key": "sk-test", "base_url": upstream.URL()}}
+	payload := []byte(`{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"silent"}],"max_tokens":128,"stream":true}`)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), "gin", ginCtx), 5*time.Second)
+	defer cancel()
+
+	result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload,
+		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:silent-upstream"},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	var terminalErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			terminalErr = chunk.Err
+		}
+	}
+	if terminalErr == nil || !strings.Contains(terminalErr.Error(), "first upstream progress timeout") {
+		t.Fatalf("terminal error = %v, want first upstream progress timeout", terminalErr)
+	}
+	if got := upstream.Connections(); got != 2 {
+		t.Fatalf("connections = %d, want one fresh retry", got)
+	}
+	timelineValue, exists := ginCtx.Get("API_WEBSOCKET_TIMELINE")
+	if !exists {
+		t.Fatal("websocket timeline was not captured")
+	}
+	timeline := string(timelineValue.([]byte))
+	for _, want := range []string{`"name":"first_progress_timeout"`, `"reason":"first_progress_timeout"`} {
+		if !strings.Contains(timeline, want) {
+			t.Errorf("timeline missing %q: %s", want, timeline)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	exec.CloseExecutionSession("claude-code:silent-upstream")
+}
+
+func TestCodexWebsocketsExecuteStreamFingerprintsDuplicateUpstreamTextDeltas(t *testing.T) {
+	const duplicateText = "duplicate diagnostic marker"
+	upstream := newCodexScriptedUpstream(t,
+		[]codexWebsocketScriptStep{
+			codexSend(`{"type":"response.created","response":{"id":"resp-duplicate","model":"gpt-5.6-sol"}}`),
+			codexSend(`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"` + duplicateText + `"}`),
+			codexSend(`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"` + duplicateText + `"}`),
+			codexSend(`{"type":"response.completed","response":{"id":"resp-duplicate","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`),
+		},
+	)
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{
+		DisableImageGeneration: config.DisableImageGenerationAll,
+		RequestLog:             true,
+	}})
+	auth := &cliproxyauth.Auth{ID: "auth-duplicate", Attributes: map[string]string{"api_key": "sk-test", "base_url": upstream.URL()}}
+	payload := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"duplicate"}],"max_tokens":128,"stream":true}`)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"), ResponseFormat: sdktranslator.FromString("claude"), OriginalRequest: payload,
+		Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "claude-code:duplicate-text"},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	var downstream strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error = %v", chunk.Err)
+		}
+		downstream.Write(chunk.Payload)
+	}
+	if got := strings.Count(downstream.String(), duplicateText); got != 2 {
+		t.Fatalf("duplicate text count = %d, want 2; stream=%s", got, downstream.String())
+	}
+	timelineValue, exists := ginCtx.Get("API_WEBSOCKET_TIMELINE")
+	if !exists {
+		t.Fatal("websocket timeline was not captured")
+	}
+	timeline := string(timelineValue.([]byte))
+	if got := strings.Count(timeline, `"name":"upstream_text_delta"`); got != 2 {
+		t.Fatalf("fingerprint event count = %d, want 2; timeline=%s", got, timeline)
+	}
+	fingerprint, _ := codexTextDeltaFingerprint([]byte(`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"` + duplicateText + `"}`))
+	if got := strings.Count(timeline, `"content_fingerprint":"`+fingerprint.Fingerprint+`"`); got != 2 {
+		t.Fatalf("fingerprint count = %d, want 2; timeline=%s", got, timeline)
+	}
+	exec.CloseExecutionSession("claude-code:duplicate-text")
+}
+
 func TestCodexWebsocketsExecuteResponsesLiteDoesNotInjectImageGenerationTool(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	capturedPayload := make(chan []byte, 1)

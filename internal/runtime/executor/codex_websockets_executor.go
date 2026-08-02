@@ -753,7 +753,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					ctx: ctx, auth: auth, session: sess, authID: authID, url: wsURL,
 					headers: retryHeaders, executionID: executionSessionID,
 				},
-				previous: codexPreviousAttempt{conn: conn, read: readCh},
+				previous: codexPreviousAttempt{conn: conn, read: readCh, err: errSend},
 				attempt:  attemptMachine,
 				recovery: codexNoopRecoveryState{},
 			})
@@ -808,6 +808,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		var firstEventAt time.Time
+		liveness := newCodexStreamLiveness(e.cfg)
+		liveness.resetAttemptAt(sendStartedAt)
 		var firstReasoningDeltaAt time.Time
 		var firstOutputTextDeltaAt time.Time
 		var upstreamFrames int64
@@ -826,7 +828,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			streamExecution.finalizeAttempt()
 			if streamExecution.reason == "completed" {
 				e.recordCircuitSuccess(ctx, auth, req.Model)
-			} else if streamExecution.reason == "read_error" || streamExecution.reason == "unexpected_binary" {
+			} else if streamExecution.reason == "read_error" || streamExecution.reason == "first_progress_timeout" || streamExecution.reason == "unexpected_binary" {
 				e.recordCircuitFailure(ctx, auth, req.Model, streamExecution.reason)
 			}
 			if sess != nil {
@@ -918,14 +920,23 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				_ = delivery.send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 				return
 			}
-			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh, codexWebsocketIdleTimeout(e.cfg))
+			readTimeout := liveness.timeout()
+			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh, readTimeout)
 			if errRead != nil {
 				if sess != nil && ctx != nil && ctx.Err() != nil {
 					streamExecution.fail("context_done", ctx.Err())
 					_ = delivery.send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
 					return
 				}
-				mappedErr := mapCodexWebsocketReadError(errRead)
+				mappedErr := liveness.mapTimeout(mapCodexWebsocketReadError(errRead))
+				var firstProgressTimeout codexFirstProgressTimeoutError
+				isFirstProgressTimeout := errors.As(mappedErr, &firstProgressTimeout)
+				if isFirstProgressTimeout {
+					helps.RecordAPIWebsocketEvent(ctx, e.cfg, "first_progress_timeout", observability.WebsocketAttributes{
+						SessionID: executionSessionID, ElapsedUS: observability.Some(time.Since(traceStartedAt).Microseconds()),
+						DurationUS: observability.Some(firstProgressTimeout.timeout.Microseconds()), Success: observability.Some(false),
+					}, nil)
+				}
 				streamExecution.closeCode = codexWebsocketCloseCode(mappedErr)
 				decision := decideCodexRetry(codexRetryInput{
 					Err:                 mappedErr,
@@ -952,7 +963,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							ctx: ctx, auth: auth, session: sess, authID: authID, url: wsURL,
 							headers: retryHeaders, executionID: executionSessionID, overflow: sessionOverflow,
 						},
-						previous: codexPreviousAttempt{conn: conn, read: readCh},
+						previous: codexPreviousAttempt{conn: conn, read: readCh, err: mappedErr},
 						attempt:  attemptMachine,
 						recovery: codexTransactionalRecoveryState{discard: func() error {
 							if bufferedBytes := delivery.bufferedBytes(); bufferedBytes > 0 {
@@ -1001,6 +1012,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 							param = nil
 							streamExecution.closeCode = 0
 							speculativeAgentCalls = make(map[string]struct{})
+							liveness.resetAttemptAt(sendStartedAt)
 							retryAttributes.DurationUS = observability.Some(time.Since(retryStartedAt).Microseconds())
 							retryAttributes.ConnectionSource = string(retrySource)
 							helps.RecordAPIWebsocketEvent(ctx, e.cfg, "transport_retry_succeeded", retryAttributes, nil)
@@ -1036,10 +1048,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 						DownstreamCommitted: observability.Some(streamBridge.snapshot().DownstreamCommitted),
 					}, nil)
 				}
-				if delivery.buffering() && delivery.bufferedBytes() > 0 {
+				firstProgressTimeout = codexFirstProgressTimeoutError{}
+				isFirstProgressTimeout = errors.As(mappedErr, &firstProgressTimeout)
+				if delivery.buffering() && delivery.bufferedBytes() > 0 && liveness.progressStarted() {
 					mappedErr = codexPartialResponseInterruptedError()
 				}
-				streamExecution.fail("read_error", mappedErr)
+				failureReason := "read_error"
+				if isFirstProgressTimeout {
+					failureReason = "first_progress_timeout"
+				}
+				streamExecution.fail(failureReason, mappedErr)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 				reporter.PublishFailure(ctx, mappedErr)
 				_ = delivery.send(cliproxyexecutor.StreamChunk{Err: mappedErr})
@@ -1067,6 +1085,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			reporter.MarkFirstResponseByte()
 			upstreamFrames++
 			upstreamBytes += int64(len(payload))
+			if fingerprint, ok := codexTextDeltaFingerprint(payload); ok {
+				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "upstream_text_delta", observability.WebsocketAttributes{
+					SessionID: executionSessionID, LastEventType: "response.output_text.delta",
+					ContentFingerprint: fingerprint.Fingerprint,
+					Bytes:              observability.Some(fingerprint.Bytes),
+					FrameOrdinal:       observability.Some(upstreamFrames),
+					OutputIndex:        observability.Some(fingerprint.OutputIndex),
+					ContentIndex:       observability.Some(fingerprint.ContentIndex),
+				}, nil)
+			}
 			if firstEventAt.IsZero() {
 				firstEventAt = time.Now()
 				helps.RecordAPIWebsocketEvent(ctx, e.cfg, "first_upstream_event", observability.WebsocketAttributes{
@@ -1092,6 +1120,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			eventType := streamEvent.Type
+			liveness.observe(streamEvent)
 			if from.String() == "claude" && strings.HasPrefix(executionSessionID, helps.ClaudeCodeWebsocketSessionPrefix) {
 				if agentCallKey, toolName, ok := codexFanoutToolCall(payload); ok {
 					if _, seen := speculativeAgentCalls[agentCallKey]; !seen {
@@ -1245,6 +1274,10 @@ func isTemporaryCodexWebsocketNetworkError(err error) bool {
 func codexWebsocketRetryReason(err error) string {
 	if err == nil {
 		return "unknown"
+	}
+	var firstProgressTimeout codexFirstProgressTimeoutError
+	if errors.As(err, &firstProgressTimeout) {
+		return "first_progress_timeout"
 	}
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
@@ -1465,10 +1498,14 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	if readCh == nil {
 		return 0, nil, fmt.Errorf("codex websockets executor: session read channel is nil")
 	}
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
+		case <-timer.C:
+			return 0, nil, codexWebsocketReadTimeoutError{timeout: idleTimeout}
 		case ev, ok := <-readCh:
 			if !ok {
 				return 0, nil, fmt.Errorf("codex websockets executor: session read channel closed")

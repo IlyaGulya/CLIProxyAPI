@@ -9,14 +9,12 @@ package claude
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"strings"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"github.com/tiktoken-go/tokenizer"
 )
 
 var (
@@ -42,6 +40,7 @@ type ConvertCodexResponseToClaudeParams struct {
 	LastWebSearchToolUseID     string
 	PendingFunctionCalls       map[string]*pendingCodexFunctionCall
 	LastPendingFunctionCallKey string
+	LogicalInputTokens         int64
 }
 
 type pendingCodexFunctionCall struct {
@@ -70,7 +69,8 @@ type pendingCodexFunctionCall struct {
 func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, _ []byte, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &ConvertCodexResponseToClaudeParams{
-			BlockIndex: 0,
+			BlockIndex:         0,
+			LogicalInputTokens: estimateLogicalClaudeInput(originalRequestRawJSON),
 		}
 	}
 
@@ -100,8 +100,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
 		template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
 		template, _ = sjson.SetBytes(template, "message.id", rootResult.Get("response.id").String())
-		if estimated := estimateClaudeStreamInputTokens(originalRequestRawJSON); estimated > 0 {
-			template, _ = sjson.SetBytes(template, "message.usage.input_tokens", estimated)
+		if params.LogicalInputTokens > 0 {
+			template, _ = sjson.SetBytes(template, "message.usage.input_tokens", params.LogicalInputTokens)
 		}
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
@@ -146,11 +146,14 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		output = appendPendingCodexFunctionCallsFromTerminal(output, params, originalRequestRawJSON, responseData)
 		template, _ = sjson.SetBytes(template, "delta.stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), params.HasEmittedToolUse))
 		template = setClaudeStopSequence(template, "delta.stop_sequence", responseData)
-		inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
-		template, _ = sjson.SetBytes(template, "usage.input_tokens", inputTokens)
-		template, _ = sjson.SetBytes(template, "usage.output_tokens", outputTokens)
-		if cachedTokens > 0 {
-			template, _ = sjson.SetBytes(template, "usage.cache_read_input_tokens", cachedTokens)
+		usage := reconcileCodexClaudeUsage(params.LogicalInputTokens, responseData.Get("usage"))
+		template, _ = sjson.SetBytes(template, "usage.input_tokens", usage.Input)
+		template, _ = sjson.SetBytes(template, "usage.output_tokens", usage.Output)
+		if usage.CacheRead > 0 {
+			template, _ = sjson.SetBytes(template, "usage.cache_read_input_tokens", usage.CacheRead)
+		}
+		if usage.CacheCreation > 0 {
+			template, _ = sjson.SetBytes(template, "usage.cache_creation_input_tokens", usage.CacheCreation)
 		}
 		template = applyCodexClaudeTerminalMetadata(template, "delta.", responseData)
 
@@ -305,64 +308,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	return [][]byte{output}
 }
 
-func estimateClaudeStreamInputTokens(input []byte) int64 {
-	if len(input) == 0 {
-		return 0
-	}
-	var decoded any
-	if json.Unmarshal(input, &decoded) != nil {
-		return 0
-	}
-	images := int64(0)
-	sanitized := sanitizeClaudeStreamTokenInput(decoded, &images)
-	encoded, err := json.Marshal(sanitized)
-	if err != nil {
-		return 0
-	}
-	codec, err := tokenizer.ForModel(tokenizer.GPT5)
-	if err != nil || codec == nil {
-		return 0
-	}
-	count, err := codec.Count(string(encoded))
-	if err != nil {
-		return 0
-	}
-	return int64(count) + images*85
-}
-
-func sanitizeClaudeStreamTokenInput(value any, images *int64) any {
-	switch typed := value.(type) {
-	case []any:
-		out := make([]any, len(typed))
-		for index := range typed {
-			out[index] = sanitizeClaudeStreamTokenInput(typed[index], images)
-		}
-		return out
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		isImage := strings.Contains(strings.ToLower(stringJSONValue(typed["type"])), "image")
-		isBase64 := strings.EqualFold(stringJSONValue(typed["type"]), "base64")
-		if isImage {
-			*images++
-		}
-		for key, child := range typed {
-			if isBase64 && key == "data" {
-				out[key] = "[image bytes omitted]"
-				continue
-			}
-			out[key] = sanitizeClaudeStreamTokenInput(child, images)
-		}
-		return out
-	default:
-		return value
-	}
-}
-
-func stringJSONValue(value any) string {
-	text, _ := value.(string)
-	return text
-}
-
 func codexStreamErrorToClaudeError(rootResult gjson.Result) []byte {
 	errorResult := rootResult.Get("error")
 	errType := strings.TrimSpace(errorResult.Get("type").String())
@@ -416,11 +361,14 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	out, _ = sjson.SetBytes(out, "id", responseData.Get("id").String())
 	out, _ = sjson.SetBytes(out, "model", responseData.Get("model").String())
-	inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
-	out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
-	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
-	if cachedTokens > 0 {
-		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
+	usage := reconcileCodexClaudeUsage(estimateLogicalClaudeInput(originalRequestRawJSON), responseData.Get("usage"))
+	out, _ = sjson.SetBytes(out, "usage.input_tokens", usage.Input)
+	out, _ = sjson.SetBytes(out, "usage.output_tokens", usage.Output)
+	if usage.CacheRead > 0 {
+		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", usage.CacheRead)
+	}
+	if usage.CacheCreation > 0 {
+		out, _ = sjson.SetBytes(out, "usage.cache_creation_input_tokens", usage.CacheCreation)
 	}
 	out = applyCodexClaudeTerminalMetadata(out, "", responseData)
 
@@ -589,7 +537,7 @@ func applyCodexClaudeTerminalMetadata(out []byte, deltaPrefix string, responseDa
 
 	usage := responseData.Get("usage")
 	for _, field := range []string{
-		"cache_creation_input_tokens", "cache_creation", "output_tokens_details",
+		"cache_creation", "output_tokens_details",
 		"server_tool_use", "inference_geo",
 	} {
 		copyRaw("usage."+field, usage.Get(field))
@@ -869,26 +817,6 @@ func resolveCodexClaudeToolUseName(originalRequestRawJSON []byte, name string) s
 		return orig
 	}
 	return name
-}
-
-func extractResponsesUsage(usage gjson.Result) (int64, int64, int64) {
-	if !usage.Exists() || usage.Type == gjson.Null {
-		return 0, 0, 0
-	}
-
-	inputTokens := usage.Get("input_tokens").Int()
-	outputTokens := usage.Get("output_tokens").Int()
-	cachedTokens := usage.Get("input_tokens_details.cached_tokens").Int()
-
-	if cachedTokens > 0 {
-		if inputTokens >= cachedTokens {
-			inputTokens -= cachedTokens
-		} else {
-			inputTokens = 0
-		}
-	}
-
-	return inputTokens, outputTokens, cachedTokens
 }
 
 // buildReverseMapFromClaudeOriginalShortToOriginal builds a map[short]original from original Claude request tools.

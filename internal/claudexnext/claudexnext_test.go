@@ -85,6 +85,9 @@ codex-websocket-generate-false-warmup: true
 		"codex-cache-aware-compaction: true",
 		"codex-websocket-circuit-breaker: true",
 		"codex-websocket-generate-false-warmup: false",
+		"request-retry: 3",
+		"max-retry-interval: 30",
+		"transient-error-cooldown-seconds: 5",
 		"secret-value",
 	} {
 		if !strings.Contains(text, want) {
@@ -98,6 +101,10 @@ codex-websocket-generate-false-warmup: true
 	if !parsed.CodexPreferUpstreamWebsockets || !parsed.CodexWebsocketSpeculativePreconnect || parsed.RequestLog {
 		t.Fatalf("prepared runtime flags were not parsed: %+v", parsed.SDKConfig)
 	}
+	if parsed.RequestRetry != 3 || parsed.MaxRetryInterval != 30 || parsed.TransientErrorCooldownSeconds != 5 {
+		t.Fatalf("retry policy = retries %d max interval %d transient cooldown %d, want 3/30/5",
+			parsed.RequestRetry, parsed.MaxRetryInterval, parsed.TransientErrorCooldownSeconds)
+	}
 	if parsed.ClaudeCodeAutoModeClassifierModel != "gpt-5.6-terra" {
 		t.Fatalf("classifier model = %q, want gpt-5.6-terra", parsed.ClaudeCodeAutoModeClassifierModel)
 	}
@@ -107,6 +114,22 @@ codex-websocket-generate-false-warmup: true
 	aliases := aliasesByName(parsed.OAuthModelAlias["codex"])
 	if aliases["sol"] != "gpt-5.6-sol" || aliases["luna"] != "gpt-5.6-luna" || aliases["terra"] != "gpt-5.6-terra" {
 		t.Fatalf("workflow aliases = %#v, want sol/luna/terra defaults", aliases)
+	}
+}
+
+func TestPrepareConfigPreservesExplicitRetryPolicy(t *testing.T) {
+	t.Parallel()
+	got, err := PrepareConfig([]byte("request-retry: 1\nmax-retry-interval: 7\ntransient-error-cooldown-seconds: 2\n"), 18432)
+	if err != nil {
+		t.Fatalf("PrepareConfig: %v", err)
+	}
+	parsed, errParse := config.ParseConfigBytes(got)
+	if errParse != nil {
+		t.Fatalf("parse prepared config: %v", errParse)
+	}
+	if parsed.RequestRetry != 1 || parsed.MaxRetryInterval != 7 || parsed.TransientErrorCooldownSeconds != 2 {
+		t.Fatalf("retry policy = retries %d max interval %d transient cooldown %d, want 1/7/2",
+			parsed.RequestRetry, parsed.MaxRetryInterval, parsed.TransientErrorCooldownSeconds)
 	}
 }
 
@@ -231,6 +254,9 @@ func TestConfigureClaudeContextSafetyUsesCodexCompatibleHeadroom(t *testing.T) {
 	t.Parallel()
 	values := map[string]string{}
 	ConfigureClaudeContextSafety(values)
+	if got := values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]; got != "200000" {
+		t.Fatalf("max context tokens = %q, want metadata fallback 200000", got)
+	}
 	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "200000" {
 		t.Fatalf("auto compact window = %q, want metadata fallback 200000", got)
 	}
@@ -242,12 +268,48 @@ func TestConfigureClaudeContextSafetyUsesCodexCompatibleHeadroom(t *testing.T) {
 func TestConfigureClaudeContextSafetyPreservesExplicitOverrides(t *testing.T) {
 	t.Parallel()
 	values := map[string]string{
+		"CLAUDE_CODE_MAX_CONTEXT_TOKENS":  "234567",
 		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456",
 		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "77",
 	}
 	ConfigureClaudeContextSafety(values)
-	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" || values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
+	if values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] != "234567" ||
+		values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" ||
+		values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
 		t.Fatalf("explicit context settings changed: %#v", values)
+	}
+}
+
+func TestConfigureClaudeContextSafetyUsesMetadataForCustomModelHardLimit(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456",
+	}
+	resolution := ClaudeContextWindowResolution{Window: 372_000, Source: "proxy_model_metadata"}
+	ConfigureClaudeContextSafety(values, resolution)
+	if got := values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]; got != "372000" {
+		t.Fatalf("max context tokens = %q, want proxy metadata 372000", got)
+	}
+	if got := values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]; got != "123456" {
+		t.Fatalf("explicit auto compact window changed to %q", got)
+	}
+}
+
+func TestClaudeContextModelsIncludesMappedWorkflowModels(t *testing.T) {
+	t.Parallel()
+	got := ClaudeContextModels(
+		"gpt-5.6-sol",
+		"",
+		map[string]string{
+			"claude-opus-4-6[1m]":   "gpt-5.6-sol",
+			"claude-opus-4-6":       "gpt-5.6-sol",
+			"claude-sonnet-4-6[1m]": "gpt-5.6-luna",
+			"claude-sonnet-4-6":     "gpt-5.6-luna",
+		},
+	)
+	want := []string{"gpt-5.6-luna", "gpt-5.6-sol"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("context models = %#v, want %#v", got, want)
 	}
 }
 
@@ -262,6 +324,9 @@ func TestResolveClaudeContextWindowUsesMinimumModelMetadata(t *testing.T) {
 	}
 	values := map[string]string{}
 	ConfigureClaudeContextSafety(values, resolution)
+	if values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] != "200000" {
+		t.Fatalf("max context tokens = %q, want 200000", values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])
+	}
 	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "200000" {
 		t.Fatalf("window = %q, want 200000", values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
 	}
@@ -317,10 +382,16 @@ func TestWaitForClaudeModelMetadataIgnoresEarlyPartialCatalog(t *testing.T) {
 }
 
 func TestConfigureClaudeContextSafetyPreservesExplicitWindow(t *testing.T) {
-	values := map[string]string{"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "77"}
-	resolution := ClaudeContextWindowResolution{Window: 200_000, Source: "proxy_model_metadata"}
+	values := map[string]string{
+		"CLAUDE_CODE_MAX_CONTEXT_TOKENS":  "234567",
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123456",
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "77",
+	}
+	resolution := ClaudeContextWindowResolution{Window: 372_000, Source: "proxy_model_metadata"}
 	ConfigureClaudeContextSafety(values, resolution)
-	if values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" || values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
+	if values["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] != "234567" ||
+		values["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "123456" ||
+		values["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "77" {
 		t.Fatalf("explicit settings changed: %#v", values)
 	}
 }
@@ -531,7 +602,7 @@ func TestLoadEnvFileDoesNotOverrideExistingEnvironment(t *testing.T) {
 	}
 }
 
-func TestPrepareAuthDirEnablesWebsocketsOnlyInPrivateCopy(t *testing.T) {
+func TestPrepareAuthDirEnablesWebsocketsWithoutMutatingSource(t *testing.T) {
 	t.Parallel()
 	source := t.TempDir()
 	destination := filepath.Join(t.TempDir(), "auth")
@@ -547,11 +618,118 @@ func TestPrepareAuthDirEnablesWebsocketsOnlyInPrivateCopy(t *testing.T) {
 		t.Fatal(errRead)
 	}
 	if !strings.Contains(string(got), `"websockets":true`) || !strings.Contains(string(got), `"access_token":"secret"`) {
-		t.Fatalf("private credential = %s", got)
+		t.Fatalf("runtime credential = %s", got)
 	}
 	unchanged, _ := os.ReadFile(filepath.Join(source, "codex.json"))
 	if string(unchanged) != string(original) {
 		t.Fatalf("source credential was mutated: %s", unchanged)
+	}
+}
+
+func TestPrepareAuthDirPreservesNewerRotatedCodexCredential(t *testing.T) {
+	t.Parallel()
+	source := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "auth")
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := `{"type":"codex","access_token":"stale-access","refresh_token":"stale-refresh","last_refresh":"2026-07-15T09:55:40+05:00","expired":"2026-07-25T09:55:40+05:00"}`
+	fresh := `{"type":"codex","access_token":"fresh-access","refresh_token":"fresh-refresh","last_refresh":"2026-07-20T09:55:40+05:00","expired":"2026-07-30T09:55:40+05:00"}`
+	if err := os.WriteFile(filepath.Join(source, "codex.json"), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "codex.json"), []byte(fresh), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PrepareAuthDir(source, destination, t.TempDir()); err != nil {
+		t.Fatalf("PrepareAuthDir: %v", err)
+	}
+
+	got, errRead := os.ReadFile(filepath.Join(destination, "codex.json"))
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !strings.Contains(string(got), `"access_token":"fresh-access"`) || !strings.Contains(string(got), `"websockets":true`) {
+		t.Fatalf("newer rotated credential was overwritten: %s", got)
+	}
+}
+
+func TestPrepareAuthDirImportsNewerCodexLoginIntoSharedStore(t *testing.T) {
+	t.Parallel()
+	source := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "auth")
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fresh := `{"type":"codex","access_token":"fresh-login","refresh_token":"fresh-refresh","last_refresh":"2026-07-21T09:55:40+05:00","expired":"2026-07-31T09:55:40+05:00"}`
+	stale := `{"type":"codex","access_token":"stale-access","refresh_token":"stale-refresh","last_refresh":"2026-07-20T09:55:40+05:00","expired":"2026-07-30T09:55:40+05:00"}`
+	if err := os.WriteFile(filepath.Join(source, "codex.json"), []byte(fresh), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "codex.json"), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PrepareAuthDir(source, destination, t.TempDir()); err != nil {
+		t.Fatalf("PrepareAuthDir: %v", err)
+	}
+
+	got, errRead := os.ReadFile(filepath.Join(destination, "codex.json"))
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !strings.Contains(string(got), `"access_token":"fresh-login"`) || !strings.Contains(string(got), `"websockets":true`) {
+		t.Fatalf("newer login was not imported: %s", got)
+	}
+}
+
+func TestRuntimeAuthDirIsSharedAcrossRuns(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	runsDir := filepath.Join(root, "runs")
+
+	first := RuntimeAuthDir(runsDir)
+	second := RuntimeAuthDir(runsDir)
+	if first != second {
+		t.Fatalf("runtime auth dirs differ: %q != %q", first, second)
+	}
+	if want := filepath.Join(root, "auth"); first != want {
+		t.Fatalf("runtime auth dir = %q, want %q", first, want)
+	}
+}
+
+func TestPrepareRuntimeAuthDirMigratesNewestCredentialFromPreviousRun(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	runsDir := filepath.Join(root, "runs")
+	destination := RuntimeAuthDir(runsDir)
+	previousAuthDir := filepath.Join(runsDir, "older-run", "private", "auth")
+	for _, dir := range []string{source, previousAuthDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stale := `{"type":"codex","access_token":"stale-access","refresh_token":"stale-refresh","last_refresh":"2026-07-15T09:55:40+05:00","expired":"2026-07-25T09:55:40+05:00"}`
+	rotated := `{"type":"codex","access_token":"rotated-access","refresh_token":"rotated-refresh","last_refresh":"2026-07-20T09:55:40+05:00","expired":"2026-07-30T09:55:40+05:00"}`
+	if err := os.WriteFile(filepath.Join(source, "codex.json"), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(previousAuthDir, "codex.json"), []byte(rotated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PrepareRuntimeAuthDir(source, destination, runsDir, t.TempDir()); err != nil {
+		t.Fatalf("PrepareRuntimeAuthDir: %v", err)
+	}
+
+	got, errRead := os.ReadFile(filepath.Join(destination, "codex.json"))
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !strings.Contains(string(got), `"access_token":"rotated-access"`) {
+		t.Fatalf("newest historical credential was not migrated: %s", got)
 	}
 }
 

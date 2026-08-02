@@ -1,5 +1,5 @@
-// Package claudecompat defines the small model-name compatibility boundary
-// between Claude Code's client-side capability profiles and proxy routing.
+// Package claudecompat defines shared compatibility contracts between Claude
+// clients and provider-specific proxy behavior.
 package claudecompat
 
 import (
