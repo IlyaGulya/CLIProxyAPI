@@ -143,6 +143,40 @@ func TestCodexClientModelsResponse_AppliesDisplayNameToTemplateModel(t *testing.
 	}
 }
 
+func TestCodexClientModelsResponse_PreservesTemplateClientContextBudget(t *testing.T) {
+	resp := CodexClientModelsResponse([]map[string]any{{
+		"id":             "gpt-5.6-sol",
+		"context_length": 1_050_000,
+	}})
+	models, ok := resp["models"].([]map[string]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("models = %#v, want one model", resp["models"])
+	}
+	if got := intModelValue(models[0], "context_window"); got != 272_000 {
+		t.Fatalf("context_window = %d, want client budget 272000", got)
+	}
+	if got := intModelValue(models[0], "max_context_window"); got != 272_000 {
+		t.Fatalf("max_context_window = %d, want client budget 272000", got)
+	}
+}
+
+func TestCodexClientModelsResponse_UsesRegistryWindowForSynthesizedModel(t *testing.T) {
+	resp := CodexClientModelsResponse([]map[string]any{{
+		"id":             "custom-context-window-model",
+		"context_length": 123_456,
+	}})
+	models, ok := resp["models"].([]map[string]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("models = %#v, want one model", resp["models"])
+	}
+	if got := intModelValue(models[0], "context_window"); got != 123_456 {
+		t.Fatalf("context_window = %d, want registry fallback 123456", got)
+	}
+	if got := intModelValue(models[0], "max_context_window"); got != 123_456 {
+		t.Fatalf("max_context_window = %d, want registry fallback 123456", got)
+	}
+}
+
 func TestCodexClientModelsResponse_DisablesSearchToolForSynthesizedModels(t *testing.T) {
 	resp := CodexClientModelsResponse([]map[string]any{
 		{"id": "custom-openai-compatible-model"},

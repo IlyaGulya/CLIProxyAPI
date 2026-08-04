@@ -27,6 +27,38 @@ func TestEmbeddedCodexClientModelsCatalogIsValid(t *testing.T) {
 	}
 }
 
+func TestEmbeddedCodexClientModelsCatalogUsesCurrentClientContextBudget(t *testing.T) {
+	data, _ := GetCodexClientModelsSnapshot()
+	var payload codexClientModelsPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("decode embedded Codex client model catalog: %v", err)
+	}
+
+	wantModels := map[string]bool{
+		"gpt-5.6-sol":   false,
+		"gpt-5.6-terra": false,
+		"gpt-5.6-luna":  false,
+	}
+	for _, model := range payload.Models {
+		slug, _ := model["slug"].(string)
+		if _, ok := wantModels[slug]; !ok {
+			continue
+		}
+		wantModels[slug] = true
+		if got := int(model["context_window"].(float64)); got != 272_000 {
+			t.Errorf("%s context_window = %d, want 272000", slug, got)
+		}
+		if got := int(model["max_context_window"].(float64)); got != 272_000 {
+			t.Errorf("%s max_context_window = %d, want 272000", slug, got)
+		}
+	}
+	for slug, found := range wantModels {
+		if !found {
+			t.Errorf("embedded Codex client model catalog is missing %s", slug)
+		}
+	}
+}
+
 func TestValidateCodexClientModelsJSON(t *testing.T) {
 	validDefault := testCodexClientModel("gpt-5.5", 1)
 	validOther := testCodexClientModel("gpt-5.6-sol", 2)
@@ -64,6 +96,90 @@ func TestValidateCodexClientModelsJSON(t *testing.T) {
 	if err := ValidateCodexClientModelsJSON(valid); err != nil {
 		t.Fatalf("valid catalog rejected: %v", err)
 	}
+}
+
+func TestApplyCodexClientCatalogContextWindowCaps(t *testing.T) {
+	defaultModel := testCodexClientModel("gpt-5.5", 1)
+	clientBudgetModel := testCodexClientModel("gpt-5.6-sol", 2)
+	clientBudgetModel["context_window"] = 372000
+	clientBudgetModel["max_context_window"] = 372000
+
+	normalized, err := applyCodexClientCatalogContextWindowCaps(testCodexClientCatalog(t, defaultModel, clientBudgetModel))
+	if err != nil {
+		t.Fatalf("apply context window caps: %v", err)
+	}
+	var payload codexClientModelsPayload
+	if err = json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatalf("decode normalized catalog: %v", err)
+	}
+
+	bySlug := make(map[string]map[string]any, len(payload.Models))
+	for _, model := range payload.Models {
+		bySlug[model["slug"].(string)] = model
+	}
+	if got := int(bySlug["gpt-5.6-sol"]["context_window"].(float64)); got != 272_000 {
+		t.Fatalf("gpt-5.6-sol context_window = %d, want capped 272000", got)
+	}
+	if got := int(bySlug["gpt-5.6-sol"]["max_context_window"].(float64)); got != 272_000 {
+		t.Fatalf("gpt-5.6-sol max_context_window = %d, want capped 272000", got)
+	}
+	if got := int(bySlug["gpt-5.5"]["context_window"].(float64)); got != 372_000 {
+		t.Fatalf("unlisted model context_window = %d, want unchanged 372000", got)
+	}
+}
+
+func TestApplyCodexClientCatalogContextWindowCapsPreservesUnknownTopLevelFields(t *testing.T) {
+	data, err := json.Marshal(map[string]any{
+		"models":           []map[string]any{testCodexClientModel("gpt-5.6-sol", 1)},
+		"catalog_revision": "future-field",
+	})
+	if err != nil {
+		t.Fatalf("marshal catalog: %v", err)
+	}
+
+	normalized, err := applyCodexClientCatalogContextWindowCaps(data)
+	if err != nil {
+		t.Fatalf("apply context window caps: %v", err)
+	}
+	var root map[string]any
+	if err = json.Unmarshal(normalized, &root); err != nil {
+		t.Fatalf("decode normalized catalog: %v", err)
+	}
+	if got := root["catalog_revision"]; got != "future-field" {
+		t.Fatalf("catalog_revision = %#v, want preserved future-field", got)
+	}
+}
+
+func TestLoadCodexClientModelsCapsRemoteContextWindowIncrease(t *testing.T) {
+	original, _ := GetCodexClientModelsSnapshot()
+	t.Cleanup(func() {
+		if _, err := loadCodexClientModelsFromBytes(original, "test cleanup"); err != nil {
+			t.Fatalf("restore original catalog: %v", err)
+		}
+	})
+
+	remoteModel := testCodexClientModel("gpt-5.6-luna", 2)
+	remoteModel["context_window"] = 372000
+	remoteModel["max_context_window"] = 372000
+	remote := testCodexClientCatalog(t, testCodexClientModel("gpt-5.5", 1), remoteModel)
+	if _, err := loadCodexClientModelsFromBytes(remote, "test remote"); err != nil {
+		t.Fatalf("load remote catalog: %v", err)
+	}
+
+	stored, _ := GetCodexClientModelsSnapshot()
+	var payload codexClientModelsPayload
+	if err := json.Unmarshal(stored, &payload); err != nil {
+		t.Fatalf("decode stored catalog: %v", err)
+	}
+	for _, model := range payload.Models {
+		if model["slug"] == "gpt-5.6-luna" {
+			if got := int(model["context_window"].(float64)); got != 272_000 {
+				t.Fatalf("stored remote context_window = %d, want capped 272000", got)
+			}
+			return
+		}
+	}
+	t.Fatal("stored catalog is missing gpt-5.6-luna")
 }
 
 func TestLoadCodexClientModelsRejectsInvalidWithoutReplacing(t *testing.T) {

@@ -43,8 +43,8 @@ func TestClaudeRequestPipelineRoutesClientCapabilityProfileBeforePolicy(t *testi
 	if result.Err != nil || result.Rejected || result.Model != "gpt-5.6-sol" || result.ClientModel != "claude-opus-4-6" {
 		t.Fatalf("pipeline result = %+v", result)
 	}
-	if result.Pressure.EffectiveWindow != 372_000 {
-		t.Fatalf("effective window = %d, want routed Sol window 372000", result.Pressure.EffectiveWindow)
+	if result.Pressure.EffectiveWindow != 272_000 {
+		t.Fatalf("effective window = %d, want routed Sol window 272000", result.Pressure.EffectiveWindow)
 	}
 	if strings.Contains(string(result.Body), "claude-opus-4-6") {
 		t.Fatalf("client capability profile leaked past routing boundary: %s", result.Body)
@@ -99,8 +99,8 @@ func TestClaudeRequestPipelineBoundsSyntheticResumeRecovery(t *testing.T) {
 		wantCompact  bool
 		wantAdaptive bool
 	}{
-		{name: "boundary interactive adapts without compact loop", targetTokens: 340_000, lastPrompt: "Continue after restoring this session.", wantKind: claudeRequestInteractive, wantAdaptive: true},
-		{name: "true overflow compact rejects once with bounded reserve", targetTokens: 360_000, lastPrompt: compactPrompt, wantKind: claudeRequestReactiveCompact, wantRejected: true, wantCompact: true},
+		{name: "boundary interactive adapts without compact loop", targetTokens: 240_000, lastPrompt: "Continue after restoring this session.", wantKind: claudeRequestInteractive, wantAdaptive: true},
+		{name: "true overflow compact rejects once with bounded reserve", targetTokens: 260_000, lastPrompt: compactPrompt, wantKind: claudeRequestReactiveCompact, wantRejected: true, wantCompact: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

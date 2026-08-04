@@ -1438,7 +1438,7 @@
       "display_name": "GPT 5.6 Terra",
       "version": "gpt-5.6",
       "description": "Balanced agentic coding model for everyday work.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1462,7 +1462,7 @@
       "display_name": "GPT 5.6 Luna",
       "version": "gpt-5.6",
       "description": "Fast and affordable agentic coding model.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1586,7 +1586,7 @@
       "display_name": "GPT 5.6 Sol",
       "version": "gpt-5.6",
       "description": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1610,7 +1610,7 @@
       "display_name": "GPT 5.6 Terra",
       "version": "gpt-5.6",
       "description": "Balanced agentic coding model for everyday work.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1634,7 +1634,7 @@
       "display_name": "GPT 5.6 Luna",
       "version": "gpt-5.6",
       "description": "Fast and affordable agentic coding model.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1781,7 +1781,7 @@
       "display_name": "GPT 5.6 Sol",
       "version": "gpt-5.6",
       "description": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1805,7 +1805,7 @@
       "display_name": "GPT 5.6 Terra",
       "version": "gpt-5.6",
       "description": "Balanced agentic coding model for everyday work.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1829,7 +1829,7 @@
       "display_name": "GPT 5.6 Luna",
       "version": "gpt-5.6",
       "description": "Fast and affordable agentic coding model.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1976,7 +1976,7 @@
       "display_name": "GPT 5.6 Sol",
       "version": "gpt-5.6",
       "description": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -2000,7 +2000,7 @@
       "display_name": "GPT 5.6 Terra",
       "version": "gpt-5.6",
       "description": "Balanced agentic coding model for everyday work.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -2024,7 +2024,7 @@
       "display_name": "GPT 5.6 Luna",
       "version": "gpt-5.6",
       "description": "Fast and affordable agentic coding model.",
-      "context_length": 372000,
+      "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"

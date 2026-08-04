@@ -51,14 +51,17 @@ func loadCodexClientModelsFromBytes(data []byte, source string) (bool, error) {
 	if err := ValidateCodexClientModelsJSON(data); err != nil {
 		return false, fmt.Errorf("%s: %w", source, err)
 	}
+	normalized, err := applyCodexClientCatalogContextWindowCaps(data)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", source, err)
+	}
 
-	cloned := append([]byte(nil), data...)
 	codexClientCatalogStore.mu.Lock()
 	defer codexClientCatalogStore.mu.Unlock()
-	if bytes.Equal(codexClientCatalogStore.data, cloned) {
+	if bytes.Equal(codexClientCatalogStore.data, normalized) {
 		return false, nil
 	}
-	codexClientCatalogStore.data = cloned
+	codexClientCatalogStore.data = normalized
 	codexClientCatalogStore.revision++
 	return true, nil
 }

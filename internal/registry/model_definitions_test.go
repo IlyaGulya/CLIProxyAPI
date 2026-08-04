@@ -16,6 +16,50 @@ func TestModelOverrideHeadersFromEmbeddedModels(t *testing.T) {
 	}
 }
 
+func TestCodexModelDefinitionsUseCurrentClientContextBudget(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []*ModelInfo
+	}{
+		{name: "free", models: GetCodexFreeModels()},
+		{name: "team", models: GetCodexTeamModels()},
+		{name: "plus", models: GetCodexPlusModels()},
+		{name: "pro", models: GetCodexProModels()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, model := range test.models {
+				if model == nil || (model.ID != "gpt-5.6-sol" && model.ID != "gpt-5.6-terra" && model.ID != "gpt-5.6-luna") {
+					continue
+				}
+				if model.ContextLength != 272_000 {
+					t.Errorf("%s context_length = %d, want 272000", model.ID, model.ContextLength)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyCodexModelContextWindowCapsPreservesLowerAndUnknownLimits(t *testing.T) {
+	data := &staticModelsJSON{CodexPro: []*ModelInfo{
+		{ID: "gpt-5.6-sol", ContextLength: 372_000},
+		{ID: "gpt-5.6-terra", ContextLength: 200_000},
+		{ID: "custom-model", ContextLength: 1_050_000},
+	}}
+
+	applyCodexModelContextWindowCaps(data)
+
+	if got := data.CodexPro[0].ContextLength; got != 272_000 {
+		t.Fatalf("known model context_length = %d, want capped 272000", got)
+	}
+	if got := data.CodexPro[1].ContextLength; got != 200_000 {
+		t.Fatalf("lower remote context_length = %d, want unchanged 200000", got)
+	}
+	if got := data.CodexPro[2].ContextLength; got != 1_050_000 {
+		t.Fatalf("unknown model context_length = %d, want unchanged 1050000", got)
+	}
+}
+
 func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
 	models := WithXAIBuiltins(nil)
 
